@@ -16,6 +16,7 @@ Files
 - `test.mjs`        CPU harness: synthetic features, full render, determinism replay
 - `gpu_test.mjs`    headless-Chromium harness: renders through WebGPU to an offscreen texture
 - `scripts/make-fixtures.mjs`  regenerates the committed test fixtures (not part of `npm test`)
+- `scripts/gate.mjs`  reduces an `npm test` log to the gate line; `scripts/zip.mjs` builds the reviewer zip
 
 ## Setup
 
@@ -37,7 +38,26 @@ command by hand. Use `python`, not `python3` — on Windows `python3` may be a S
 
 ```
 npm test
+node scripts/gate.mjs --run      # npm test, logged to out/gate.log (UTF-8), reduced to one line
 ```
+
+There is no hosted CI: GitHub Actions is off and every gate runs on the self-hosted machine.
+`gate.mjs --run` prints the line AGENTS.md rule 3 asks for and exits 0 PASS, 1 FAIL, 2 truncated:
+
+    gate: PASS · goldens 13/13, 0 differing px · CPU 9.73 ms/frame · page errors 0 · validation errors 0 · skips: export: software adapter cannot encode from the presented canvas
+
+It FAILs on any differing pixel, page or validation error, `FAIL` line, non-zero `npm test`
+exit, any skip other than that SwiftShader export skip, and on a committed `index.html` that
+`pack.py` would not reproduce (pretest re-packs, so a working-tree diff afterwards is a stale or
+hand-edited file). `node scripts/gate.mjs <log>` gates a saved log; PowerShell-redirected logs are
+UTF-16 and are decoded. `node scripts/gate.test.mjs` pins the parser to eight real logs in
+`scripts/testdata/`.
+
+**One GPU run at a time, enforced.** `gpu_test.mjs` takes a lock in `~/.moshloom` (shared by every
+checkout and worktree of the user) before it launches a browser: `--hardware` takes the exclusive
+`gpu.lock`, every other run its own `sw.<pid>.lock`. A run that would overlap prints
+`gpu lock: refused ...` and exits 3 without starting Chromium; a lock whose pid is dead is removed.
+`node gpu_test.mjs --lock-self-test` checks this without a browser (10 cases).
 
 - `pretest` re-packs `index.html` so the tests always run against the current sources.
 - `test.mjs` renders 3,840 frames of the CPU path at 640x360, reports ms/frame, then replays
@@ -63,7 +83,11 @@ npm test
   modes through the header control, boots `#cpu`, and checks that `rwCall` rejects clearly
   when there is no worker. In worker mode it also exports 45 frames, exports a video clip
   twice and requires the same decoded clip-frame hash, checks worker thumbnails, and resizes
-  the worker through the Size control. Every long-lived-page section starts by pinning 120 BPM
+  the worker through the Size control. Thumbnail checks wait for the real condition (every
+  block has one, 60 s budget) instead of a fixed sleep: about 0.5-0.8 s instead of 14 s. Two
+  fresh worker pages deliver the worker's `device-lost` message and its `onerror` through the
+  page's own handlers and require `worker+gpu -> main+gpu`, a new canvas and a lit frame.
+  Every long-lived-page section starts by pinning 120 BPM
   and a known project, so a tempo or arrangement left by an earlier section cannot change a
   later result.
 
@@ -175,8 +199,13 @@ answered yet, this is where the probe runs:
     after : main+gpu  canvas swapped, G.ok, frame rendered, no page errors
 
 The worker's own `device-lost` message and the worker `onerror` call the same function. A silent
-`terminate()` cannot be made to look like a crash, so the mechanism is tested by inviting it
-explicitly; the spontaneous triggers are wired but not simulated in the suite.
+`terminate()` cannot be made to look like a crash, so `npm test` delivers both triggers through the
+handlers the page installs on `rw`, each on a fresh worker page:
+
+    recovery device-lost: worker+gpu -> main+gpu, new canvas, lum 0.5152 (G.off texture), page errors 0, validation errors 0
+    recovery onerror: worker+gpu -> main+gpu, new canvas, lum 0.5375 (G.off texture), page errors 0, validation errors 0
+
+A real device loss or a real worker crash is not simulated.
 
 ### T1c: export, thumbnails and media in the worker
 
@@ -191,6 +220,28 @@ frame. The main thread seeks the video, draws it to its 2D canvas and transfers 
 Two exports of the same clip project decode to the same frame hash. The worker wasm, muxers and
 OffscreenCanvas are all in the worker body; `pack.py` inlines the muxers once and the worker
 source includes that text.
+
+On SwiftShader (`npm test`, main at 6bcd8dd): worker export 1.94 MB 1280x720, decoded luminance
+0.111; the clip export lands on hash 1500507020 twice; worker thumbnails 39/39.
+
+**The hardware gate is not green.** `npm run test:gpu:hw` on the T1c merge (f4517c3) failed:
+the main-mode export (visible canvas) decoded black, luminance 0, and the worker clip export was
+not repeatable (3606441599 vs 3996078533); worker export itself was lit (1.96 MB, 0.11). Main-mode
+export has decoded black in every hardware run since T1c work began; the last lit one was 0.101.
+The same suite on a candidate fix (PR #4) also failed, including a worker export that had been
+lit, so on this machine the hardware result currently changes between runs without a code change.
+Until it is reproducible, no hardware number here is evidence for or against a fix.
+
+### Milestone zip
+
+    npm run zip -- --sha <rev> [--out <path>] [--check-pack] <log> [<log> ...]
+
+Builds `out/moshloom-<shortsha>.zip` for the external reviewer: the tree at `<rev>` from
+`git archive`, the given logs under `logs/`, and `MANIFEST.txt` (full SHA, commit subject, each
+log's size and sha256). It reads the finished zip back, fails on a missing or empty log, on any
+`node_modules` or `out` path segment, and leaves no zip behind on failure. `--check-pack` rebuilds
+`index.html` in a temporary worktree of `<rev>` and requires it byte-identical.
+`node scripts/zip.mjs --self-test` checks the entry-name rules.
 
 ### Builds, goldens and what "same pixels" means
 
