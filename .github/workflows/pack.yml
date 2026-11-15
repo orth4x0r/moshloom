@@ -1,0 +1,33 @@
+name: pack
+
+# index.html is generated: `python pack.py` inlines gpu.js, the base64 engine.wasm and the two
+# muxers. A hand edit of index.html, a stale wasm blob or a muxer bump that was never re-packed
+# all show up here as a diff. The gate parser is checked on the same logs the coordinator reads.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: pack-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+
+      - name: pack
+        run: python pack.py
+
+      - name: index.html is byte-identical to the pack output
+        run: git diff --exit-code index.html
+
+      - name: gate parser against the saved logs
+        run: node scripts/gate.test.mjs

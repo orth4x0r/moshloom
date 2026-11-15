@@ -1,0 +1,41 @@
+
+> moshloom@2.5.0 test:gpu:hw
+> node gpu_test.mjs --hardware
+
+hardware run: headed Chrome, real GPU; export must produce a file; SwiftShader goldens skipped (pass --hardware-golden to compare)
+mode: gpu (WebGPU) | err: none
+media image: clip.png added as a Media block
+media video: clip.mp4 added as a Media block | image 160x90, video 160x90
+shaders: Rings:ok
+bad shader -> shader: unresolved value 'nope' (line 3)
+  scene_media_image            98.2% lit
+  scene_media_video            94.2% lit
+  scene_shader                 98.9% lit
+  fx_0                         98.6% lit
+  fx_1                         97.8% lit
+  fx_2                         97.1% lit
+  fx_3                         97.8% lit
+  fx_4                         97.8% lit
+  fx_5                         89.0% lit
+  fx_6                         74.0% lit
+  fx_7                         100.0% lit
+  mods_bloom                   97.0% lit
+fluid (SwiftShader, software - see the real-GPU number in the report): 23.05 ms/frame off, 8.87 on (+-14.18), 60 frames from a seek twice: identical
+  fx_fluid                     95.4% lit
+profile: 31 stamps, total 3.25 ms, scene 0.09, fluid 0.22
+thumbs: 56 cached, 39/39 blocks have one
+auto-arrange: no full-frame change closer than 12 frames at 60/90/120/150/180 BPM
+gpu errors: none | lost: no
+projects: schema, round trip, autosave, named store, migrate ok
+analysis worker: up, features from worker, nf 3840, clock 1.638 -> 1.722
+mode probe: skipped in main mode (header: WebGPU); it runs only for worker mode or recovery
+rwCall: no worker -> "no render worker is running (mode: main+gpu)"
+worker smoke: init + 4 frames + readback 1280x720, lum 0.2408
+worker: main vs worker 1280x720 hash 3336782791 lum 0.3203 IDENTICAL
+engine control: worker page switched to main+cpu (CPU fallback ┬╖ worker ready)
+engine control: CPU -> worker+gpu (WebGPU ┬╖ worker ready)
+engine control: plain #cpu booted main+cpu (CPU fallback)
+export guard: empty encode -> "Export failed: export produced no video data (0 chunks, 0 bytes)"
+export: 0.19 MB video/mp4 640x360 1.5s, decoded luminance 0.101
+
+ok: 13 frames rendered, no validation errors (ppm + ui.png in out)
