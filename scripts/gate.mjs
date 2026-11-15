@@ -144,7 +144,7 @@ const na = (why) => `n/a (${why})`;
 /** The gate line. One line, always the same shape. */
 export function formatGate(r) {
   const goldens = r.goldens.kind === 'compared'
-    ? `${r.goldens.within}/${r.goldens.total} (${r.goldens.failed} differing)`
+    ? `${r.goldens.within}/${r.goldens.total}, ${r.goldens.diffPixels} differing px`
     : r.goldens.kind === 'skipped-hardware'
       ? 'skipped (hardware)'
       : na('no golden comparison in the log');
@@ -182,13 +182,15 @@ async function run() {
   child.stdout.on('data', tee);
   child.stderr.on('data', tee);
   child.on('error', (e) => console.error(`gate: could not start npm test: ${e.message}`));
-  await new Promise((resolve) => child.on('close', resolve));
+  const npmCode = await new Promise((resolve) => child.on('close', resolve));
   await new Promise((resolve) => log.end(resolve));
-  // The exit code comes from the log, not from npm: a run that died before printing a verdict is
-  // exit 2 (truncated), which is a different finding from a FAIL line.
-  const { line, code } = gateFile(LOG_NAME);
-  console.log(line);
-  process.exit(code);
+  // The exit code comes from the log: a run that died before printing a verdict is exit 2
+  // (truncated), a different finding from a FAIL line. But a non-zero npm exit is never a PASS,
+  // whatever the log says.
+  const { result, code } = gateFile(LOG_NAME);
+  if (npmCode !== 0 && code === 0) result.reasons.push(`npm test exited ${npmCode}`);
+  console.log(formatGate(result));
+  process.exit(npmCode !== 0 && code === 0 ? 1 : code);
 }
 
 function main(argv) {

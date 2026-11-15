@@ -27,7 +27,7 @@ const CASES = [
     pageErrors: 0, validationErrors: 0,
     skips: 'export: software adapter cannot encode from the presented canvas',
     reasons: [],
-    line: 'gate: PASS · goldens 13/13 (0 differing) · CPU 10.35 ms/frame · page errors 0'
+    line: 'gate: PASS · goldens 13/13, 0 differing px · CPU 10.35 ms/frame · page errors 0'
       + ' · validation errors 0 · skips: export: software adapter cannot encode from the presented canvas',
   },
   {
@@ -49,7 +49,7 @@ const CASES = [
     pageErrors: 0, validationErrors: 0,
     skips: SOFTWARE_EXPORT_SKIP,
     reasons: ['FAIL line present'],
-    line: `gate: FAIL · goldens 13/13 (0 differing) · CPU 10.67 ms/frame · page errors 0`
+    line: `gate: FAIL · goldens 13/13, 0 differing px · CPU 10.67 ms/frame · page errors 0`
       + ` · validation errors 0 · skips: ${SOFTWARE_EXPORT_SKIP}`,
   },
   {
@@ -65,7 +65,7 @@ const CASES = [
       'FAIL line present',
       'skipped on a hardware run: worker: no: probe timed out',
     ],
-    line: 'gate: FAIL · goldens 0/13 (13 differing) · CPU n/a (hardware run) · page errors 0'
+    line: 'gate: FAIL · goldens 0/13, 2351169 differing px · CPU n/a (hardware run) · page errors 0'
       + ' · validation errors 0 · skips: worker: no: probe timed out',
   },
   {
@@ -80,7 +80,7 @@ const CASES = [
       'goldens: 2351169 differing pixels total',
       'FAIL line present',
     ],
-    line: 'gate: FAIL · goldens 0/13 (13 differing) · CPU n/a (hardware run) · page errors 0'
+    line: 'gate: FAIL · goldens 0/13, 2351169 differing px · CPU n/a (hardware run) · page errors 0'
       + ' · validation errors 0 · skips: none',
   },
   {
@@ -91,7 +91,7 @@ const CASES = [
     pageErrors: 2, validationErrors: 0,
     skips: SOFTWARE_EXPORT_SKIP,
     reasons: ['FAIL line present', '2 page error line(s) in the FAIL block'],
-    line: `gate: FAIL · goldens 13/13 (0 differing) · CPU 9.95 ms/frame · page errors 2`
+    line: `gate: FAIL · goldens 13/13, 0 differing px · CPU 9.95 ms/frame · page errors 2`
       + ` · validation errors 0 · skips: ${SOFTWARE_EXPORT_SKIP}`,
   },
   {
@@ -102,7 +102,7 @@ const CASES = [
     pageErrors: 0, validationErrors: 0,
     skips: SOFTWARE_EXPORT_SKIP,
     reasons: ['FAIL line present'],
-    line: `gate: FAIL · goldens 13/13 (0 differing) · CPU n/a (partial log: test.mjs did not run)`
+    line: `gate: FAIL · goldens 13/13, 0 differing px · CPU n/a (partial log: test.mjs did not run)`
       + ` · page errors 0 · validation errors 0 · skips: ${SOFTWARE_EXPORT_SKIP}`,
   },
   {
