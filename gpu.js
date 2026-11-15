@@ -607,7 +607,39 @@ function fluidClear(enc){
   }
 }
 function gpuReset(){ G.valid=false; G.fluidOn=false; }   // call next to WASM.reset(): seek, play start, resize, export
-// cheap pixel probe for the export loop: mean luminance of the last feedback buffer, 0..1
+// ---- offscreen frame capture: the frame an export encodes --------------------------------
+// An export must never read the presented canvas. A canvas snapshot taken when the window is not
+// being composited (a background tab, an occluded window) is blank on a real adapter, and the
+// result changed between runs, so every export switches to an offscreen texture, renders into
+// G.off and reads that texture back. Only the texture path is independent of the window.
+// One MAP_READ buffer per export, reused for every frame. bytesPerRow must be a multiple of 256.
+function gpuCapOpen(w,h){
+  const row=Math.ceil(w*4/256)*256;
+  return {w,h,row,bgra:G.fmt.indexOf('bgra')===0,
+    buf:G.dev.createBuffer({size:row*h,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ})};
+}
+function gpuCapClose(cap){ try{cap.buf.destroy();}catch(e){} }
+// Copies G.off into a tight RGBA frame in `cap` and returns it with the luminance sampled from
+// those same bytes. The guard has to measure what the encoder is handed: the feedback buffer stays
+// bright while a blank capture is encoded, which is how black exports shipped green once.
+async function gpuCapFrame(cap){
+  const dev=G.dev;
+  await dev.queue.onSubmittedWorkDone();
+  const ce=dev.createCommandEncoder();
+  ce.copyTextureToBuffer({texture:G.off},{buffer:cap.buf,bytesPerRow:cap.row},[cap.w,cap.h]);
+  dev.queue.submit([ce.finish()]);
+  await cap.buf.mapAsync(GPUMapMode.READ);
+  const mapped=new Uint8Array(cap.buf.getMappedRange());
+  const copy=new Uint8Array(mapped.length); copy.set(mapped); cap.buf.unmap();
+  let sum=0,cnt=0;
+  for(let i=0;i<copy.length;i+=4*97){sum+=copy[i]+copy[i+1]+copy[i+2];cnt++;}
+  const lum=cnt?sum/(cnt*3*255):0;
+  // G.fmt is the canvas format, so an bgra8unorm adapter hands us BGR: swap before VideoFrame('RGBA').
+  if(cap.bgra)for(let i=0;i<copy.length;i+=4){const b=copy[i];copy[i]=copy[i+2];copy[i+2]=b;}
+  return {copy,lum};
+}
+// Mean luminance of the last feedback buffer, 0..1. Not a capture check: use gpuCapFrame's lum for
+// "what did the encoder get".
 async function gpuProbe(){
   if(!G.ok||!G.valid) return null;
   const dev=G.dev, T=GPUTextureUsage;
