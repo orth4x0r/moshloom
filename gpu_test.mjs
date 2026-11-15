@@ -361,6 +361,92 @@ if (!clipImg || !clipVid) { console.error('fixtures/clip.png and a clip video ar
 const outDir = path.join(root, 'out');
 fs.mkdirSync(outDir, { recursive: true });
 
+// ---- export decode: one separate headless Chromium (H4) ----------------------
+// Every export check used to decode its own file in the page that produced it: a <video>, a seek
+// to 0.5 s, drawImage onto a 160x90 canvas, luminance and an FNV hash. In `--hardware` mode that
+// page is a headed window, and Chrome does not reliably produce decoded video frames for a window
+// that is covered or in the background, so the same file decoded lit in one run and black in the
+// next three with no code change. The check must not depend on what is on screen.
+//
+// So the exporting page now hands the file's bytes (base64) to Node and never decodes anything,
+// and Node decodes in ONE separate headless Chromium with no GPU: launched lazily on the first
+// file, one page reused for all of them, at a file:// URL inside this repo. The computation is
+// the same video -> seek 0.5 s -> 160x90 -> luminance / FNV hash, so the numbers stay comparable
+// with the ones already recorded. It is part of this run and inside this run's GPU lock; it is
+// closed on the normal path and by an exit handler on every other one.
+//
+// `--use-angle=swiftshader` is the one flag and it is not decoration: drawImage(video) rasterizes
+// the frame, and the default backend rounds YUV->RGB differently from the software one the
+// exporting page ran under `npm test`. The same bytes decoded by both, measured on the H4 branch:
+//
+//   decode backend                     worker export      media clip frame
+//   default (machine GPU)              0.109              630426149, lum 0.022
+//   --use-angle=swiftshader            0.111              1500507020, lum 0.023   <- the recorded values
+//   channel:'chromium', new headless   0 (black frame)    1620850465
+//
+// The recorded values are 0.111 and 1500507020, so the decode browser takes the software raster:
+// one decoder on every machine, no adapter in the answer, and the pinned numbers keep their
+// meaning. (New headless with a full Chromium build is not an option either: it drew black.)
+const SWIFTSHADER_RASTER = ['--use-angle=swiftshader'];
+const decodeHtml = path.join(outDir, 'decode.html');
+let decodeBrowser = null, decodeP = null;
+
+// Playwright serializes this function and runs it in the decode page, so it may reference nothing
+// outside its own argument. Same steps, same numbers as the inline decodes it replaces.
+const decodeInPage = async ({ b64, mime }) => {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  const blob = new Blob([u8], mime ? { type: mime } : undefined);
+  const hashOf = (a) => { let x = 2166136261 >>> 0; for (let i = 0; i < a.length; i++) x = Math.imul(x ^ a[i], 16777619) >>> 0; return x >>> 0; };
+  const url = URL.createObjectURL(blob);
+  const v = document.createElement('video'); v.muted = true; v.src = url; v.load();
+  await new Promise((res) => { v.onloadeddata = res; v.onerror = res; setTimeout(res, 4000); });
+  v.currentTime = 0.5;
+  await new Promise((r) => { v.onseeked = r; setTimeout(r, 800); });
+  const c = document.createElement('canvas'); c.width = 160; c.height = 90;
+  const g = c.getContext('2d'); g.drawImage(v, 0, 0, 160, 90);
+  const d = g.getImageData(0, 0, 160, 90).data;
+  let sum = 0; for (let i = 0; i < d.length; i += 4) sum += d[i] + d[i + 1] + d[i + 2];
+  const out = { hash: hashOf(d), lum: +(sum / (160 * 90 * 3 * 255)).toFixed(3),
+    w: v.videoWidth, h: v.videoHeight, dur: +(v.duration || 0).toFixed(2) };
+  URL.revokeObjectURL(url); v.remove(); c.remove();
+  return out;
+};
+
+async function openDecodePage() {
+  if (decodeP) return decodeP;
+  fs.writeFileSync(decodeHtml, '<!doctype html><meta charset="utf-8"><title>moshloom export decode</title>\n');
+  decodeBrowser = await chromium.launch({ headless: true, args: SWIFTSHADER_RASTER });
+  // Belt and braces for the "close it on every exit path" rule: the normal path awaits
+  // closeDecodePage(), and a throw, process.exit() or a signal still takes the browser down here.
+  process.on('exit', () => { try { if (decodeBrowser) decodeBrowser.close(); } catch (e) {} });
+  const pg = await decodeBrowser.newPage();
+  await pg.goto(pathToFileURL(decodeHtml).href);
+  decodeP = pg;
+  console.log(`decode: export files are decoded in a separate headless Chromium, never in the exporting page (${path.relative(process.cwd(), decodeHtml) || decodeHtml})`);
+  return decodeP;
+}
+
+// A decode that cannot run must not take the suite down with a stack: the file then reads as
+// undecodable and the existing assertion for that check fails with its existing message.
+async function decodeVideoFile(b64, mime, label) {
+  try {
+    const pg = await openDecodePage();
+    return await pg.evaluate(decodeInPage, { b64, mime: mime || '' });
+  } catch (e) {
+    console.log(`decode: ${label} could not be decoded in the headless page (${e.message.split('\n')[0]})`);
+    return { hash: 0, lum: 0, w: 0, h: 0, dur: 0 };
+  }
+}
+
+async function closeDecodePage() {
+  if (!decodeBrowser) return;
+  const b = decodeBrowser;
+  decodeBrowser = null; decodeP = null;
+  try { await b.close(); } catch (e) {}
+}
+
 // HARDWARE is read at the top of the file, before the lock is taken.
 // The committed goldens are SwiftShader references. A real adapter renders the same scenes with
 // its own precision/colour path, so hardware mode checks rendering and export but skips that
@@ -872,7 +958,14 @@ try {
       errs.push('worker: the plan differs from main on the same frame');
     else console.log(`worker: main vs worker ${mainRef.w}x${mainRef.h} hash ${workerOut.cmp.hash >>> 0} lum ${workerOut.cmp.lum} IDENTICAL`);
     // T1c: export runs in the worker and encodes from an offscreen texture, not the canvas.
+    // The page only hands the bytes over; Node decodes them in the headless page above.
     const workerExport = await workerPage.evaluate(async () => {
+      const b64Of = async (blob) => {
+        const a = new Uint8Array(await blob.arrayBuffer());
+        let s = '';
+        for (let i = 0; i < a.length; i += 0x8000) s += String.fromCharCode.apply(null, a.subarray(i, i + 0x8000));
+        return btoa(s);
+      };
       const savedNf = nf;
       nf = 45; blocks = [newBlock(9, { len: 256, mosh: 0.6, glitch: 0, var: 1, rgb: 0.3 })];
       fx = []; lastBlob = null; push();
@@ -881,19 +974,9 @@ try {
       const b = lastBlob ? lastBlob.blob : null;
       nf = savedNf;
       if (!b) return { status: st, blob: 0, mode, renderIn };
-      const url = URL.createObjectURL(b);
-      const v = document.createElement('video'); v.muted = true; v.src = url; v.load();
-      await new Promise((res) => { v.onloadeddata = res; v.onerror = res; setTimeout(res, 4000); });
-      v.currentTime = 0.5;
-      await new Promise((r) => { v.onseeked = r; setTimeout(r, 800); });
-      const c = document.createElement('canvas'); c.width = 160; c.height = 90;
-      const g = c.getContext('2d'); g.drawImage(v, 0, 0, 160, 90);
-      const d = g.getImageData(0, 0, 160, 90).data;
-      let sum = 0; for (let i = 0; i < d.length; i += 4) sum += d[i] + d[i + 1] + d[i + 2];
-      URL.revokeObjectURL(url);
-      return { status: st, blob: b.size, type: b.type, dur: +(v.duration || 0).toFixed(2),
-        w: v.videoWidth, h: v.videoHeight, lum: +(sum / (160 * 90 * 3 * 255)).toFixed(3), mode, renderIn };
+      return { status: st, blob: b.size, type: b.type, b64: await b64Of(b), mode, renderIn };
     });
+    if (workerExport.b64) Object.assign(workerExport, await decodeVideoFile(workerExport.b64, workerExport.type, 'worker export'));
     if (!(workerExport.blob > 0)) errs.push('worker export: no file (' + workerExport.status + ')');
     else if (!(workerExport.w > 0) || !(workerExport.h > 0) || !(workerExport.dur > 0))
       errs.push('worker export: the file does not decode');
@@ -918,19 +1001,11 @@ try {
     await workerPage.setInputFiles('#mfile', clipVid);
     await workerPage.waitForFunction(() => /added|Could not/.test($('status').textContent), null, { timeout: 20000 }).catch(() => {});
     const mediaExport = await workerPage.evaluate(async () => {
-      const hashOf = (a) => { let x = 2166136261 >>> 0; for (let i = 0; i < a.length; i++) x = Math.imul(x ^ a[i], 16777619) >>> 0; return x >>> 0; };
-      const decode = async (b) => {
-        const url = URL.createObjectURL(b);
-        const v = document.createElement('video'); v.muted = true; v.src = url; v.load();
-        await new Promise((res) => { v.onloadeddata = res; v.onerror = res; setTimeout(res, 4000); });
-        v.currentTime = 0.5;
-        await new Promise((r) => { v.onseeked = r; setTimeout(r, 800); });
-        const c = document.createElement('canvas'); c.width = 160; c.height = 90;
-        const g = c.getContext('2d'); g.drawImage(v, 0, 0, 160, 90);
-        const d = g.getImageData(0, 0, 160, 90).data;
-        let sum = 0; for (let i = 0; i < d.length; i += 4) sum += d[i] + d[i + 1] + d[i + 2];
-        URL.revokeObjectURL(url);
-        return { hash: hashOf(d), lum: +(sum / (160 * 90 * 3 * 255)).toFixed(3), w: v.videoWidth, h: v.videoHeight, dur: +(v.duration || 0).toFixed(2) };
+      const b64Of = async (blob) => {
+        const a = new Uint8Array(await blob.arrayBuffer());
+        let s = '';
+        for (let i = 0; i < a.length; i += 0x8000) s += String.fromCharCode.apply(null, a.subarray(i, i + 0x8000));
+        return btoa(s);
       };
       const savedNf = nf;
       nf = 30; blocks = [newBlock(16, { len: 256, clip: 0, mosh: 0.5, glitch: 0, var: 1, rgb: 0.3 })];
@@ -939,12 +1014,16 @@ try {
         lastBlob = null; push(); await exportVideo();
         const b = lastBlob ? lastBlob.blob : null;
         if (!b) return { status: $('status').textContent, blob: 0 };
-        return { status: $('status').textContent, blob: b.size, ...(await decode(b)) };
+        return { status: $('status').textContent, blob: b.size, type: b.type, b64: await b64Of(b) };
       };
       const a = await run(), b = await run();
       nf = savedNf;
       return { a, b };
     });
+    // Both files go through the one headless page, so a difference between the two hashes comes
+    // from the encoded frames, not from which page decoded them.
+    if (mediaExport.a.b64) Object.assign(mediaExport.a, await decodeVideoFile(mediaExport.a.b64, mediaExport.a.type, 'worker media export (first)'));
+    if (mediaExport.b.b64) Object.assign(mediaExport.b, await decodeVideoFile(mediaExport.b.b64, mediaExport.b.type, 'worker media export (second)'));
     if (!(mediaExport.a.blob > 0) || !(mediaExport.b.blob > 0))
       errs.push('worker media export: no file (' + mediaExport.a.status + ' / ' + mediaExport.b.status + ')');
     else if (!(mediaExport.a.lum > 0.01)) errs.push('worker media export decoded to black frames');
@@ -1113,6 +1192,12 @@ else console.log('export guard: empty encode -> "' + emptyExport.status + '"');
 await page.bringToFront();
 await page.waitForTimeout(300);
 const exp = await page.evaluate(async () => {
+  const b64Of = async (blob) => {
+    const a = new Uint8Array(await blob.arrayBuffer());
+    let s = '';
+    for (let i = 0; i < a.length; i += 0x8000) s += String.fromCharCode.apply(null, a.subarray(i, i + 0x8000));
+    return btoa(s);
+  };
   delete window.__MOSH_OFFSCREEN;
   gpuAttach({ offscreen: false });       // ENV.offscreen is what gpuResize reads; deleting the global is not enough
   gpuResize(G.w, G.h);
@@ -1131,20 +1216,11 @@ const exp = await page.evaluate(async () => {
     lost: (typeof G !== 'undefined' && G.lostMsg) || '', ok: (typeof G !== 'undefined' && !!G.ok) };
   nf = savedNf;
   if (!b) return info;
-  const url = URL.createObjectURL(b);
-  const v = document.createElement('video'); v.muted = true; v.src = url; v.load();
-  await new Promise((res) => { v.onloadeddata = res; v.onerror = res; setTimeout(res, 4000); });
-  v.currentTime = 0.5;
-  await new Promise((r) => { v.onseeked = r; setTimeout(r, 800); });
-  const c = document.createElement('canvas'); c.width = 160; c.height = 90;
-  const g = c.getContext('2d'); g.drawImage(v, 0, 0, 160, 90);
-  const d = g.getImageData(0, 0, 160, 90).data;
-  let sum = 0; for (let i = 0; i < d.length; i += 4) sum += d[i] + d[i+1] + d[i+2];
-  URL.revokeObjectURL(url);
-  return { ...info, type: b.type, dur: +(v.duration || 0).toFixed(2),
-    w: v.videoWidth, h: v.videoHeight, lum: +(sum / (160 * 90 * 3 * 255)).toFixed(3) };
+  // The decode happens in Node's headless page, never here: this page may be a headed window.
+  return { ...info, type: b.type, b64: await b64Of(b) };
 });
 const lostDevice = exp.mode !== 'gpu' || !!exp.lost || !exp.ok || /lost|device lost/i.test(exp.status || '');
+if (!lostDevice && exp.b64) Object.assign(exp, await decodeVideoFile(exp.b64, exp.type, 'export'));
 if (lostDevice) {
   const why = exp.lost || (/GPU was lost[^.;]*/i.exec(exp.status || '') || [])[0]
     || (exp.mode !== 'gpu' ? 'no presentable WebGPU canvas' : 'the GPU device was lost');
@@ -1238,6 +1314,7 @@ if (CHECK_GOLDENS && fs.existsSync(goldenDir)) {
 }
 
 
+await closeDecodePage();
 await browser.close();
 
 const all = [...errs, ...gpuErrs.map((e) => 'GPU ' + e)];
