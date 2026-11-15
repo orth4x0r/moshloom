@@ -221,18 +221,33 @@ source includes that text.
 On SwiftShader (`npm test`, main at 6bcd8dd): worker export 1.94 MB 1280x720, decoded luminance
 0.111; the clip export lands on hash 1500507020 twice; worker thumbnails 39/39.
 
-**The hardware gate is not green.** `npm run test:gpu:hw` on the T1c merge (f4517c3) failed:
+**Hardware gate: green at dd5a5ec, two back-to-back runs, identical numbers.**
+
+| line | run 1 (19:49-20:02) | run 2 (20:02-20:11) |
+| --- | --- | --- |
+| main export | 1.02 MB 640x360, decoded luminance 0.273 | same |
+| worker export | 1.96 MB 1280x720, decoded luminance 0.11 | same |
+| worker clip export | hash 195076583 twice, luminance 0.022 | same |
+| main vs worker | hash 3336782791, lum 0.3203, IDENTICAL | same |
+| recovery device-lost / onerror | worker+gpu -> main+gpu, lum 0.5665 / 0.6217 | 0.5593 / 0.6166 |
+| profile | 4.23 ms total, fluid 0.21 | 4.93 ms, fluid 0.27 |
+| gate | `PASS · goldens skipped (hardware) · page errors 0 · validation errors 0 · skips: none` | same |
+
+Idle state: no input from 19:52:30 to 20:03:30 (run 1's last 10 minutes); run 2 saw input at about
+20:03 and 20:08. The clip hash differs from SwiftShader's 1500507020 because the real adapter
+renders the clip differently; it is repeatable within and across runs. Goldens are SwiftShader
+references and are not compared on hardware.
+
+History. `npm run test:gpu:hw` on the T1c merge (f4517c3) failed:
 the main-mode export (visible canvas) decoded black, luminance 0, and the worker clip export was
 not repeatable (3606441599 vs 3996078533); worker export itself was lit (1.96 MB, 0.11). Main-mode
 export has decoded black in every hardware run since T1c work began; the last lit one was 0.101.
 The same suite on a candidate fix (PR #4) also failed, including a worker export that had been
 lit, so on this machine the hardware result currently changes between runs without a code change.
-Until it is reproducible, no hardware number here is evidence for or against a fix.
-
-Since X2 (#7) every export, main and worker, renders into the offscreen texture and reads it back,
-so an export no longer depends on the window being composited. The harness still decodes the
-exported file inside the headed window, which is the remaining window dependence; H4 moves that
-decode into a separate headless browser.
+Two changes removed the dependence on the window: since X2 (#7) every export, main and worker,
+renders into the offscreen texture and reads it back, and since H4 (#10) the harness decodes
+exported files in a separate headless Chromium (`--use-angle=swiftshader`, so the decoded numbers
+match the SwiftShader run) instead of inside the headed window.
 
 ### Milestone zip
 
