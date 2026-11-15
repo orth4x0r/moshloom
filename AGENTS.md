@@ -40,7 +40,7 @@ Up to **four** workers at once, one lane each, never two workers in the same lan
 | **B · harness** | `gpu_test.mjs`, `test.mjs` | H2 |
 | **C · gates** | `scripts/gate*`, `scripts/testdata/**`, `.github/workflows/pack.yml` | H1 |
 | **D · tooling** | `scripts/zip.mjs`, `package.json`, `package-lock.json` | Z1 |
-| **E · docs** | `README.md`, `lab/*/README.md` | coordinator |
+| **E · docs** | `README.md`, `lab/*/README.md`, `.github/workflows/ci.yml` | coordinator |
 | **frozen** | `AGENTS.md`, `fixtures/**`, `engine.c`, `engine.wasm`, `build.*`, `lab/`, `index.html` | coordinator only |
 
 Lane A is the bottleneck: `index.src.html` carries the UI, the worker protocol and export in one
