@@ -49,12 +49,22 @@ const lockNames = (dir) => {
   catch (e) { return []; }
 };
 
+// openSync('wx') creates the file empty and the record is written a moment later. A lock with no
+// readable record that is this young is a run being born, not a stale lock: deleting it there would
+// let two runs both pass their checks.
+const YOUNG_MS = 10000;
+function beingWritten(file) {
+  try { return Date.now() - fs.statSync(file).mtimeMs < YOUNG_MS; } catch (e) { return false; }
+}
+
 // Stale = the recorded pid is not running. A live lock is never removed: it is exactly the run
-// the rule protects. A record with no readable pid cannot be attributed, so it counts as stale.
+// the rule protects. A record with no readable pid cannot be attributed, so it counts as stale
+// once it is older than YOUNG_MS.
 function removeStaleLocks(dir) {
   for (const n of lockNames(dir)) {
     const file = path.join(dir, n);
     const rec = readRecord(file);
+    if (!rec && beingWritten(file)) continue;
     const pid = rec ? rec.pid : 0;
     if (pidAlive(pid)) continue;
     try {
@@ -71,7 +81,12 @@ function liveConflicts(dir, hardware) {
   for (const n of lockNames(dir)) {
     const file = path.join(dir, n);
     const rec = readRecord(file);
-    if (!rec || !pidAlive(rec.pid)) continue;
+    if (!rec) {
+      // a run that has created its lock but not yet written it: treat it as live
+      if (beingWritten(file) && (n === GPU_LOCK || hardware)) out.push({ file, pid: 0, start: 'being written', cwd: 'unknown' });
+      continue;
+    }
+    if (!pidAlive(rec.pid)) continue;
     if (n === GPU_LOCK || hardware) out.push({ file, ...rec });
   }
   return out;
@@ -309,10 +324,20 @@ async function runLockSelfTest() {
           && /peer marker sw\.\d+\.lock seen at the same time/.test(outB) && lockNames(d).length === 0,
         `exits ${ca}/${cb}; "${outA.trim().split('\n').pop()}" | "${outB.trim().split('\n').pop()}"`);
     }
+    // 6. a gpu.lock that exists but is not written yet is a run being born, not a stale lock
+    {
+      const d = dir('young');
+      const g = path.join(d, GPU_LOCK);
+      fs.closeSync(fs.openSync(g, 'wx'));
+      const { value, lines } = quiet(() => acquireRunLock({ dir: d, hardware: false }));
+      ok('an empty, just-created gpu.lock blocks a SwiftShader run and is not swept',
+        !value.ok && fs.existsSync(g) && lines.length === 0,
+        `refused=${!value.ok}, gpu.lock kept=${fs.existsSync(g)}, stale lines ${lines.length}`);
+    }
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) {}
   }
-  console.log(`lock self-test: ${pass} passed, ${fail} failed, ${Date.now() - started} ms, no browser launched`);
+  console.log(`lock self-test:${pass} passed, ${fail} failed, ${Date.now() - started} ms, no browser launched`);
   process.exit(fail ? 1 : 0);
 }
 
