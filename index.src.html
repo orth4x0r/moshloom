@@ -342,15 +342,11 @@ self.onmessage = async (ev) => {
     }
     if (!gpuWasm()) throw new Error('worker not initialised');
     if (m.t === 'features') {
+      const err = Renderer.loadFeatures(m.p); if (err) throw new Error(err);
       const X = gpuWasm();
-      X.load_features(m.p.nf);
-      for (let i = 0; i < m.p.arrays.length; i++)
-        new Float32Array(X.memory.buffer, X.feat(i), m.p.nf).set(m.p.arrays[i]);
-      new Float32Array(X.memory.buffer, X.mel_ptr(), m.p.nf * 24).set(m.p.mel);
-      X.set_grid(m.p.bpm, m.p.offs);
       return wReply('features-ok', { nf: X.get_nf(), bpm: X.get_bpm(), offs: X.get_offs() }, m.id);
     }
-    if (m.t === 'project') { const err = gpuSetProject(m.p); if (err) throw new Error(err); return wReply('project-ok', {}, m.id); }
+    if (m.t === 'project') { const err = Renderer.setProject(m.p); if (err) throw new Error(err); return wReply('project-ok', {}, m.id); }
     if (m.t === 'seek') { gpuWasm().reset(); gpuReset(); return wReply('seek-ok', {}, m.id); }
     if (m.t === 'resize') {
       WSV.w = m.p.w; WSV.h = m.p.h;
@@ -711,16 +707,13 @@ async function analysisRoundTrip(type, payload, transfer){
   lastAnalyzeMs = performance.now() - t0;
   return r;
 }
-// Load analysis made elsewhere into the render-side wasm: arrays first, then the grid, because
-// fPulse/fTT/fHue are derived from the arrays by set_grid() and plan() reads them every frame.
+// Load analysis made elsewhere into the render-side wasm through the renderer's one loader (arrays
+// first, then the grid); this function only keeps the page's own bookkeeping.
 function applyFeatures(r){
   nf = r.nf;
-  X.load_features(nf);
-  for (let i = 0; i < r.arrays.length; i++)
-    new Float32Array(X.memory.buffer, X.feat(i), nf).set(r.arrays[i]);
-  new Float32Array(X.memory.buffer, X.mel_ptr(), nf * 24).set(r.mel);
   bpm = r.bpm; offs = r.offs;
-  X.set_grid(bpm, offs);
+  const err = Renderer.loadFeatures({ nf, arrays: r.arrays, mel: r.mel, bpm, offs });
+  if (err) throw new Error(err);
   grabFeats();
   if (renderIn === 'worker' && rw)
     rwCall('features', { nf, bpm, offs, arrays: [0,1,2,3,4,5,6].map((i) => new Float32Array(X.memory.buffer, X.feat(i), nf).slice()),
@@ -747,7 +740,7 @@ function afterAnalysis(keep,fix){
   seek(0);
 }
 function push(){
-  const err=gpuSetProject({blocks,fx,bpm,offs});
+  const err=Renderer.setProject({blocks,fx,bpm,offs});
   if (renderIn === 'worker' && rw) rwCall('project', { blocks, fx, bpm, offs }).catch((e) => toast('render worker: ' + e.message, 'warn'));
   if(err) fail(err);
   const json=JSON.stringify(project());            // outside the try: a throw here is a bug, not a storage failure
