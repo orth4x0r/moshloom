@@ -68,8 +68,14 @@ Two rules that make this survivable:
 
 ## Test facts that bite
 
-- **Export skips on SwiftShader.** A software adapter cannot encode from a presented WebGPU
-  canvas. That skip is expected there; on `--hardware` the export step must fail instead.
+- **Exports never read the presented canvas.** Main and worker export render into the offscreen
+  texture and read it back (`gpuCapFrame` in gpu.js), because a canvas capture is blank whenever
+  the window is not composited. So export runs on SwiftShader too: `npm test` has **no allowed
+  skip**, and the gate FAILs on any skip, including the old `export: software adapter cannot
+  encode from the presented canvas`.
+- **Hardware runs need an untouched machine.** `npm run test:gpu:hw` drives a headed window; while
+  someone is using the machine its results changed between runs with no code change. Quote the
+  idle state with any hardware number.
 - **The worker + GPU comparison needs a machine that can present from a worker.** Elsewhere it
   prints a skip with its reason. A skip is not a pass — quote it verbatim.
 - **Sections share one long-lived page.** Every section starts with `resetSection()` (120 BPM,
