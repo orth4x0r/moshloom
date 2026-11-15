@@ -37,6 +37,8 @@ const SWIFTSHADER_ARGS = [
 ];
 const HARDWARE_ARGS = [
   '--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--autoplay-policy=no-user-gesture-required',
+  '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
+  '--disable-background-timer-throttling', '--disable-features=CalculateNativeWinOcclusion',
 ];
 
 async function launch() {
@@ -539,8 +541,19 @@ try {
       const sz = workerExport.blob >= 1e5 ? (workerExport.blob / 1e6).toFixed(2) + ' MB' : Math.max(1, Math.round(workerExport.blob / 1024)) + ' KB';
       console.log(`worker export: ${sz} ${workerExport.type} ${workerExport.w}x${workerExport.h} ${workerExport.dur}s, decoded luminance ${workerExport.lum}`);
     }
+    // T1c: the Size control must resize the worker's textures, not the page's transferred canvas.
+    await workerPage.selectOption('#res', '640');
+    await workerPage.waitForTimeout(600);
+    const workerResize = await workerPage.evaluate(async () => {
+      const r = await rwCall('readback', {});
+      return { w: r.w, h: r.h, W, H, run: window.__runMode };
+    });
+    if (workerResize.w !== 640 || workerResize.h !== 360 || workerResize.W !== 640 || workerResize.H !== 360)
+      errs.push(`worker resize: readback ${workerResize.w}x${workerResize.h}, page ${workerResize.W}x${workerResize.H}`);
+    else console.log(`worker resize: ${workerResize.w}x${workerResize.h}, ${workerResize.run}`);
     // A video Media block exercises the request/transfer path, and two exports must land on the
     // same clip frame at the same timestamp.
+    await workerPage.bringToFront();
     await workerPage.setInputFiles('#mfile', clipVid);
     await workerPage.waitForFunction(() => /added|Could not/.test($('status').textContent), null, { timeout: 20000 }).catch(() => {});
     const mediaExport = await workerPage.evaluate(async () => {
@@ -587,16 +600,6 @@ try {
     }));
     if (workerThumbs.drawn === 0) errs.push('worker thumbnails: no block thumbnail was generated');
     else console.log(`worker thumbnails: ${workerThumbs.cached} cached, ${workerThumbs.drawn}/${workerThumbs.blocks} blocks have one`);
-    // T1c: the Size control must resize the worker's textures, not the page's transferred canvas.
-    await workerPage.selectOption('#res', '640');
-    await workerPage.waitForTimeout(600);
-    const workerResize = await workerPage.evaluate(async () => {
-      const r = await rwCall('readback', {});
-      return { w: r.w, h: r.h, W, H, run: window.__runMode };
-    });
-    if (workerResize.w !== 640 || workerResize.h !== 360 || workerResize.W !== 640 || workerResize.H !== 360)
-      errs.push(`worker resize: readback ${workerResize.w}x${workerResize.h}, page ${workerResize.W}x${workerResize.H}`);
-    else console.log(`worker resize: ${workerResize.w}x${workerResize.h}, ${workerResize.run}`);
     if (werrs.length) errs.push('worker page: ' + werrs[0]);
   }
   // The header control must restart through recovery. A machine can always reach CPU.
@@ -647,7 +650,9 @@ const emptyExport = await page.evaluate(async () => {
   const savedNf = nf;
   window.VideoEncoder = FakeVE; window.VideoFrame = FakeVF;
   nf = 2; blocks = [newBlock(9, { len: 256, mosh: 0, glitch: 0, var: 1 })]; fx = []; lastBlob = null; push();
-  try { await exportVideo(); } finally { window.VideoEncoder = RealVE; window.VideoFrame = RealVF; nf = savedNf; }
+  try { await exportVideo(); } finally {
+    window.VideoEncoder = RealVE; window.VideoFrame = RealVF; nf = savedNf;
+  }
   return { status: $('status').textContent, blob: lastBlob ? lastBlob.blob.size : 0 };
 });
 if (emptyExport.blob !== 0) errs.push('export guard: an empty encode left a ' + emptyExport.blob + '-byte blob');
