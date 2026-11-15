@@ -20,14 +20,25 @@ const dir = path.join(here, 'testdata');
 // file -> what the parser must say about it.
 const CASES = [
   {
-    file: 'pass-swiftshader.log', encoding: 'utf-16le', code: 0, verdict: 'ok',
-    why: 'a full `npm test` run, goldens clean, the one allowed skip',
+    file: 'pass-swiftshader.log', encoding: 'utf-8', code: 0, verdict: 'ok',
+    why: 'a full `npm test` run after X2: goldens clean, main export runs on SwiftShader, no skip',
+    goldens: { kind: 'compared', total: 13, within: 13, failed: 0, diffPixels: 0 },
+    cpu: { ms: '14.85', note: null },
+    pageErrors: 0, validationErrors: 0,
+    skips: null,
+    reasons: [],
+    line: 'gate: PASS · goldens 13/13, 0 differing px · CPU 14.85 ms/frame · page errors 0'
+      + ' · validation errors 0 · skips: none',
+  },
+  {
+    file: 'fail-export-skip.log', encoding: 'utf-16le', code: 1, verdict: 'ok',
+    why: 'a green run from before X2: the SwiftShader export skip is no longer allowed',
     goldens: { kind: 'compared', total: 13, within: 13, failed: 0, diffPixels: 0 },
     cpu: { ms: '10.35', note: null },
     pageErrors: 0, validationErrors: 0,
     skips: 'export: software adapter cannot encode from the presented canvas',
-    reasons: [],
-    line: 'gate: PASS · goldens 13/13, 0 differing px · CPU 10.35 ms/frame · page errors 0'
+    reasons: ['unexpected skip: export: software adapter cannot encode from the presented canvas'],
+    line: 'gate: FAIL · goldens 13/13, 0 differing px · CPU 10.35 ms/frame · page errors 0'
       + ' · validation errors 0 · skips: export: software adapter cannot encode from the presented canvas',
   },
   {
@@ -48,7 +59,7 @@ const CASES = [
     cpu: { ms: '10.67', note: null },
     pageErrors: 0, validationErrors: 0,
     skips: SOFTWARE_EXPORT_SKIP,
-    reasons: ['FAIL line present'],
+    reasons: ['FAIL line present', 'unexpected skip: export: software adapter cannot encode from the presented canvas'],
     line: `gate: FAIL · goldens 13/13, 0 differing px · CPU 10.67 ms/frame · page errors 0`
       + ` · validation errors 0 · skips: ${SOFTWARE_EXPORT_SKIP}`,
   },
@@ -90,7 +101,7 @@ const CASES = [
     cpu: { ms: '9.95', note: null },
     pageErrors: 2, validationErrors: 0,
     skips: SOFTWARE_EXPORT_SKIP,
-    reasons: ['FAIL line present', '2 page error line(s) in the FAIL block'],
+    reasons: ['FAIL line present', '2 page error line(s) in the FAIL block', 'unexpected skip: export: software adapter cannot encode from the presented canvas'],
     line: `gate: FAIL · goldens 13/13, 0 differing px · CPU 9.95 ms/frame · page errors 2`
       + ` · validation errors 0 · skips: ${SOFTWARE_EXPORT_SKIP}`,
   },
@@ -101,7 +112,7 @@ const CASES = [
     cpu: { ms: null, note: 'partial log: test.mjs did not run' },
     pageErrors: 0, validationErrors: 0,
     skips: SOFTWARE_EXPORT_SKIP,
-    reasons: ['FAIL line present'],
+    reasons: ['FAIL line present', 'unexpected skip: export: software adapter cannot encode from the presented canvas'],
     line: `gate: FAIL · goldens 13/13, 0 differing px · CPU n/a (partial log: test.mjs did not run)`
       + ` · page errors 0 · validation errors 0 · skips: ${SOFTWARE_EXPORT_SKIP}`,
   },
@@ -112,7 +123,7 @@ const CASES = [
     cpu: { ms: '10.35', note: null },
     pageErrors: null, validationErrors: 0,
     skips: SOFTWARE_EXPORT_SKIP,
-    reasons: ['no golden comparison in a SwiftShader run'],
+    reasons: ['no golden comparison in a SwiftShader run', 'unexpected skip: export: software adapter cannot encode from the presented canvas'],
     line: `gate: FAIL · goldens n/a (no golden comparison in the log) · CPU 10.35 ms/frame`
       + ` · page errors n/a (no verdict line: the run may not have finished) · validation errors 0`
       + ` · skips: ${SOFTWARE_EXPORT_SKIP}`,
@@ -162,7 +173,7 @@ const TRAPS = [
     },
   },
   {
-    why: 'a skip other than the SwiftShader export skip is a FAIL even on a green run',
+    why: 'any skip is a FAIL even on a green run',
     log: [
       'block record 24 floats, effect record 5 floats, render 640x360',
       'ms/frame 10.00  worst 12  frames 10  lit 99%',
