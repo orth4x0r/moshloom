@@ -4,10 +4,347 @@
 // Exits non-zero on any WebGPU validation error, page error, or a black render.
 import { chromium } from 'playwright';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
+
+const HARDWARE = process.argv.includes('--hardware');
+
+// ---- GPU run lock (H3) -------------------------------------------------------
+// AGENTS.md rule 6: one headed-Chrome run at a time on this machine, and nothing alongside it.
+// A brief that says "do not" was already ignored once, so the harness enforces it:
+//   --hardware                     takes the EXCLUSIVE gpu.lock
+//   anything else (npm test,       takes its own sw.<pid>.lock; two of these may overlap
+//     --record, --no-golden)
+// Both are created atomically ('wx') in one directory shared by every checkout and worktree of
+// this user, so a hardware run on the primary checkout stops a SwiftShader run in any worktree.
+// A run that would break the rule prints one `gpu lock: refused ...` line and exits 3 before any
+// browser is launched. `--lock-self-test` exercises all of it with no browser at all.
+const LOCK_REFUSED = 3;
+const GPU_LOCK = 'gpu.lock';
+const swMarker = (pid) => `sw.${pid}.lock`;
+const lockDirFor = () => process.env.MOSHLOOM_LOCK_DIR || path.join(os.homedir(), '.moshloom');
+
+// `process.kill(pid, 0)` in try/catch. On Windows EPERM means the process exists but is not ours.
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return e.code === 'EPERM'; }
+}
+
+function readRecord(file) {
+  try {
+    // Strip a BOM: a lock written by another tool is still a lock, and an unreadable pid reads
+    // as 0, which would let a live run be swept as stale.
+    const j = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+    if (j && Number.isInteger(j.pid)) return j;
+  } catch (e) {}
+  return null;
+}
+
+const lockNames = (dir) => {
+  try { return fs.readdirSync(dir).filter((n) => n === GPU_LOCK || /^sw\.\d+\.lock$/.test(n)); }
+  catch (e) { return []; }
+};
+
+// openSync('wx') creates the file empty and the record is written a moment later. A lock with no
+// readable record that is this young is a run being born, not a stale lock: deleting it there would
+// let two runs both pass their checks.
+const YOUNG_MS = 10000;
+function beingWritten(file) {
+  try { return Date.now() - fs.statSync(file).mtimeMs < YOUNG_MS; } catch (e) { return false; }
+}
+
+// Stale = the recorded pid is not running. A live lock is never removed: it is exactly the run
+// the rule protects. A record with no readable pid cannot be attributed, so it counts as stale
+// once it is older than YOUNG_MS.
+function removeStaleLocks(dir) {
+  for (const n of lockNames(dir)) {
+    const file = path.join(dir, n);
+    const rec = readRecord(file);
+    if (!rec && beingWritten(file)) continue;
+    const pid = rec ? rec.pid : 0;
+    if (pidAlive(pid)) continue;
+    try {
+      fs.unlinkSync(file);
+      console.log(`gpu lock: removed stale ${file} (pid ${pid})`);
+    } catch (e) {}
+  }
+}
+
+// A SwiftShader run is blocked by a live gpu.lock and by nothing else (two may overlap).
+// A hardware run is blocked by a live gpu.lock or by any live sw marker.
+function liveConflicts(dir, hardware) {
+  const out = [];
+  for (const n of lockNames(dir)) {
+    const file = path.join(dir, n);
+    const rec = readRecord(file);
+    if (!rec) {
+      // a run that has created its lock but not yet written it: treat it as live
+      if (beingWritten(file) && (n === GPU_LOCK || hardware)) out.push({ file, pid: 0, start: 'being written', cwd: 'unknown' });
+      continue;
+    }
+    if (!pidAlive(rec.pid)) continue;
+    if (n === GPU_LOCK || hardware) out.push({ file, ...rec });
+  }
+  return out;
+}
+
+const holderText = (h) => `pid ${h.pid} in ${h.file} (started ${h.start || 'unknown start'}, cwd ${h.cwd || 'unknown cwd'})`;
+
+/** Take the lock for a run of this kind: {ok:true, file} or {ok:false, holders|why}. */
+function acquireRunLock({ dir, hardware, argv = process.argv }) {
+  try { fs.mkdirSync(dir, { recursive: true }); }
+  catch (e) { return { ok: false, why: `cannot create lock dir ${dir}: ${e.message}` }; }
+  removeStaleLocks(dir);
+  const clash = liveConflicts(dir, hardware);
+  if (clash.length) return { ok: false, holders: clash };
+  const file = path.join(dir, hardware ? GPU_LOCK : swMarker(process.pid));
+  const record = JSON.stringify({ pid: process.pid, start: new Date().toISOString(), cwd: process.cwd(),
+    argv: argv.slice(2), kind: hardware ? 'hardware' : 'swiftshader' }, null, 1);
+  let fd;
+  try { fd = fs.openSync(file, 'wx'); }          // atomic: throws EEXIST if the file is already there
+  catch (e) {
+    if (e.code === 'EEXIST') {
+      const rec = readRecord(file);
+      return { ok: false, holders: [{ file, pid: rec ? rec.pid : 0, start: rec && rec.start, cwd: rec && rec.cwd }] };
+    }
+    return { ok: false, why: `cannot create ${file}: ${e.message}` };
+  }
+  try { fs.writeSync(fd, record); } finally { fs.closeSync(fd); }
+  // Close the check-then-create window: re-read the other side now that our file exists, and back
+  // off if a run of the opposite kind got in between. Whichever side sees the other first wins.
+  const after = liveConflicts(dir, hardware).filter((h) => h.pid !== process.pid);
+  if (after.length) {
+    try { fs.unlinkSync(file); } catch (e) {}
+    return { ok: false, holders: after };
+  }
+  return { ok: true, file };
+}
+
+// Release on every exit path. `exit` fires for a normal return, process.exit(), an uncaught throw
+// and a signal handler that exits, so one synchronous unlink handler covers all of them.
+const heldLocks = new Set();
+let releaseInstalled = false;
+function installReleaseHandlers() {
+  if (releaseInstalled) return;
+  releaseInstalled = true;
+  process.on('exit', () => {
+    for (const file of heldLocks) { try { fs.unlinkSync(file); } catch (e) {} }
+    heldLocks.clear();
+  });
+  // Windows delivers Ctrl+C as SIGINT; SIGTERM is raised by a parent or a test. Both exit, which
+  // runs the handler above. SIGBREAK is Ctrl+Break on Windows.
+  for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]]) process.on(sig, () => process.exit(code));
+  if (process.platform === 'win32') process.on('SIGBREAK', () => process.exit(131));
+}
+
+/** Acquire or refuse, before any browser exists. */
+function takeRunLock(hardware) {
+  const lock = acquireRunLock({ dir: lockDirFor(), hardware });
+  if (!lock.ok) {
+    const ms = Math.round(process.uptime() * 1000);      // process start -> refusal line
+    const who = lock.holders ? lock.holders.map(holderText).join('; ') : lock.why;
+    console.log(`gpu lock: refused after ${ms} ms for a ${hardware ? 'hardware' : 'SwiftShader'} run: ${who}`
+      + ' - that run owns the GPU; wait for it to finish (a lock whose pid is dead is removed automatically).');
+    process.exit(LOCK_REFUSED);
+  }
+  heldLocks.add(lock.file);
+  installReleaseHandlers();
+  return lock.file;
+}
+
+const SELF_URL = import.meta.url;
+
+// Used only by --lock-self-test: a real second process takes a lock and leaves by a chosen path,
+// so the release handler is exercised for real instead of simulated in-process.
+async function lockChildMode(mode) {
+  const dir = lockDirFor();
+  const lock = acquireRunLock({ dir, hardware: mode === 'hardware' });
+  if (!lock.ok) {
+    console.log(`child ${process.pid}: refused ${lock.holders ? lock.holders.map(holderText).join('; ') : lock.why}`);
+    process.exit(LOCK_REFUSED);
+  }
+  heldLocks.add(lock.file);
+  installReleaseHandlers();
+  console.log(`child ${process.pid}: holding ${lock.file}`);
+  if (mode === 'throw') throw new Error('self-test: the release handler must survive a thrown error');
+  if (mode === 'hold') {
+    // Concurrency case: rendezvous with the other SwiftShader run. The ready file is written only
+    // while the marker is held, so seeing the peer's ready file proves both markers coexisted.
+    const ready = (marker) => marker + '.ready';
+    fs.writeFileSync(ready(lock.file), String(process.pid));
+    const mine = path.basename(ready(lock.file));
+    const deadline = Date.now() + 20000;
+    let peer = 0;
+    while (Date.now() < deadline && !peer) {
+      let names = [];
+      try { names = fs.readdirSync(dir); } catch (e) {}
+      for (const n of names) {
+        if (n === mine || !/^sw\.\d+\.lock\.ready$/.test(n)) continue;
+        try { peer = Number(fs.readFileSync(path.join(dir, n), 'utf8')) || 1; } catch (e) {}
+      }
+      if (!peer) await new Promise((r) => setTimeout(r, 50));
+    }
+    console.log(`child ${process.pid}: holding ${path.basename(lock.file)},`
+      + ` peer marker ${peer ? 'sw.' + peer + '.lock seen at the same time' : 'NEVER SEEN'}`);
+    process.exit(peer ? 0 : 1);
+  }
+  process.exit(0);                                   // the normal-exit path
+}
+
+/** --lock-self-test: every case here, no browser, exit 0/1. */
+async function runLockSelfTest() {
+  const started = Date.now();
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'moshloom-lock-'));
+  let pass = 0, fail = 0;
+  const ok = (name, cond, detail = '') => {
+    if (cond) pass++; else fail++;
+    console.log(`${cond ? 'PASS' : 'FAIL'} ${name}${detail ? ' :: ' + detail : ''}`);
+  };
+  const dir = (tag) => fs.mkdtempSync(path.join(tmp, tag + '-'));
+  const writeFake = (file, pid) => fs.writeFileSync(file,
+    JSON.stringify({ pid, start: '2026-01-01T00:00:00.000Z', cwd: tmp, argv: ['--fake'] }));
+  // A recorded console so the stale-removal lines can be asserted instead of just printed.
+  const quiet = (fn) => {
+    const real = console.log, lines = [];
+    console.log = (...a) => lines.push(a.map(String).join(' '));
+    try { return { value: fn(), lines }; } finally { console.log = real; }
+  };
+  // A pid that is provably dead: a child that has already exited and been reaped.
+  const deadPid = () => {
+    const r = spawnSync(process.execPath, ['-e', '0'], {});
+    if (r.pid && !pidAlive(r.pid)) return r.pid;
+    for (let p = 65000; p < 66000; p++) if (!pidAlive(p)) return p;
+    return 999999;
+  };
+  const envFor = (d, mode) => ({ ...process.env, MOSHLOOM_LOCK_DIR: d, MOSHLOOM_LOCK_CHILD: mode });
+  const childCode = `await import(${JSON.stringify(SELF_URL)})`;
+  const childSync = (d, mode) => spawnSync(process.execPath, ['--input-type=module', '-e', childCode],
+    { env: envFor(d, mode), encoding: 'utf8', timeout: 60000 });
+
+  try {
+    // 1. a live hardware lock blocks a SwiftShader run
+    {
+      const d = dir('hw-blocks-sw');
+      const g = path.join(d, GPU_LOCK);
+      writeFake(g, process.pid);
+      const { value } = quiet(() => acquireRunLock({ dir: d, hardware: false }));
+      ok('a live hardware lock blocks a SwiftShader run',
+        !value.ok && !!value.holders && value.holders[0].pid === process.pid && fs.existsSync(g),
+        `refused=${!value.ok}, holder pid ${value.holders && value.holders[0].pid}, gpu.lock kept=${fs.existsSync(g)}`);
+      ok('the refused SwiftShader run left no marker of its own',
+        !fs.existsSync(path.join(d, swMarker(process.pid))));
+    }
+
+    // 2. a live SwiftShader marker blocks a hardware run
+    {
+      const d = dir('sw-blocks-hw');
+      const m = path.join(d, swMarker(process.pid));
+      writeFake(m, process.pid);
+      const { value } = quiet(() => acquireRunLock({ dir: d, hardware: true }));
+      const g = path.join(d, GPU_LOCK);
+      ok('a live SwiftShader marker blocks a hardware run',
+        !value.ok && value.holders.some((h) => h.file === m) && !fs.existsSync(g),
+        `refused=${!value.ok}, holder ${path.basename(m)}, gpu.lock created=${fs.existsSync(g)}`);
+    }
+
+    // 3. stale locks of both kinds are removed, and the run continues
+    {
+      const d = dir('stale');
+      const dead = deadPid();
+      const g = path.join(d, GPU_LOCK), s = path.join(d, swMarker(dead));
+      writeFake(g, dead); writeFake(s, dead);
+      const { value, lines } = quiet(() => acquireRunLock({ dir: d, hardware: false }));
+      const format = lines.every((l) => new RegExp(`^gpu lock: removed stale .* \\(pid ${dead}\\)$`).test(l));
+      ok('stale locks of both kinds are removed and the run continues',
+        value.ok && lines.length === 2 && format && !fs.existsSync(g) && !fs.existsSync(s),
+        `${lines.length} stale line(s), both in "gpu lock: removed stale <file> (pid ${dead})" form=${format}`);
+      for (const l of lines) console.log('  ' + l);
+      if (value.ok) fs.unlinkSync(value.file);
+    }
+
+    // 3b. a hardware run after a stale gpu.lock takes the exclusive lock (the acquire half of it)
+    {
+      const d = dir('stale-hw');
+      const dead = deadPid();
+      writeFake(path.join(d, GPU_LOCK), dead);
+      const { value, lines } = quiet(() => acquireRunLock({ dir: d, hardware: true }));
+      const body = value.ok ? JSON.parse(fs.readFileSync(value.file, 'utf8')) : {};
+      ok('a stale gpu.lock is removed and a hardware run then takes it exclusively',
+        value.ok && path.basename(value.file) === GPU_LOCK && body.pid === process.pid
+          && typeof body.start === 'string' && Array.isArray(body.argv),
+        `lock=${value.ok ? path.basename(value.file) : 'none'}, record pid ${body.pid}, cwd ${body.cwd}`);
+      for (const l of lines) console.log('  ' + l);
+      if (value.ok) fs.unlinkSync(value.file);
+    }
+
+    // 4. own marker released after a normal exit, and after a thrown error (real child processes)
+    {
+      const d = dir('exit');
+      const r = childSync(d, 'sw');
+      const file = r.pid ? path.join(d, swMarker(r.pid)) : '';
+      ok('the marker is released after a normal exit',
+        r.status === 0 && /child \d+: holding/.test(r.stdout || '') && !!file && !fs.existsSync(file),
+        `child pid ${r.pid} exit ${r.status}, marker gone=${!!file && !fs.existsSync(file)}, child said "${(r.stdout || '').trim()}"`);
+    }
+    {
+      const d = dir('throw');
+      const r = childSync(d, 'throw');
+      const file = r.pid ? path.join(d, swMarker(r.pid)) : '';
+      ok('the marker is released after a thrown error',
+        r.status !== 0 && /child \d+: holding/.test(r.stdout || '') && !!file && !fs.existsSync(file),
+        `child pid ${r.pid} exit ${r.status} (non-zero expected), marker gone=${!!file && !fs.existsSync(file)}`);
+    }
+    {
+      const d = dir('exit-hw');
+      const r = childSync(d, 'hardware');
+      const g = path.join(d, GPU_LOCK);
+      ok('the exclusive gpu.lock is released after a normal exit',
+        r.status === 0 && /child \d+: holding/.test(r.stdout || '') && !fs.existsSync(g),
+        `child pid ${r.pid} exit ${r.status}, gpu.lock gone=${!fs.existsSync(g)}`);
+    }
+
+    // 5. two concurrent SwiftShader runs do not block each other
+    {
+      const d = dir('concurrent');
+      const a = spawn(process.execPath, ['--input-type=module', '-e', childCode],
+        { env: envFor(d, 'hold'), stdio: ['ignore', 'pipe', 'pipe'] });
+      const b = spawn(process.execPath, ['--input-type=module', '-e', childCode],
+        { env: envFor(d, 'hold'), stdio: ['ignore', 'pipe', 'pipe'] });
+      let outA = '', outB = '';
+      a.stdout.on('data', (c) => { outA += c; });
+      b.stdout.on('data', (c) => { outB += c; });
+      const codeOf = (p) => new Promise((res) => p.on('close', res));
+      const [ca, cb] = await Promise.all([codeOf(a), codeOf(b)]);
+      ok('two concurrent SwiftShader runs do not block each other',
+        ca === 0 && cb === 0 && /peer marker sw\.\d+\.lock seen at the same time/.test(outA)
+          && /peer marker sw\.\d+\.lock seen at the same time/.test(outB) && lockNames(d).length === 0,
+        `exits ${ca}/${cb}; "${outA.trim().split('\n').pop()}" | "${outB.trim().split('\n').pop()}"`);
+    }
+    // 6. a gpu.lock that exists but is not written yet is a run being born, not a stale lock
+    {
+      const d = dir('young');
+      const g = path.join(d, GPU_LOCK);
+      fs.closeSync(fs.openSync(g, 'wx'));
+      const { value, lines } = quiet(() => acquireRunLock({ dir: d, hardware: false }));
+      ok('an empty, just-created gpu.lock blocks a SwiftShader run and is not swept',
+        !value.ok && fs.existsSync(g) && lines.length === 0,
+        `refused=${!value.ok}, gpu.lock kept=${fs.existsSync(g)}, stale lines ${lines.length}`);
+    }
+  } finally {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) {}
+  }
+  console.log(`lock self-test:${pass} passed, ${fail} failed, ${Date.now() - started} ms, no browser launched`);
+  process.exit(fail ? 1 : 0);
+}
+
+if (process.env.MOSHLOOM_LOCK_CHILD) await lockChildMode(process.env.MOSHLOOM_LOCK_CHILD);
+if (process.argv.includes('--lock-self-test')) await runLockSelfTest();
+takeRunLock(HARDWARE);
+// ---- end GPU run lock -------------------------------------------------------
 
 const root = import.meta.dirname;
 const html = path.join(root, 'index.html');
@@ -24,7 +361,7 @@ if (!clipImg || !clipVid) { console.error('fixtures/clip.png and a clip video ar
 const outDir = path.join(root, 'out');
 fs.mkdirSync(outDir, { recursive: true });
 
-const HARDWARE = process.argv.includes('--hardware');
+// HARDWARE is read at the top of the file, before the lock is taken.
 // The committed goldens are SwiftShader references. A real adapter renders the same scenes with
 // its own precision/colour path, so hardware mode checks rendering and export but skips that
 // comparison unless a hardware baseline is requested explicitly.
@@ -101,6 +438,33 @@ const resetSection = async () => {
     push();
   });
 };
+
+// Thumbnails are asynchronous: drawTimeline queues thumbsSoon (350 ms) and genThumbs then renders
+// one thumbnail per block, in the page in main mode and in the render worker in worker mode. A
+// fixed wait is a guess in both directions, so wait for the real condition: every #track .blk has
+// a background image. On timeout the counts are reported and the run fails; it never passes on a
+// timeline that is still empty.
+const THUMB_TIMEOUT_MS = 60000;
+async function waitForThumbs(pg, label) {
+  const counts = () => pg.evaluate(() => ({
+    cached: thumbs.size,
+    drawn: [...document.querySelectorAll('#track .blk')].filter((d) => d.style.backgroundImage).length,
+    blocks: blocks.length,
+  }));
+  const t0 = Date.now();
+  let timedOut = false;
+  try {
+    await pg.waitForFunction(() => {
+      const els = [...document.querySelectorAll('#track .blk')];
+      return els.length > 0 && els.length === blocks.length && els.every((d) => d.style.backgroundImage);
+    }, null, { timeout: THUMB_TIMEOUT_MS, polling: 100 });
+  } catch (e) { timedOut = true; }
+  const info = await counts();
+  const ms = Date.now() - t0;
+  // A separate line, so the pinned `thumbs: ...` line below keeps its exact format.
+  console.log(`${label} wait: ${ms} ms for ${info.drawn}/${info.blocks} block thumbnails (budget ${THUMB_TIMEOUT_MS} ms)`);
+  return { ok: !timedOut, info, ms };
+}
 
 const shots = [];
 async function grab(name) {
@@ -258,14 +622,11 @@ else {
 // ---- thumbnails ----
 await resetSection();
 await page.evaluate(() => { autoArrange(); });
-await page.waitForTimeout(6000);
-const thumbInfo = await page.evaluate(() => ({
-  cached: thumbs.size,
-  drawn: [...document.querySelectorAll('#track .blk')].filter((d) => d.style.backgroundImage).length,
-  blocks: blocks.length,
-}));
+const thumbsWait = await waitForThumbs(page, 'thumbs');
+const thumbInfo = thumbsWait.info;
 console.log('thumbs:', `${thumbInfo.cached} cached, ${thumbInfo.drawn}/${thumbInfo.blocks} blocks have one`);
-if (thumbInfo.drawn === 0) errs.push('no block thumbnails were generated');
+if (!thumbsWait.ok) errs.push(`thumbnails: only ${thumbInfo.drawn}/${thumbInfo.blocks} blocks had one after ${thumbsWait.ms} ms (timed out)`);
+else if (thumbInfo.drawn === 0) errs.push('no block thumbnails were generated');
 
 // ---- Auto-arrange must not flicker faster than the flash limit, at any tempo ----
 await resetSection();
@@ -592,14 +953,11 @@ try {
     else console.log(`worker media export: clip frame hash ${mediaExport.a.hash >>> 0} twice, luminance ${mediaExport.a.lum}`);
     // T1c: thumbnails render in the worker too.
     await workerPage.evaluate(() => { autoArrange(); });
-    await workerPage.waitForTimeout(8000);
-    const workerThumbs = await workerPage.evaluate(() => ({
-      cached: thumbs.size,
-      drawn: [...document.querySelectorAll('#track .blk')].filter((d) => d.style.backgroundImage).length,
-      blocks: blocks.length,
-    }));
-    if (workerThumbs.drawn === 0) errs.push('worker thumbnails: no block thumbnail was generated');
-    else console.log(`worker thumbnails: ${workerThumbs.cached} cached, ${workerThumbs.drawn}/${workerThumbs.blocks} blocks have one`);
+    const workerThumbsWait = await waitForThumbs(workerPage, 'worker thumbnails');
+    const workerThumbs = workerThumbsWait.info;
+    console.log(`worker thumbnails: ${workerThumbs.cached} cached, ${workerThumbs.drawn}/${workerThumbs.blocks} blocks have one`);
+    if (!workerThumbsWait.ok) errs.push(`worker thumbnails: only ${workerThumbs.drawn}/${workerThumbs.blocks} blocks had one after ${workerThumbsWait.ms} ms (timed out)`);
+    else if (workerThumbs.drawn === 0) errs.push('worker thumbnails: no block thumbnail was generated');
     if (werrs.length) errs.push('worker page: ' + werrs[0]);
   }
   // The header control must restart through recovery. A machine can always reach CPU.
@@ -632,6 +990,94 @@ try {
 if (workerWhy) {
   skips.push('worker: ' + workerWhy);
   console.log(`worker: skipped here (${workerWhy})`);
+}
+
+// ---- spontaneous worker failures (H2): the device-lost message and onerror both recover ---------
+// README, Recovery: "The worker's own `device-lost` message and the worker `onerror` call the same
+// function. A silent `terminate()` cannot be made to look like a crash, so the mechanism is tested
+// by inviting it explicitly; the spontaneous triggers are wired but not simulated in the suite."
+// These sections invite exactly those two triggers, each on its own fresh worker page, through the
+// handlers index.src.html installs on `rw` (rw.onmessage / rw.onerror), then assert the step-down
+// the README documents (worker+gpu -> main+gpu), a fresh canvas, a rendered frame and no errors.
+for (const name of ['device-lost', 'onerror']) {
+  let rp = null;
+  try {
+    rp = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+    const rerrs = [];
+    rp.on('pageerror', (e) => rerrs.push('PAGEERR ' + e.message));
+    rp.on('console', (m) => { if (m.type() === 'error' && !benignConsole(m.text())) rerrs.push('CONSOLE ' + m.text().slice(0, 500)); });
+    await rp.addInitScript(() => { window.__MOSH_OFFSCREEN = true; });
+    await rp.goto(pathToFileURL(html).href + '?mode=worker&offscreen=1&v=' + Date.now());
+    await rp.waitForFunction(() => window.__featReady === true, null, { timeout: 30000 }).catch(() => {});
+    const before = await rp.evaluate(() => ({
+      runMode: window.__runMode, workerGpu: window.__workerGpu,
+      note: typeof gpuNote === 'string' ? gpuNote : '',
+    }));
+    if (before.runMode !== 'worker+gpu') {
+      const why = (before.workerGpu && before.workerGpu !== 'yes' ? before.workerGpu : 'run mode is ' + (before.runMode || 'unknown'))
+        + (before.note ? ' (' + before.note + ')' : '');
+      skips.push(`recovery ${name}: ` + why);
+      console.log(`recovery ${name}: skipped here (${why})`);
+      continue;
+    }
+    // Tag the live canvas and take the error count, then deliver the failure through the handler
+    // the page actually installed. Frame 0 of a project is a black frame by plan (gpuFrame clears
+    // and returns), so ask for frame 600 - the frame the rest of the suite reads back - by moving
+    // the playhead before the trigger: recover() replays the current frame. recover() sets
+    // window.__runMode in its finally block.
+    await rp.evaluate((kind) => {
+      window.__h2old = $('cv');
+      window.__h2gpuErrs = (typeof G !== 'undefined' && G.errs) ? G.errs.length : 0;
+      pos = 20;                                  // 20 s * 30 fps = frame 600
+      if (kind === 'device-lost') rw.onmessage({ data: PROTO.make('device-lost', { message: 'test' }, null) });
+      else rw.onerror(new ErrorEvent('error', { message: 'test' }));
+    }, name);
+    await rp.waitForFunction(() => window.__runMode && window.__runMode !== 'worker+gpu', null, { timeout: 45000, polling: 100 }).catch(() => {});
+    const after = await rp.evaluate(async () => {
+      const lumOf = (a) => {
+        let s = 0;
+        for (let i = 0; i < a.length; i += 4) s += a[i] + a[i + 1] + a[i + 2];
+        return +(s / (a.length / 4 * 3 * 255)).toFixed(4);
+      };
+      let lum = null, route = 'no readable frame';
+      if (mode === 'gpu' && typeof G !== 'undefined' && G.ok && G.off) {
+        const d = G.dev, w = G.w, h = G.h;
+        const buf = d.createBuffer({ size: w * h * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const e = d.createCommandEncoder();
+        e.copyTextureToBuffer({ texture: G.off }, { buffer: buf, bytesPerRow: w * 4 }, [w, h]);
+        d.queue.submit([e.finish()]);
+        await d.queue.onSubmittedWorkDone();
+        await buf.mapAsync(GPUMapMode.READ);
+        lum = lumOf(new Uint8Array(buf.getMappedRange()));
+        buf.unmap(); buf.destroy();
+        route = 'G.off texture';
+      } else {
+        const c = $('cv');
+        const g = (typeof ctx2d !== 'undefined' && ctx2d) ? ctx2d : null;
+        if (g) { lum = lumOf(g.getImageData(0, 0, c.width, c.height).data); route = '2D canvas'; }
+      }
+      const old = window.__h2old;
+      const now = $('cv');
+      return {
+        runMode: window.__runMode, route, lum,
+        swapped: now !== old && !old.isConnected,
+        gpuNew: ((typeof G !== 'undefined' && G.errs) ? G.errs.length : 0) - window.__h2gpuErrs,
+      };
+    });
+    console.log(`recovery ${name}: ${before.runMode} -> ${after.runMode}, `
+      + `${after.swapped ? 'new canvas' : 'SAME canvas'}, lum ${after.lum} (${after.route}), `
+      + `page errors ${rerrs.length}, validation errors ${after.gpuNew}`);
+    if (after.runMode !== 'main+gpu')
+      errs.push(`recovery ${name}: ${before.runMode} stepped down to ${after.runMode}, expected main+gpu`);
+    if (!after.swapped) errs.push(`recovery ${name}: the canvas element was not replaced`);
+    if (!(after.lum > 0.01)) errs.push(`recovery ${name}: no frame rendered after recovery (lum ${after.lum} via ${after.route})`);
+    if (after.gpuNew) errs.push(`recovery ${name}: ${after.gpuNew} new WebGPU validation error(s)`);
+    if (rerrs.length) errs.push(`recovery ${name}: page error: ${rerrs[0]}`);
+  } catch (e) {
+    errs.push(`recovery ${name}: ${e.message}`);
+  } finally {
+    if (rp) await rp.close();
+  }
 }
 
 // ---- export guard: an encoder that yields no chunks must fail, not report "done · 0.0 MB" ----
