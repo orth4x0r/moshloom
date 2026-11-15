@@ -439,6 +439,33 @@ const resetSection = async () => {
   });
 };
 
+// Thumbnails are asynchronous: drawTimeline queues thumbsSoon (350 ms) and genThumbs then renders
+// one thumbnail per block, in the page in main mode and in the render worker in worker mode. A
+// fixed wait is a guess in both directions, so wait for the real condition: every #track .blk has
+// a background image. On timeout the counts are reported and the run fails; it never passes on a
+// timeline that is still empty.
+const THUMB_TIMEOUT_MS = 60000;
+async function waitForThumbs(pg, label) {
+  const counts = () => pg.evaluate(() => ({
+    cached: thumbs.size,
+    drawn: [...document.querySelectorAll('#track .blk')].filter((d) => d.style.backgroundImage).length,
+    blocks: blocks.length,
+  }));
+  const t0 = Date.now();
+  let timedOut = false;
+  try {
+    await pg.waitForFunction(() => {
+      const els = [...document.querySelectorAll('#track .blk')];
+      return els.length > 0 && els.length === blocks.length && els.every((d) => d.style.backgroundImage);
+    }, null, { timeout: THUMB_TIMEOUT_MS, polling: 100 });
+  } catch (e) { timedOut = true; }
+  const info = await counts();
+  const ms = Date.now() - t0;
+  // A separate line, so the pinned `thumbs: ...` line below keeps its exact format.
+  console.log(`${label} wait: ${ms} ms for ${info.drawn}/${info.blocks} block thumbnails (budget ${THUMB_TIMEOUT_MS} ms)`);
+  return { ok: !timedOut, info, ms };
+}
+
 const shots = [];
 async function grab(name) {
   const px = await page.evaluate(async () => {
@@ -595,14 +622,11 @@ else {
 // ---- thumbnails ----
 await resetSection();
 await page.evaluate(() => { autoArrange(); });
-await page.waitForTimeout(6000);
-const thumbInfo = await page.evaluate(() => ({
-  cached: thumbs.size,
-  drawn: [...document.querySelectorAll('#track .blk')].filter((d) => d.style.backgroundImage).length,
-  blocks: blocks.length,
-}));
+const thumbsWait = await waitForThumbs(page, 'thumbs');
+const thumbInfo = thumbsWait.info;
 console.log('thumbs:', `${thumbInfo.cached} cached, ${thumbInfo.drawn}/${thumbInfo.blocks} blocks have one`);
-if (thumbInfo.drawn === 0) errs.push('no block thumbnails were generated');
+if (!thumbsWait.ok) errs.push(`thumbnails: only ${thumbInfo.drawn}/${thumbInfo.blocks} blocks had one after ${thumbsWait.ms} ms (timed out)`);
+else if (thumbInfo.drawn === 0) errs.push('no block thumbnails were generated');
 
 // ---- Auto-arrange must not flicker faster than the flash limit, at any tempo ----
 await resetSection();
@@ -929,14 +953,11 @@ try {
     else console.log(`worker media export: clip frame hash ${mediaExport.a.hash >>> 0} twice, luminance ${mediaExport.a.lum}`);
     // T1c: thumbnails render in the worker too.
     await workerPage.evaluate(() => { autoArrange(); });
-    await workerPage.waitForTimeout(8000);
-    const workerThumbs = await workerPage.evaluate(() => ({
-      cached: thumbs.size,
-      drawn: [...document.querySelectorAll('#track .blk')].filter((d) => d.style.backgroundImage).length,
-      blocks: blocks.length,
-    }));
-    if (workerThumbs.drawn === 0) errs.push('worker thumbnails: no block thumbnail was generated');
-    else console.log(`worker thumbnails: ${workerThumbs.cached} cached, ${workerThumbs.drawn}/${workerThumbs.blocks} blocks have one`);
+    const workerThumbsWait = await waitForThumbs(workerPage, 'worker thumbnails');
+    const workerThumbs = workerThumbsWait.info;
+    console.log(`worker thumbnails: ${workerThumbs.cached} cached, ${workerThumbs.drawn}/${workerThumbs.blocks} blocks have one`);
+    if (!workerThumbsWait.ok) errs.push(`worker thumbnails: only ${workerThumbs.drawn}/${workerThumbs.blocks} blocks had one after ${workerThumbsWait.ms} ms (timed out)`);
+    else if (workerThumbs.drawn === 0) errs.push('worker thumbnails: no block thumbnail was generated');
     if (werrs.length) errs.push('worker page: ' + werrs[0]);
   }
   // The header control must restart through recovery. A machine can always reach CPU.
@@ -969,6 +990,94 @@ try {
 if (workerWhy) {
   skips.push('worker: ' + workerWhy);
   console.log(`worker: skipped here (${workerWhy})`);
+}
+
+// ---- spontaneous worker failures (H2): the device-lost message and onerror both recover ---------
+// README, Recovery: "The worker's own `device-lost` message and the worker `onerror` call the same
+// function. A silent `terminate()` cannot be made to look like a crash, so the mechanism is tested
+// by inviting it explicitly; the spontaneous triggers are wired but not simulated in the suite."
+// These sections invite exactly those two triggers, each on its own fresh worker page, through the
+// handlers index.src.html installs on `rw` (rw.onmessage / rw.onerror), then assert the step-down
+// the README documents (worker+gpu -> main+gpu), a fresh canvas, a rendered frame and no errors.
+for (const name of ['device-lost', 'onerror']) {
+  let rp = null;
+  try {
+    rp = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+    const rerrs = [];
+    rp.on('pageerror', (e) => rerrs.push('PAGEERR ' + e.message));
+    rp.on('console', (m) => { if (m.type() === 'error' && !benignConsole(m.text())) rerrs.push('CONSOLE ' + m.text().slice(0, 500)); });
+    await rp.addInitScript(() => { window.__MOSH_OFFSCREEN = true; });
+    await rp.goto(pathToFileURL(html).href + '?mode=worker&offscreen=1&v=' + Date.now());
+    await rp.waitForFunction(() => window.__featReady === true, null, { timeout: 30000 }).catch(() => {});
+    const before = await rp.evaluate(() => ({
+      runMode: window.__runMode, workerGpu: window.__workerGpu,
+      note: typeof gpuNote === 'string' ? gpuNote : '',
+    }));
+    if (before.runMode !== 'worker+gpu') {
+      const why = (before.workerGpu && before.workerGpu !== 'yes' ? before.workerGpu : 'run mode is ' + (before.runMode || 'unknown'))
+        + (before.note ? ' (' + before.note + ')' : '');
+      skips.push(`recovery ${name}: ` + why);
+      console.log(`recovery ${name}: skipped here (${why})`);
+      continue;
+    }
+    // Tag the live canvas and take the error count, then deliver the failure through the handler
+    // the page actually installed. Frame 0 of a project is a black frame by plan (gpuFrame clears
+    // and returns), so ask for frame 600 - the frame the rest of the suite reads back - by moving
+    // the playhead before the trigger: recover() replays the current frame. recover() sets
+    // window.__runMode in its finally block.
+    await rp.evaluate((kind) => {
+      window.__h2old = $('cv');
+      window.__h2gpuErrs = (typeof G !== 'undefined' && G.errs) ? G.errs.length : 0;
+      pos = 20;                                  // 20 s * 30 fps = frame 600
+      if (kind === 'device-lost') rw.onmessage({ data: PROTO.make('device-lost', { message: 'test' }, null) });
+      else rw.onerror(new ErrorEvent('error', { message: 'test' }));
+    }, name);
+    await rp.waitForFunction(() => window.__runMode && window.__runMode !== 'worker+gpu', null, { timeout: 45000, polling: 100 }).catch(() => {});
+    const after = await rp.evaluate(async () => {
+      const lumOf = (a) => {
+        let s = 0;
+        for (let i = 0; i < a.length; i += 4) s += a[i] + a[i + 1] + a[i + 2];
+        return +(s / (a.length / 4 * 3 * 255)).toFixed(4);
+      };
+      let lum = null, route = 'no readable frame';
+      if (mode === 'gpu' && typeof G !== 'undefined' && G.ok && G.off) {
+        const d = G.dev, w = G.w, h = G.h;
+        const buf = d.createBuffer({ size: w * h * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const e = d.createCommandEncoder();
+        e.copyTextureToBuffer({ texture: G.off }, { buffer: buf, bytesPerRow: w * 4 }, [w, h]);
+        d.queue.submit([e.finish()]);
+        await d.queue.onSubmittedWorkDone();
+        await buf.mapAsync(GPUMapMode.READ);
+        lum = lumOf(new Uint8Array(buf.getMappedRange()));
+        buf.unmap(); buf.destroy();
+        route = 'G.off texture';
+      } else {
+        const c = $('cv');
+        const g = (typeof ctx2d !== 'undefined' && ctx2d) ? ctx2d : null;
+        if (g) { lum = lumOf(g.getImageData(0, 0, c.width, c.height).data); route = '2D canvas'; }
+      }
+      const old = window.__h2old;
+      const now = $('cv');
+      return {
+        runMode: window.__runMode, route, lum,
+        swapped: now !== old && !old.isConnected,
+        gpuNew: ((typeof G !== 'undefined' && G.errs) ? G.errs.length : 0) - window.__h2gpuErrs,
+      };
+    });
+    console.log(`recovery ${name}: ${before.runMode} -> ${after.runMode}, `
+      + `${after.swapped ? 'new canvas' : 'SAME canvas'}, lum ${after.lum} (${after.route}), `
+      + `page errors ${rerrs.length}, validation errors ${after.gpuNew}`);
+    if (after.runMode !== 'main+gpu')
+      errs.push(`recovery ${name}: ${before.runMode} stepped down to ${after.runMode}, expected main+gpu`);
+    if (!after.swapped) errs.push(`recovery ${name}: the canvas element was not replaced`);
+    if (!(after.lum > 0.01)) errs.push(`recovery ${name}: no frame rendered after recovery (lum ${after.lum} via ${after.route})`);
+    if (after.gpuNew) errs.push(`recovery ${name}: ${after.gpuNew} new WebGPU validation error(s)`);
+    if (rerrs.length) errs.push(`recovery ${name}: page error: ${rerrs[0]}`);
+  } catch (e) {
+    errs.push(`recovery ${name}: ${e.message}`);
+  } finally {
+    if (rp) await rp.close();
+  }
 }
 
 // ---- export guard: an encoder that yields no chunks must fail, not report "done · 0.0 MB" ----
