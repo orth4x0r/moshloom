@@ -37,9 +37,9 @@ Up to **four** workers at once, one lane each, never two workers in the same lan
 | lane | owns | queue, in order |
 | --- | --- | --- |
 | **A · UI / worker** | `index.src.html`, `gpu.js`, `pack.py` | R1 → U1 → T1d |
-| **B · harness** | `gpu_test.mjs`, `test.mjs` | H2 |
-| **C · gates** | `scripts/gate*`, `scripts/testdata/**`, `.github/workflows/pack.yml` | H1 |
-| **D · tooling** | `scripts/zip.mjs`, `package.json`, `package-lock.json` | Z1 |
+| **B · harness** | `gpu_test.mjs`, `test.mjs` | (empty) |
+| **C · gates** | `scripts/gate*`, `scripts/testdata/**` | (empty) |
+| **D · tooling** | `scripts/zip.mjs`, `package.json`, `package-lock.json` | (empty) |
 | **E · docs** | `README.md`, `lab/*/README.md`, `.github/workflows/ci.yml` | coordinator |
 | **frozen** | `AGENTS.md`, `fixtures/**`, `engine.c`, `engine.wasm`, `build.*`, `lab/`, `index.html` | coordinator only |
 
@@ -99,7 +99,10 @@ one branch per task, and never touch another worker's area.
 
 - In: M0, T1a, T1b1, T1b2. Worker mode exists and is **off by default on purpose**, until it has
   been used for real through the header Engine control.
-- In flight: T1c — thumbnails and export in the worker, repeatable video-clip exports.
+- In: T1c (thumbnails, export and repeatable clip exports in the worker), with X2 (exports read
+  back from the texture), H1-H4, Z1, C2. Hardware gate green at dd5a5ec: two back-to-back
+  `npm run test:gpu:hw` runs, identical numbers, `skips: none` (README, T1c section).
+- Next: the milestone zip to the reviewer, then lane A's R1 -> U1 -> T1d.
 - Ceiling: lane A is one file. `T1e` (split `index.src.html` into UI / worker body / export, with
   `pack.py` inlining modules) is the only task that widens the fan-out beyond four. It must land
   with 13/13 goldens untouched, and it does not go before a milestone gate.
