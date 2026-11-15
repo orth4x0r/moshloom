@@ -645,7 +645,7 @@ async function gpuCompile(i,code){
   catch(e){ return (e.message||String(e)).replace(/\(line (\d+)\)/,(m,n)=>'(line '+Math.max(1,n-(WG_HEAD+WG_VS).split('\n').length+1)+')'); }
 }
 async function gpuAddMedia(file){
-  const T=GPUTextureUsage, u=T.TEXTURE_BINDING|T.COPY_DST|T.RENDER_ATTACHMENT, m={name:file.name};
+  const T=GPUTextureUsage, u=T.TEXTURE_BINDING|T.COPY_DST|T.RENDER_ATTACHMENT, m={name:file.name,file};
   if(file.type.startsWith('video')){ const doc=ENV.doc; if(!doc) throw new Error('media needs a document: pass one to gpuAttach');
     const el=doc.createElement('video'); el.muted=true; el.loop=true; el.playsInline=true; el.src=URL.createObjectURL(file);
     await new Promise((res,rej)=>{el.onloadeddata=res;el.onerror=()=>rej(new Error('cannot decode this video'));}); m.kind='video'; m.el=el; m.dur=el.duration||1; const sc=Math.min(1,1280/el.videoWidth); m.w=Math.max(2,Math.round(el.videoWidth*sc)); m.h=Math.max(2,Math.round(el.videoHeight*sc));

@@ -231,7 +231,11 @@ async function runWorkerExport(p, id) {
     const br = w >= 1920 ? 16e6 : w >= 1280 ? 10e6 : w >= 960 ? 7e6 : 4.5e6;
     let vc = null, mp4 = false;
     for (const [c, m] of [['avc1.640028', 1], ['avc1.4d0028', 1], ['avc1.420028', 1], ['vp09.00.40.08', 0], ['vp8', 0]]) {
-      try { if ((await VideoEncoder.isConfigSupported({ codec: c, width: w, height: h, bitrate: br, framerate: fps })).supported) { vc = c; mp4 = !!m; break; } } catch (e) {}
+      try {
+        if ((await VideoEncoder.isConfigSupported({ codec: c, width: w, height: h, bitrate: br, framerate: fps })).supported) {
+          vc = c; mp4 = !!m; break;
+        }
+      } catch (e) {}
     }
     if (!vc) throw new Error('no video encoder available in this worker');
     let ac = null, ch = 0, sr = 0, chs = null;
@@ -421,7 +425,7 @@ let X,mem,img,ctx2d=null,mode='cpu',gpuNote='';
 window.__workerGpu = null;   // null = the probe has not run; 'yes' or 'no: reason' once it has
 let W=640,H=360,nf=0,bpm=120,offs=0,dur=0;
 let blocks=[],fx=[],shaders=[],sections=[],sel=0,fsel=0,selK='blk',ppb=14;
-let actx=null,abuf=null,asrc=null,gain=null,playing=false,pos=0,t0=0,lastF=-1,recording=null,exporting=null,lastBlob=null,dlcap=null;
+let actx=null,abuf=null,asrc=null,gain=null,playing=false,pos=0,t0=0,lastF=-1,recording=null,exporting=null,exportClient=null,lastBlob=null,dlcap=null;
 let feats={},userEdited=false,hist=[],hi=-1;
 
 function fail(m){const e=$('err');e.textContent=m;e.style.display='block';}
@@ -574,6 +578,12 @@ function rwCall(type, payload, transfer) {
     rw.postMessage(PROTO.make(type, payload, id), transfer || []);
   });
 }
+function exportProgress(p) {
+  if (!exporting) return;
+  const pct = Math.round(100 * p.f / Math.max(1, p.nf));
+  $('bExp').textContent = `■ Cancel ${pct}%`;
+  status(`exporting ${W}×${H} · frame ${p.f}/${p.nf}`);
+}
 async function startRenderWorker(opts) {
   opts = opts || {};
   const src = [$('proto').textContent, $('mux-src').textContent, $('gpu-src').textContent, $('render-worker').textContent].join('\n');
@@ -581,13 +591,8 @@ async function startRenderWorker(opts) {
   rw.onmessage = (ev) => {
     const m = ev.data;
     if (m.t === 'device-lost') { recover('device lost in the render worker: ' + m.p.message); return; }
-    if (m.t === 'media-request') { serveWorkerMedia(m.p).catch((e) => toast('export media: ' + e.message, 'warn')); return; }
-    if (m.t === 'export-progress' && exporting) {
-      const p = m.p, pct = Math.round(100 * p.f / Math.max(1, p.nf));
-      $('bExp').textContent = `■ Cancel ${pct}%`;
-      status(`exporting ${W}×${H} · frame ${p.f}/${p.nf}`);
-      return;
-    }
+    if (m.t === 'media-request') { serveWorkerMedia(m.p, (type, payload, transfer) => { if (rw) rw.postMessage(PROTO.make(type, payload, null), transfer || []); }).catch((e) => toast('export media: ' + e.message, 'warn')); return; }
+    if (m.t === 'export-progress') { exportProgress(m.p); return; }
     if (m.t === 'error' && !m.id) { toast('render worker: ' + m.p.message, 'warn'); return; }
     const p = rwPending.get(m.id); if (!p) return;
     rwPending.delete(m.id);
@@ -1088,24 +1093,27 @@ async function seekVideoExact(el,t){
   const d=el.duration||1, q=Math.max(0,Math.min(d-1e-3,Math.round(t*FPS)/FPS));
   if(Math.abs(el.currentTime-q)>1e-4){
     await new Promise(res=>{let done=false;const fin=()=>{if(done)return;done=true;el.removeEventListener('seeked',fin);res();};
-      el.addEventListener('seeked',fin,{once:true});el.currentTime=q;setTimeout(fin,1000);});
+      el.addEventListener('seeked',fin,{once:true});el.currentTime=q;setTimeout(fin,2000);});
   }
-  if(typeof el.requestVideoFrameCallback==='function'){
+  // A seeked video is not always ready to draw on a hardware decoder. Only wait when the page is
+  // visible: in a background tab rVFC and its timer are throttled and would stall an export.
+  if(typeof el.requestVideoFrameCallback==='function'&&document.visibilityState==='visible'){
     await new Promise(res=>{let done=false;const fin=()=>{if(done)return;done=true;res();};
-      try{el.requestVideoFrameCallback(fin);}catch(e){fin();}setTimeout(fin,300);});
+      try{el.requestVideoFrameCallback(fin);}catch(e){fin();}setTimeout(fin,500);});
   }
 }
 const sizeLabel=sz=>sz>=1e5?(sz/1e6).toFixed(1)+' MB':Math.max(1,Math.round(sz/1024))+' KB';
-async function serveWorkerMedia(p){
-  if(!rw) return;
+async function serveWorkerMedia(p, post){
+  if(!post) return;
   const out=[];
   for(const c of p.clips||[]){
     const m=G.media[c.clip]; if(!m||m.kind!=='video'||!m.el) continue;
     await seekVideoExact(m.el,c.time);
-    const bmp=await createImageBitmap(m.el,{resizeWidth:m.w,resizeHeight:m.h,resizeQuality:'high'});
+    m.c2.drawImage(m.el,0,0,m.w,m.h);
+    const bmp=await createImageBitmap(m.cv);
     out.push({clip:c.clip,bitmap:bmp});
   }
-  rw.postMessage(PROTO.make('media-frames',{req:p.req,frames:out},null),out.map(o=>o.bitmap));
+  post('media-frames',{req:p.req,frames:out},out.map(o=>o.bitmap));
 }
 async function addWorkerMedia(file){
   const i=G.media.length;
@@ -1116,7 +1124,8 @@ async function addWorkerMedia(file){
     const cv=document.createElement('canvas'); cv.width=w; cv.height=h; const c2=cv.getContext('2d',{willReadFrequently:true});
     const m={name:file.name,kind:'video',w,h,dur:el.duration||1,el,cv,c2,file}; G.media.push(m);
     await seekVideoExact(el,0);
-    const bmp=await createImageBitmap(el,{resizeWidth:w,resizeHeight:h,resizeQuality:'high'});
+    m.c2.drawImage(el,0,0,w,h);
+    const bmp=await createImageBitmap(m.cv);
     await rwCall('media-frame',{index:i,bitmap:bmp,w,h,dur:m.dur,kind:'video'},[bmp]);
     return i;
   }
@@ -1133,45 +1142,56 @@ async function seekMedia(f){ if(mode!=='gpu'||!G.media.some(m=>m.el))return; con
 function probeCpuLuma(){
   try{ const d=ctx2d.getImageData(0,0,8,8).data; let s=0; for(let i=0;i<d.length;i+=4) s+=d[i]+d[i+1]+d[i+2]; return s/(8*8*3*255); }catch(e){ return null; }
 }
+function renderClient(){
+  return {
+    call:(type,payload,transfer)=>rwCall(type,payload,transfer),
+    post:(type,payload,transfer)=>{ if(rw)rw.postMessage(PROTO.make(type,payload,null),transfer||[]); },
+    close:()=>{},
+  };
+}
+async function runExport(client){
+  await client.call('features',{nf,bpm,offs,
+    arrays:[0,1,2,3,4,5,6].map(i=>new Float32Array(X.memory.buffer,X.feat(i),nf).slice()),
+    mel:new Float32Array(X.memory.buffer,X.mel_ptr(),nf*24).slice()});
+  await client.call('project',{blocks,fx,bpm,offs});
+  // A fresh or recovered worker has no media textures; resend the still images and a video's first frame.
+  for(let i=0;i<G.media.length;i++){
+    const m=G.media[i]; if(!m||!m.file) continue;
+    if(m.kind==='video'){
+      await seekVideoExact(m.el,0);
+      m.c2.drawImage(m.el,0,0,m.w,m.h);
+      const bmp=await createImageBitmap(m.cv);
+      await client.call('media-frame',{index:i,bitmap:bmp,w:m.w,h:m.h,dur:m.dur,kind:'video'},[bmp]);
+    } else {
+      let bmp=await createImageBitmap(m.file);
+      if(bmp.width!==m.w||bmp.height!==m.h){const b2=await createImageBitmap(m.file,{resizeWidth:m.w,resizeHeight:m.h,resizeQuality:'high'});bmp.close();bmp=b2;}
+      await client.call('media-image',{index:i,bitmap:bmp,w:m.w,h:m.h,kind:'image'},[bmp]);
+    }
+  }
+  let audio=null, transfer=[];
+  if(abuf&&typeof AudioEncoder!=='undefined'){
+    const ch=Math.min(2,abuf.numberOfChannels), sr=abuf.sampleRate, total=Math.min(abuf.length,Math.floor(dur*sr));
+    const channels=[...Array(ch).keys()].map(c=>abuf.getChannelData(c).slice(0,total));
+    audio={sampleRate:sr,channels}; transfer=channels.map(a=>a.buffer);
+  }
+  const r=await client.call('export',{w:W,h:H,nf,fps:FPS,bpm,offs,audio},transfer);
+  lastBlob={blob:new Blob([r.buf],{type:r.type}),ext:r.ext};
+  if(!lastBlob.blob.size)throw new Error('export produced an empty file (0-byte blob)');
+  $('bExp').textContent='⬇ Save video';
+  status(`export done · ${sizeLabel(lastBlob.blob.size)} ${lastBlob.ext}${abuf&&!r.audio?' (no audio encoder here — video only)':''} — press Save video`);
+}
 async function exportInWorker(){
   if(mode!=='gpu'||!rw){ status('Export needs the GPU render worker.'); return; }
   pause(); const job={cancel:false}; exporting=job; const btn=$('bExp'); btn.classList.add('on');
-  try{
-    await rwCall('features',{nf,bpm,offs,
-      arrays:[0,1,2,3,4,5,6].map(i=>new Float32Array(X.memory.buffer,X.feat(i),nf).slice()),
-      mel:new Float32Array(X.memory.buffer,X.mel_ptr(),nf*24).slice()});
-    await rwCall('project',{blocks,fx,bpm,offs});
-    // A recovered worker has no media textures; resend the still images and a video's first frame.
-    for(let i=0;i<G.media.length;i++){
-      const m=G.media[i]; if(!m||!m.file) continue;
-      if(m.kind==='video'){
-        await seekVideoExact(m.el,0);
-        const bmp=await createImageBitmap(m.el,{resizeWidth:m.w,resizeHeight:m.h,resizeQuality:'high'});
-        await rwCall('media-frame',{index:i,bitmap:bmp,w:m.w,h:m.h,dur:m.dur,kind:'video'},[bmp]);
-      } else {
-        let bmp=await createImageBitmap(m.file);
-        if(bmp.width!==m.w||bmp.height!==m.h){const b2=await createImageBitmap(m.file,{resizeWidth:m.w,resizeHeight:m.h,resizeQuality:'high'});bmp.close();bmp=b2;}
-        await rwCall('media-image',{index:i,bitmap:bmp,w:m.w,h:m.h,kind:'image'},[bmp]);
-      }
-    }
-    let audio=null, transfer=[];
-    if(abuf&&typeof AudioEncoder!=='undefined'){
-      const ch=Math.min(2,abuf.numberOfChannels), sr=abuf.sampleRate, total=Math.min(abuf.length,Math.floor(dur*sr));
-      const channels=[...Array(ch).keys()].map(c=>abuf.getChannelData(c).slice(0,total));
-      audio={sampleRate:sr,channels}; transfer=channels.map(a=>a.buffer);
-    }
-    const r=await rwCall('export',{w:W,h:H,nf,fps:FPS,bpm,offs,audio},transfer);
-    lastBlob={blob:new Blob([r.buf],{type:r.type}),ext:r.ext};
-    if(!lastBlob.blob.size)throw new Error('export produced an empty file (0-byte blob)');
-    btn.textContent='⬇ Save video'; status(`export done · ${sizeLabel(lastBlob.blob.size)} ${lastBlob.ext}${abuf&&!r.audio?' (no audio encoder here — video only)':''} — press Save video`);
-  }catch(e){ btn.textContent='⬇ Export video'; status(e.message==='cancelled'?'export cancelled':'Export failed: '+(e.message||e)); }
-  exporting=null; btn.classList.remove('on'); pos=0; refresh();
+  exportClient=renderClient();
+  try{ await runExport(exportClient); }
+  catch(e){ btn.textContent='⬇ Export video'; status(e.message==='cancelled'?'export cancelled':'Export failed: '+(e.message||e)); }
+  finally{ exportClient=null; exporting=null; btn.classList.remove('on'); pos=0; refresh(); }
 }
 async function exportVideo(){
   if(renderIn==='worker') return exportInWorker();
   if(!window.VideoEncoder||!window.VideoFrame||typeof Mp4Muxer==='undefined'){startRec();return;}
   pause(); const job={cancel:false}; exporting=job; const btn=$('bExp'); btn.classList.add('on');
-  let prevOff=null, capBuf=null, capRow=0, capFmt='RGBA';
   try{
     const br=W>=1920?16e6:W>=1280?10e6:W>=960?7e6:4.5e6; let vc=null,mp4=false,vBytes=0,vChunks=0;
     for(const [c,m] of [['avc1.640028',1],['avc1.4d0028',1],['avc1.420028',1],['vp09.00.40.08',0],['vp8',0]]){
@@ -1197,38 +1217,15 @@ async function exportVideo(){
       for(let o=0;o<total;o+=N){const n=Math.min(N,total-o),d=new Float32Array(n*ch);for(let c=0;c<ch;c++)d.set(chs[c].subarray(o,o+n),c*n);
         const ad=new AudioData({format:'f32-planar',sampleRate:sr,numberOfFrames:n,numberOfChannels:ch,timestamp:Math.round(o/sr*1e6),data:d});aenc.encode(ad);ad.close();
         if(aenc.encodeQueueSize>40)await sleep(1);} await aenc.flush(); aenc.close(); }
-    if(mode==='gpu'){
-      prevOff=ENV.offscreen;
-      gpuAttach({offscreen:true}); gpuResize(W,H);     // export from a texture, never from a presented canvas
-      capRow=Math.ceil(W*4/256)*256;
-      capBuf=G.dev.createBuffer({size:capRow*H,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
-      capFmt=G.fmt.indexOf('bgra')===0?'BGRA':'RGBA';
-    }
     X.reset(); gpuReset(); const cv=$('cv'), t0=performance.now(); let blackRun=0, probes=0, litProbes=0;
     for(let f=0;f<nf;f++){
       if(job.cancel)throw new Error('cancelled'); if(encErr)throw encErr; if(mode==='gpu'&&!G.ok)throw new Error('GPU was lost during export');
       await seekMedia(f); frame(f);
-      let lum=null;
-      if(mode==='gpu'){
-        await G.dev.queue.onSubmittedWorkDone();
-        const ce=G.dev.createCommandEncoder();
-        ce.copyTextureToBuffer({texture:G.off},{buffer:capBuf,bytesPerRow:capRow},[W,H]);
-        G.dev.queue.submit([ce.finish()]);
-        await capBuf.mapAsync(GPUMapMode.READ);
-        const mapped=new Uint8Array(capBuf.getMappedRange());
-        const copy=new Uint8Array(mapped.length); copy.set(mapped); capBuf.unmap();
-        let sum=0,cnt=0;
-        for(let i=0;i<copy.length;i+=4*97){sum+=copy[i]+copy[i+1]+copy[i+2];cnt++;}
-        lum=cnt?sum/(cnt*3*255):0;
-        if(capFmt==='BGRA')for(let i=0;i<copy.length;i+=4){const b=copy[i];copy[i]=copy[i+2];copy[i+2]=b;}
-        const vf=new VideoFrame(copy,{format:'RGBA',codedWidth:W,codedHeight:H,
-          timestamp:Math.round(f*1e6/FPS),duration:Math.round(1e6/FPS),layout:[{offset:0,stride:capRow}]});
-        venc.encode(vf,{keyFrame:f%60===0}); vf.close();
-      } else {
-        if(f%3===0)await sleep(0);
-        const vf=new VideoFrame(cv,{timestamp:Math.round(f*1e6/FPS),duration:Math.round(1e6/FPS)}); venc.encode(vf,{keyFrame:f%60===0}); vf.close();
-        lum=probeCpuLuma();
-      }
+      // Capture only after the frame has been presented: a WebGPU canvas snapshotted in the same
+      // task as its submit is still blank, which silently produced all-black exports.
+      if(mode==='gpu')await G.dev.queue.onSubmittedWorkDone(); else if(f%3===0)await sleep(0);
+      const vf=new VideoFrame(cv,{timestamp:Math.round(f*1e6/FPS),duration:Math.round(1e6/FPS)}); venc.encode(vf,{keyFrame:f%60===0}); vf.close();
+      const lum=mode==='gpu'?await gpuProbe():probeCpuLuma();
       while(venc.encodeQueueSize>6)await sleep(2);
       if(f>0&&(f%15===0||f===nf-1)){
         probes++;
@@ -1248,10 +1245,6 @@ async function exportVideo(){
     if(!lastBlob.blob.size)throw new Error('export produced an empty file (0-byte blob)');
     btn.textContent='⬇ Save video'; status(`export done · ${sizeLabel(lastBlob.blob.size)} ${lastBlob.ext}${ac||!abuf?'':' (no audio encoder here — video only)'} — press Save video`);
   }catch(e){ btn.textContent='⬇ Export video'; status(e.message==='cancelled'?'export cancelled':'Export failed: '+(e.message||e)); }
-  finally{
-    if(capBuf){try{capBuf.destroy();}catch(e){}}
-    if(prevOff!==null){try{gpuAttach({offscreen:prevOff});gpuResize(W,H);}catch(e){}}
-  }
   exporting=null; btn.classList.remove('on'); pos=0; refresh();
 }
 function startRec(){   // real-time fallback when the browser has no WebCodecs
@@ -1272,7 +1265,7 @@ async function saveRec(){
        lastBlob=null;$('bExp').textContent='⬇ Export video';
   }catch(e){status(e&&e.code==='declined'?'Save declined — press Save video to try again.':'Could not save here ('+((e&&e.code)||e)+').');}
 }
-$('bExp').onclick=()=>{ if(exporting){exporting.cancel=true;if(renderIn==='worker'&&rw)rwCall('export-cancel',{}).catch(()=>{});} else if(recording){pause();} else if(lastBlob){saveRec();} else exportVideo(); };
+$('bExp').onclick=()=>{ if(exporting){exporting.cancel=true;if(exportClient)try{exportClient.post('export-cancel',{});}catch(e){}} else if(recording){pause();} else if(lastBlob){saveRec();} else exportVideo(); };
 $('bExp').oncontextmenu=e=>{e.preventDefault();if(lastBlob){lastBlob=null;$('bExp').textContent='⬇ Export video';status('export discarded');}};
 boot();
 </script>

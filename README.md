@@ -61,8 +61,11 @@ npm test
   (init, frames, readback) and compares one readback hash and plan against main. Where the
   machine cannot run worker + GPU it prints a skip with the reason. The same section switches
   modes through the header control, boots `#cpu`, and checks that `rwCall` rejects clearly
-  when there is no worker. Every long-lived-page section starts by pinning 120 BPM and a known
-  project, so a tempo or arrangement left by an earlier section cannot change a later result.
+  when there is no worker. In worker mode it also exports 45 frames, exports a video clip
+  twice and requires the same decoded clip-frame hash, checks worker thumbnails, and resizes
+  the worker through the Size control. Every long-lived-page section starts by pinning 120 BPM
+  and a known project, so a tempo or arrangement left by an earlier section cannot change a
+  later result.
 
 ### Real-GPU export check
 
@@ -175,7 +178,19 @@ The worker's own `device-lost` message and the worker `onerror` call the same fu
 `terminate()` cannot be made to look like a crash, so the mechanism is tested by inviting it
 explicitly; the spontaneous triggers are wired but not simulated in the suite.
 
-Still to come: thumbnails and export move onto the worker in T1c.
+### T1c: export, thumbnails and media in the worker
+
+In worker mode, export runs **in the render worker**. The worker switches to an offscreen
+texture, reads each frame back, and encodes it; it owns the muxers, so the main thread only
+supplies audio PCM and video frames. Thumbnails also render in the worker (`thumb` message),
+and the Size control sends a `resize` to the worker instead of touching the transferred canvas.
+
+Video clips are requested per export frame. The worker computes the clip time from the same
+grid the plan uses, quantizes it to the export frame rate, and asks the main thread for that
+frame. The main thread seeks the video, draws it to its 2D canvas and transfers an `ImageBitmap`.
+Two exports of the same clip project decode to the same frame hash. The worker wasm, muxers and
+OffscreenCanvas are all in the worker body; `pack.py` inlines the muxers once and the worker
+source includes that text.
 
 ### Builds, goldens and what "same pixels" means
 
@@ -263,6 +278,11 @@ default palette to `DEFPAL` in engine.c (raise the scene limit there and in `pac
   transferred arrays and are loaded with `load_features(nf)`, then `set_grid(bpm, offs)` derives
   `fPulse`/`fTT`/`fHue` — in that order, or `U.T` stays zero and the picture freezes. If workers are
   refused the app falls back to analysing locally and says so in a toast.
+- T1c: export, thumbnails and video clips in the worker. Worker export encodes from an offscreen
+  texture with the muxers inside the worker; clip frames are requested per export frame, quantized
+  to the export rate, and two exports of the same clip project land on the same decoded frame.
+  Worker thumbnails and worker-mode resize are covered by `npm test`. Main-mode export still uses
+  the visible canvas and is the SwiftShader skip.
 - T1b2: the render worker (its own wasm, GPU device and OffscreenCanvas) with the same protocol as
   the analysis worker. Worker mode is chosen by `?mode=`, `#worker` or the header Engine control and
   restarts through recovery. The worker probe is lazy (never in main mode at boot), a worker smoke
