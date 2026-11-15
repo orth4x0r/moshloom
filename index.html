@@ -4109,7 +4109,39 @@ function fluidClear(enc){
   }
 }
 function gpuReset(){ G.valid=false; G.fluidOn=false; }   // call next to WASM.reset(): seek, play start, resize, export
-// cheap pixel probe for the export loop: mean luminance of the last feedback buffer, 0..1
+// ---- offscreen frame capture: the frame an export encodes --------------------------------
+// An export must never read the presented canvas. A canvas snapshot taken when the window is not
+// being composited (a background tab, an occluded window) is blank on a real adapter, and the
+// result changed between runs, so every export switches to an offscreen texture, renders into
+// G.off and reads that texture back. Only the texture path is independent of the window.
+// One MAP_READ buffer per export, reused for every frame. bytesPerRow must be a multiple of 256.
+function gpuCapOpen(w,h){
+  const row=Math.ceil(w*4/256)*256;
+  return {w,h,row,bgra:G.fmt.indexOf('bgra')===0,
+    buf:G.dev.createBuffer({size:row*h,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ})};
+}
+function gpuCapClose(cap){ try{cap.buf.destroy();}catch(e){} }
+// Copies G.off into a tight RGBA frame in `cap` and returns it with the luminance sampled from
+// those same bytes. The guard has to measure what the encoder is handed: the feedback buffer stays
+// bright while a blank capture is encoded, which is how black exports shipped green once.
+async function gpuCapFrame(cap){
+  const dev=G.dev;
+  await dev.queue.onSubmittedWorkDone();
+  const ce=dev.createCommandEncoder();
+  ce.copyTextureToBuffer({texture:G.off},{buffer:cap.buf,bytesPerRow:cap.row},[cap.w,cap.h]);
+  dev.queue.submit([ce.finish()]);
+  await cap.buf.mapAsync(GPUMapMode.READ);
+  const mapped=new Uint8Array(cap.buf.getMappedRange());
+  const copy=new Uint8Array(mapped.length); copy.set(mapped); cap.buf.unmap();
+  let sum=0,cnt=0;
+  for(let i=0;i<copy.length;i+=4*97){sum+=copy[i]+copy[i+1]+copy[i+2];cnt++;}
+  const lum=cnt?sum/(cnt*3*255):0;
+  // G.fmt is the canvas format, so an bgra8unorm adapter hands us BGR: swap before VideoFrame('RGBA').
+  if(cap.bgra)for(let i=0;i<copy.length;i+=4){const b=copy[i];copy[i]=copy[i+2];copy[i+2]=b;}
+  return {copy,lum};
+}
+// Mean luminance of the last feedback buffer, 0..1. Not a capture check: use gpuCapFrame's lum for
+// "what did the encoder get".
 async function gpuProbe(){
   if(!G.ok||!G.valid) return null;
   const dev=G.dev, T=GPUTextureUsage;
@@ -4391,7 +4423,7 @@ function requestMedia(f, clips) {
 }
 async function runWorkerExport(p, id) {
   exportCancel = false;
-  let prevOff = null, prevW = 0, prevH = 0;
+  let prevOff = null, prevW = 0, prevH = 0, cap = null;
   try {
     if (!G || !G.ok) throw new Error('export needs the GPU render worker');
     if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined' || typeof Mp4Muxer === 'undefined')
@@ -4442,9 +4474,8 @@ async function runWorkerExport(p, id) {
     prevOff = ENV.offscreen; prevW = WSV.w; prevH = WSV.h;
     gpuAttach({ offscreen: true }); gpuResize(w, h);
     const X = gpuWasm(); X.reset(); gpuReset();
-    const dev = G.dev, row = Math.ceil(w * 4 / 256) * 256;
-    const buf = dev.createBuffer({ size: row * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    const bgra = G.fmt.indexOf('bgra') === 0;
+    const dev = G.dev;
+    cap = gpuCapOpen(w, h);
     let blackRun = 0, probes = 0, litProbes = 0;
     for (let f = 0; f < nf; f++) {
       if (exportCancel) throw new Error('cancelled');
@@ -4460,24 +4491,15 @@ async function runWorkerExport(p, id) {
         }
       }
       gpuFrame(f);
-      await dev.queue.onSubmittedWorkDone();
-      const ce = dev.createCommandEncoder();
-      ce.copyTextureToBuffer({ texture: G.off }, { buffer: buf, bytesPerRow: row }, [w, h]);
-      dev.queue.submit([ce.finish()]);
-      await buf.mapAsync(GPUMapMode.READ);
-      const mapped = new Uint8Array(buf.getMappedRange());
-      const copy = new Uint8Array(mapped.length); copy.set(mapped); buf.unmap();
-      let sum = 0, cnt = 0;
-      for (let i = 0; i < copy.length; i += 4 * 97) { sum += copy[i] + copy[i + 1] + copy[i + 2]; cnt++; }
-      const lum = cnt ? sum / (cnt * 3 * 255) : 0;
-      if (bgra) for (let i = 0; i < copy.length; i += 4) { const b = copy[i]; copy[i] = copy[i + 2]; copy[i + 2] = b; }
+      const r = await gpuCapFrame(cap);
+      const copy = r.copy, lum = r.lum;
       if (f > 0 && (f % 15 === 0 || f === nf - 1)) {
         probes++;
         if (lum < 0.002) blackRun++; else { blackRun = 0; litProbes++; }
         if (blackRun >= 2) throw new Error('export is producing black frames (frame ' + f + ')');
       }
       const vf = new VideoFrame(copy, { format: 'RGBA', codedWidth: w, codedHeight: h,
-        timestamp: Math.round(f * 1e6 / fps), duration: Math.round(1e6 / fps), layout: [{ offset: 0, stride: row }] });
+        timestamp: Math.round(f * 1e6 / fps), duration: Math.round(1e6 / fps), layout: [{ offset: 0, stride: cap.row }] });
       venc.encode(vf, { keyFrame: f % 60 === 0 }); vf.close();
       while (venc.encodeQueueSize > 6) await sleep(2);
       if (f % 10 === 0) self.postMessage(PROTO.make('export-progress', { f, nf }, null));
@@ -4492,6 +4514,7 @@ async function runWorkerExport(p, id) {
   } catch (e) {
     wReply('error', { message: String((e && e.message) || e) }, id);
   } finally {
+    if (cap) gpuCapClose(cap);
     if (prevOff !== null) {
       try { gpuAttach({ offscreen: prevOff }); gpuResize(prevW, prevH); gpuWasm().reset(); gpuReset(); } catch (e) {}
     }
@@ -5258,18 +5281,43 @@ $('sSave').onclick=async()=>{
 
 // ---------- export ----------
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+// Resolves when the element actually holds a frame to copy (HAVE_CURRENT_DATA). `seeked` alone is
+// not that: it can fire while readyState is still HAVE_METADATA, and drawImage() then silently
+// leaves the previous frame on the canvas.
+function frameReady(el,ms){
+  if(el.readyState>=2) return Promise.resolve(true);
+  return new Promise(res=>{
+    let done=false;
+    const fin=()=>{ if(done)return; done=true; clearTimeout(t);
+      el.removeEventListener('loadeddata',fin); el.removeEventListener('canplay',fin); res(el.readyState>=2); };
+    const t=setTimeout(fin,ms||400);
+    el.addEventListener('loadeddata',fin); el.addEventListener('canplay',fin);
+  });
+}
 async function seekVideoExact(el,t){
   const d=el.duration||1, q=Math.max(0,Math.min(d-1e-3,Math.round(t*FPS)/FPS));
-  if(Math.abs(el.currentTime-q)>1e-4){
-    await new Promise(res=>{let done=false;const fin=()=>{if(done)return;done=true;el.removeEventListener('seeked',fin);res();};
-      el.addEventListener('seeked',fin,{once:true});el.currentTime=q;setTimeout(fin,2000);});
+  // Always assign, even when currentTime already reads q. An element that was loaded but never
+  // seeked has no frame drawImage() can copy - readyState reaches 4 and drawImage is still a silent
+  // no-op - and the assignment is what gives it one. Chrome fires seeked for a same-position seek.
+  // Skipping it here was the asymmetry: the first export's frame 0 was the previous canvas content
+  // (transparent) while the second export sought back from the end and got the real frame.
+  await new Promise(res=>{let done=false;const fin=()=>{if(done)return;done=true;el.removeEventListener('seeked',fin);res();};
+    el.addEventListener('seeked',fin,{once:true});el.currentTime=q;setTimeout(fin,2000);});
+  await frameReady(el,400);
+}
+// The clip frame as a bitmap, or a loud failure - never a stale one. The media elements are
+// detached, so requestVideoFrameCallback never runs for them (the old wait here was a timer, not a
+// readiness check), and drawImage() of an element whose decoder has not caught up is a silent
+// no-op: it leaves the *previous* clip frame on the canvas, which is why two exports of the same
+// clip disagreed. The canvas is cleared before every draw, so that case is visible instead.
+async function grabClipFrame(m){
+  for(let i=0;i<20;i++){
+    m.c2.clearRect(0,0,m.w,m.h); m.c2.drawImage(m.el,0,0,m.w,m.h);
+    const px=samplePixels(m.cv);
+    if(px&&px.alpha>0.5) return createImageBitmap(m.cv);
+    await sleep(25);
   }
-  // A seeked video is not always ready to draw on a hardware decoder. Only wait when the page is
-  // visible: in a background tab rVFC and its timer are throttled and would stall an export.
-  if(typeof el.requestVideoFrameCallback==='function'&&document.visibilityState==='visible'){
-    await new Promise(res=>{let done=false;const fin=()=>{if(done)return;done=true;res();};
-      try{el.requestVideoFrameCallback(fin);}catch(e){fin();}setTimeout(fin,500);});
-  }
+  throw new Error('the clip frame at '+m.el.currentTime.toFixed(2)+'s did not decode');
 }
 const sizeLabel=sz=>sz>=1e5?(sz/1e6).toFixed(1)+' MB':Math.max(1,Math.round(sz/1024))+' KB';
 async function serveWorkerMedia(p, post){
@@ -5278,8 +5326,7 @@ async function serveWorkerMedia(p, post){
   for(const c of p.clips||[]){
     const m=G.media[c.clip]; if(!m||m.kind!=='video'||!m.el) continue;
     await seekVideoExact(m.el,c.time);
-    m.c2.drawImage(m.el,0,0,m.w,m.h);
-    const bmp=await createImageBitmap(m.cv);
+    const bmp=await grabClipFrame(m);
     out.push({clip:c.clip,bitmap:bmp});
   }
   post('media-frames',{req:p.req,frames:out},out.map(o=>o.bitmap));
@@ -5293,8 +5340,7 @@ async function addWorkerMedia(file){
     const cv=document.createElement('canvas'); cv.width=w; cv.height=h; const c2=cv.getContext('2d',{willReadFrequently:true});
     const m={name:file.name,kind:'video',w,h,dur:el.duration||1,el,cv,c2,file}; G.media.push(m);
     await seekVideoExact(el,0);
-    m.c2.drawImage(el,0,0,w,h);
-    const bmp=await createImageBitmap(m.cv);
+    const bmp=await grabClipFrame(m);
     await rwCall('media-frame',{index:i,bitmap:bmp,w,h,dur:m.dur,kind:'video'},[bmp]);
     return i;
   }
@@ -5310,6 +5356,21 @@ async function seekMedia(f){ if(mode!=='gpu'||!G.media.some(m=>m.el))return; con
     await new Promise(r=>{const done=()=>{m.el.removeEventListener('seeked',done);r();};m.el.addEventListener('seeked',done);m.el.currentTime=t;setTimeout(done,400);}); } }
 function probeCpuLuma(){
   try{ const d=ctx2d.getImageData(0,0,8,8).data; let s=0; for(let i=0;i<d.length;i+=4) s+=d[i]+d[i+1]+d[i+2]; return s/(8*8*3*255); }catch(e){ return null; }
+}
+// Mean luminance 0..1 and mean alpha 0..1 of anything drawable, or null when it cannot be read.
+// "Did the clip decoder hand us a frame at all": a canvas that was cleared and then not written to
+// is transparent, a decoded frame is opaque. Export frames do not come through here - a GPU export
+// encodes the readback buffer, and its guard samples those bytes (gpuCapFrame).
+
+let capCv=null,capCtx=null;
+function samplePixels(src){
+  try{
+    if(!capCv){capCv=document.createElement('canvas');capCv.width=8;capCv.height=8;capCtx=capCv.getContext('2d',{willReadFrequently:true});}
+    capCtx.clearRect(0,0,8,8); capCtx.drawImage(src,0,0,8,8);
+    const d=capCtx.getImageData(0,0,8,8).data; let s=0,a=0;
+    for(let i=0;i<d.length;i+=4){ s+=d[i]+d[i+1]+d[i+2]; a+=d[i+3]; }
+    return {lum:s/(8*8*3*255),alpha:a/(8*8*255)};
+  }catch(e){ return null; }
 }
 function renderClient(){
   return {
@@ -5328,8 +5389,7 @@ async function runExport(client){
     const m=G.media[i]; if(!m||!m.file) continue;
     if(m.kind==='video'){
       await seekVideoExact(m.el,0);
-      m.c2.drawImage(m.el,0,0,m.w,m.h);
-      const bmp=await createImageBitmap(m.cv);
+      const bmp=await grabClipFrame(m);
       await client.call('media-frame',{index:i,bitmap:bmp,w:m.w,h:m.h,dur:m.dur,kind:'video'},[bmp]);
     } else {
       let bmp=await createImageBitmap(m.file);
@@ -5361,6 +5421,7 @@ async function exportVideo(){
   if(renderIn==='worker') return exportInWorker();
   if(!window.VideoEncoder||!window.VideoFrame||typeof Mp4Muxer==='undefined'){startRec();return;}
   pause(); const job={cancel:false}; exporting=job; const btn=$('bExp'); btn.classList.add('on');
+  let prevOff=null, cap=null;
   try{
     const br=W>=1920?16e6:W>=1280?10e6:W>=960?7e6:4.5e6; let vc=null,mp4=false,vBytes=0,vChunks=0;
     for(const [c,m] of [['avc1.640028',1],['avc1.4d0028',1],['avc1.420028',1],['vp09.00.40.08',0],['vp8',0]]){
@@ -5386,24 +5447,37 @@ async function exportVideo(){
       for(let o=0;o<total;o+=N){const n=Math.min(N,total-o),d=new Float32Array(n*ch);for(let c=0;c<ch;c++)d.set(chs[c].subarray(o,o+n),c*n);
         const ad=new AudioData({format:'f32-planar',sampleRate:sr,numberOfFrames:n,numberOfChannels:ch,timestamp:Math.round(o/sr*1e6),data:d});aenc.encode(ad);ad.close();
         if(aenc.encodeQueueSize>40)await sleep(1);} await aenc.flush(); aenc.close(); }
+    // Render into an offscreen texture and read that back: a capture of the presented canvas is
+    // blank whenever the window is not composited, which is what made exports black in the
+    // background and took a different path run to run.
+    if(mode==='gpu'){ prevOff=ENV.offscreen; gpuAttach({offscreen:true}); gpuResize(W,H); cap=gpuCapOpen(W,H); }
     X.reset(); gpuReset(); const cv=$('cv'), t0=performance.now(); let blackRun=0, probes=0, litProbes=0;
     for(let f=0;f<nf;f++){
       if(job.cancel)throw new Error('cancelled'); if(encErr)throw encErr; if(mode==='gpu'&&!G.ok)throw new Error('GPU was lost during export');
       await seekMedia(f); frame(f);
-      // Capture only after the frame has been presented: a WebGPU canvas snapshotted in the same
-      // task as its submit is still blank, which silently produced all-black exports.
-      if(mode==='gpu')await G.dev.queue.onSubmittedWorkDone(); else if(f%3===0)await sleep(0);
-      const vf=new VideoFrame(cv,{timestamp:Math.round(f*1e6/FPS),duration:Math.round(1e6/FPS)}); venc.encode(vf,{keyFrame:f%60===0}); vf.close();
-      const lum=mode==='gpu'?await gpuProbe():probeCpuLuma();
+      let vf=null, lum=null;
+      if(mode==='gpu'){
+        const r=await gpuCapFrame(cap); lum=r.lum;
+        vf=new VideoFrame(r.copy,{format:'RGBA',codedWidth:W,codedHeight:H,
+          timestamp:Math.round(f*1e6/FPS),duration:Math.round(1e6/FPS),layout:[{offset:0,stride:cap.row}]});
+      } else {
+        if(f%3===0)await sleep(0);
+        vf=new VideoFrame(cv,{timestamp:Math.round(f*1e6/FPS),duration:Math.round(1e6/FPS)});
+        lum=probeCpuLuma();
+      }
+      venc.encode(vf,{keyFrame:f%60===0}); vf.close();
+      // The guard reads the captured frame, not the feedback buffer: only the capture can tell
+      // "the GPU is drawing" apart from "the frame the encoder got is blank".
+      const probeNow=f>0&&(f%15===0||f===nf-1);
       while(venc.encodeQueueSize>6)await sleep(2);
-      if(f>0&&(f%15===0||f===nf-1)){
+      if(probeNow){
         probes++;
         if(lum!==null){ if(lum<0.002)blackRun++; else {blackRun=0;litProbes++;} }
-        if(blackRun>=2)throw new Error('export is producing black frames (frame '+f+') - the canvas or the GPU is not delivering pixels');
+        if(blackRun>=2)throw new Error('export is producing black frames (frame '+f+', captured luminance '+(lum===null?'n/a':lum.toFixed(4))+') - the frame read back from the offscreen texture was blank');
       }
       if(f%10===0){const p=f/nf;btn.textContent=`■ Cancel ${Math.round(p*100)}%`;status(`exporting ${W}×${H} ${mp4?'mp4':'webm'} · frame ${f}/${nf}`+(f>30?` · about ${Math.ceil((performance.now()-t0)/1000*(1-p)/p)}s left`:''));pos=f/FPS;}
     }
-    if(probes&&!litProbes)throw new Error('export produced only black frames ('+probes+' probes, none lit) - the canvas or the GPU is not delivering pixels');
+    if(probes&&!litProbes)throw new Error('export produced only black frames ('+probes+' probes, none lit) - the offscreen texture is not delivering pixels');
     await venc.flush(); venc.close(); if(encErr)throw encErr;
     // A lost device can leave the encoder with zero chunks; never report "done · 0.0 MB".
     if(!vChunks||!vBytes)throw new Error('export produced no video data ('+vChunks+' chunks, '+vBytes+' bytes)');
@@ -5414,6 +5488,10 @@ async function exportVideo(){
     if(!lastBlob.blob.size)throw new Error('export produced an empty file (0-byte blob)');
     btn.textContent='⬇ Save video'; status(`export done · ${sizeLabel(lastBlob.blob.size)} ${lastBlob.ext}${ac||!abuf?'':' (no audio encoder here — video only)'} — press Save video`);
   }catch(e){ btn.textContent='⬇ Export video'; status(e.message==='cancelled'?'export cancelled':'Export failed: '+(e.message||e)); }
+  finally{
+    if(cap)gpuCapClose(cap);
+    if(prevOff!==null){try{gpuAttach({offscreen:prevOff});gpuResize(W,H);}catch(e){}}
+  }
   exporting=null; btn.classList.remove('on'); pos=0; refresh();
 }
 function startRec(){   // real-time fallback when the browser has no WebCodecs
