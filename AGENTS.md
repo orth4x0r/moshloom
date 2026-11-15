@@ -30,19 +30,31 @@ wins and the conflict gets reported, never silently resolved.
 6. **One headed-Chrome run at a time.** `npm run test:gpu:hw` takes the real GPU. Only the
    coordinator runs it, only on the primary checkout, never alongside another run.
 
-## File ownership — how parallel work stays mergeable
+## Fan-out lanes
 
-| area | files | can run alongside |
+Up to **four** workers at once, one lane each, never two workers in the same lane.
+
+| lane | owns | queue, in order |
 | --- | --- | --- |
-| UI, worker, export | `index.src.html` | renderer, engine, harness |
-| renderer, shaders | `gpu.js` | UI, engine, harness |
-| engine | `engine.c`, `build.*`, `engine.build.json` | UI, harness (goldens break — see rule 4) |
-| harness | `gpu_test.mjs`, `test.mjs`, `scripts/` | everything |
-| docs | `README.md` | everything |
+| **A · UI / worker** | `index.src.html`, `gpu.js`, `pack.py` | R1 → U1 → T1d |
+| **B · harness** | `gpu_test.mjs`, `test.mjs` | H2 |
+| **C · gates** | `scripts/gate*`, `scripts/testdata/**`, `.github/workflows/pack.yml` | H1 |
+| **D · tooling** | `scripts/zip.mjs`, `package.json`, `package-lock.json` | Z1 |
+| **E · docs** | `README.md`, `lab/*/README.md` | coordinator |
+| **frozen** | `AGENTS.md`, `fixtures/**`, `engine.c`, `engine.wasm`, `build.*`, `lab/`, `index.html` | coordinator only |
 
-`index.src.html` carries the UI, the worker protocol and export in one ~90 KB file. **Two tasks
-that both need it are serialized, not parallel.** Everything else can fan out. This table is the
-whole anti-collision mechanism; respect it instead of inventing a merge heuristic.
+Lane A is the bottleneck: `index.src.html` carries the UI, the worker protocol and export in one
+~90 KB file, so lane A runs one task at a time and other lanes merge around it. Splitting that
+file is the only change that adds lanes (see State).
+
+Two rules that make this survivable:
+
+- **`index.html` is generated.** When a merge conflicts on it, resolve by running `python pack.py`
+  and re-adding, never by hand-merging. Same for `engine.wasm` — if it conflicts, the branch
+  rebuilt it, which rule 4 already forbids.
+- **A lane that needs the GPU waits.** While `npm run test:gpu:hw` is running, no worker starts
+  Chromium at all. Software-adapter runs of `npm test` in four worktrees is the outer edge of
+  what the fixed timeouts in `gpu_test.mjs` tolerate.
 
 ## Definition of done
 
@@ -71,7 +83,7 @@ whole anti-collision mechanism; respect it instead of inventing a merge heuristi
 The coordinator owns the integration checkout and the merges. Workers get their own worktree,
 one branch per task, and never touch another worker's area.
 
-- split by the ownership table; do not fan out onto `index.src.html`
+- split by the lane table; never two workers in one lane
 - merge serially, then re-run `npm test` on the integration checkout after each merge
 - a worker's test claim is unverified until it is re-run after merge
 - a worker that cannot run a step says so; the coordinator does not paper over the gap
@@ -82,5 +94,8 @@ one branch per task, and never touch another worker's area.
 - In: M0, T1a, T1b1, T1b2. Worker mode exists and is **off by default on purpose**, until it has
   been used for real through the header Engine control.
 - In flight: T1c — thumbnails and export in the worker, repeatable video-clip exports.
+- Ceiling: lane A is one file. `T1e` (split `index.src.html` into UI / worker body / export, with
+  `pack.py` inlining modules) is the only task that widens the fan-out beyond four. It must land
+  with 13/13 goldens untouched, and it does not go before a milestone gate.
 - Milestone gate: `npm run test:gpu:hw` green, then a zip to the reviewer, who reviews the whole
   thread split.
