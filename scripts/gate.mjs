@@ -25,14 +25,15 @@
 //
 // A FAIL is reported whenever the log shows: goldens short of all within tolerance, any differing
 // pixel, any page or validation error, a FAIL line, a missing CPU line in a full `npm test` log, a
-// missing golden comparison on a SwiftShader run, or a skip other than the SwiftShader export skip.
+// missing golden comparison on a SwiftShader run, or any skip at all. Since X2 (main-mode export reads
+// back from the offscreen texture) export runs on SwiftShader too, so its old skip is a regression.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
-/** The one skip a SwiftShader run is allowed to print. Verbatim from gpu_test.mjs. */
+/** The skip SwiftShader printed before X2, verbatim from gpu_test.mjs. No longer allowed: it FAILs. */
 export const SOFTWARE_EXPORT_SKIP = 'export: software adapter cannot encode from the presented canvas';
 
 const LOG_NAME = path.join('out', 'gate.log');
@@ -133,7 +134,7 @@ export function parseLog(text) {
   const skips = skipItems.length ? skipItems.join('; ') : null;
   for (const s of skipItems) {
     if (hardware) reasons.push(`skipped on a hardware run: ${s}`);
-    else if (s !== SOFTWARE_EXPORT_SKIP) reasons.push(`unexpected skip: ${s}`);
+    else reasons.push(`unexpected skip: ${s}`);
   }
 
   return { hardware, verdict, goldens, cpu, pageErrors, validationErrors, skips, reasons };
