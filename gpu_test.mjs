@@ -4,10 +4,347 @@
 // Exits non-zero on any WebGPU validation error, page error, or a black render.
 import { chromium } from 'playwright';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
+
+const HARDWARE = process.argv.includes('--hardware');
+
+// ---- GPU run lock (H3) -------------------------------------------------------
+// AGENTS.md rule 6: one headed-Chrome run at a time on this machine, and nothing alongside it.
+// A brief that says "do not" was already ignored once, so the harness enforces it:
+//   --hardware                     takes the EXCLUSIVE gpu.lock
+//   anything else (npm test,       takes its own sw.<pid>.lock; two of these may overlap
+//     --record, --no-golden)
+// Both are created atomically ('wx') in one directory shared by every checkout and worktree of
+// this user, so a hardware run on the primary checkout stops a SwiftShader run in any worktree.
+// A run that would break the rule prints one `gpu lock: refused ...` line and exits 3 before any
+// browser is launched. `--lock-self-test` exercises all of it with no browser at all.
+const LOCK_REFUSED = 3;
+const GPU_LOCK = 'gpu.lock';
+const swMarker = (pid) => `sw.${pid}.lock`;
+const lockDirFor = () => process.env.MOSHLOOM_LOCK_DIR || path.join(os.homedir(), '.moshloom');
+
+// `process.kill(pid, 0)` in try/catch. On Windows EPERM means the process exists but is not ours.
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return e.code === 'EPERM'; }
+}
+
+function readRecord(file) {
+  try {
+    // Strip a BOM: a lock written by another tool is still a lock, and an unreadable pid reads
+    // as 0, which would let a live run be swept as stale.
+    const j = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+    if (j && Number.isInteger(j.pid)) return j;
+  } catch (e) {}
+  return null;
+}
+
+const lockNames = (dir) => {
+  try { return fs.readdirSync(dir).filter((n) => n === GPU_LOCK || /^sw\.\d+\.lock$/.test(n)); }
+  catch (e) { return []; }
+};
+
+// openSync('wx') creates the file empty and the record is written a moment later. A lock with no
+// readable record that is this young is a run being born, not a stale lock: deleting it there would
+// let two runs both pass their checks.
+const YOUNG_MS = 10000;
+function beingWritten(file) {
+  try { return Date.now() - fs.statSync(file).mtimeMs < YOUNG_MS; } catch (e) { return false; }
+}
+
+// Stale = the recorded pid is not running. A live lock is never removed: it is exactly the run
+// the rule protects. A record with no readable pid cannot be attributed, so it counts as stale
+// once it is older than YOUNG_MS.
+function removeStaleLocks(dir) {
+  for (const n of lockNames(dir)) {
+    const file = path.join(dir, n);
+    const rec = readRecord(file);
+    if (!rec && beingWritten(file)) continue;
+    const pid = rec ? rec.pid : 0;
+    if (pidAlive(pid)) continue;
+    try {
+      fs.unlinkSync(file);
+      console.log(`gpu lock: removed stale ${file} (pid ${pid})`);
+    } catch (e) {}
+  }
+}
+
+// A SwiftShader run is blocked by a live gpu.lock and by nothing else (two may overlap).
+// A hardware run is blocked by a live gpu.lock or by any live sw marker.
+function liveConflicts(dir, hardware) {
+  const out = [];
+  for (const n of lockNames(dir)) {
+    const file = path.join(dir, n);
+    const rec = readRecord(file);
+    if (!rec) {
+      // a run that has created its lock but not yet written it: treat it as live
+      if (beingWritten(file) && (n === GPU_LOCK || hardware)) out.push({ file, pid: 0, start: 'being written', cwd: 'unknown' });
+      continue;
+    }
+    if (!pidAlive(rec.pid)) continue;
+    if (n === GPU_LOCK || hardware) out.push({ file, ...rec });
+  }
+  return out;
+}
+
+const holderText = (h) => `pid ${h.pid} in ${h.file} (started ${h.start || 'unknown start'}, cwd ${h.cwd || 'unknown cwd'})`;
+
+/** Take the lock for a run of this kind: {ok:true, file} or {ok:false, holders|why}. */
+function acquireRunLock({ dir, hardware, argv = process.argv }) {
+  try { fs.mkdirSync(dir, { recursive: true }); }
+  catch (e) { return { ok: false, why: `cannot create lock dir ${dir}: ${e.message}` }; }
+  removeStaleLocks(dir);
+  const clash = liveConflicts(dir, hardware);
+  if (clash.length) return { ok: false, holders: clash };
+  const file = path.join(dir, hardware ? GPU_LOCK : swMarker(process.pid));
+  const record = JSON.stringify({ pid: process.pid, start: new Date().toISOString(), cwd: process.cwd(),
+    argv: argv.slice(2), kind: hardware ? 'hardware' : 'swiftshader' }, null, 1);
+  let fd;
+  try { fd = fs.openSync(file, 'wx'); }          // atomic: throws EEXIST if the file is already there
+  catch (e) {
+    if (e.code === 'EEXIST') {
+      const rec = readRecord(file);
+      return { ok: false, holders: [{ file, pid: rec ? rec.pid : 0, start: rec && rec.start, cwd: rec && rec.cwd }] };
+    }
+    return { ok: false, why: `cannot create ${file}: ${e.message}` };
+  }
+  try { fs.writeSync(fd, record); } finally { fs.closeSync(fd); }
+  // Close the check-then-create window: re-read the other side now that our file exists, and back
+  // off if a run of the opposite kind got in between. Whichever side sees the other first wins.
+  const after = liveConflicts(dir, hardware).filter((h) => h.pid !== process.pid);
+  if (after.length) {
+    try { fs.unlinkSync(file); } catch (e) {}
+    return { ok: false, holders: after };
+  }
+  return { ok: true, file };
+}
+
+// Release on every exit path. `exit` fires for a normal return, process.exit(), an uncaught throw
+// and a signal handler that exits, so one synchronous unlink handler covers all of them.
+const heldLocks = new Set();
+let releaseInstalled = false;
+function installReleaseHandlers() {
+  if (releaseInstalled) return;
+  releaseInstalled = true;
+  process.on('exit', () => {
+    for (const file of heldLocks) { try { fs.unlinkSync(file); } catch (e) {} }
+    heldLocks.clear();
+  });
+  // Windows delivers Ctrl+C as SIGINT; SIGTERM is raised by a parent or a test. Both exit, which
+  // runs the handler above. SIGBREAK is Ctrl+Break on Windows.
+  for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]]) process.on(sig, () => process.exit(code));
+  if (process.platform === 'win32') process.on('SIGBREAK', () => process.exit(131));
+}
+
+/** Acquire or refuse, before any browser exists. */
+function takeRunLock(hardware) {
+  const lock = acquireRunLock({ dir: lockDirFor(), hardware });
+  if (!lock.ok) {
+    const ms = Math.round(process.uptime() * 1000);      // process start -> refusal line
+    const who = lock.holders ? lock.holders.map(holderText).join('; ') : lock.why;
+    console.log(`gpu lock: refused after ${ms} ms for a ${hardware ? 'hardware' : 'SwiftShader'} run: ${who}`
+      + ' - that run owns the GPU; wait for it to finish (a lock whose pid is dead is removed automatically).');
+    process.exit(LOCK_REFUSED);
+  }
+  heldLocks.add(lock.file);
+  installReleaseHandlers();
+  return lock.file;
+}
+
+const SELF_URL = import.meta.url;
+
+// Used only by --lock-self-test: a real second process takes a lock and leaves by a chosen path,
+// so the release handler is exercised for real instead of simulated in-process.
+async function lockChildMode(mode) {
+  const dir = lockDirFor();
+  const lock = acquireRunLock({ dir, hardware: mode === 'hardware' });
+  if (!lock.ok) {
+    console.log(`child ${process.pid}: refused ${lock.holders ? lock.holders.map(holderText).join('; ') : lock.why}`);
+    process.exit(LOCK_REFUSED);
+  }
+  heldLocks.add(lock.file);
+  installReleaseHandlers();
+  console.log(`child ${process.pid}: holding ${lock.file}`);
+  if (mode === 'throw') throw new Error('self-test: the release handler must survive a thrown error');
+  if (mode === 'hold') {
+    // Concurrency case: rendezvous with the other SwiftShader run. The ready file is written only
+    // while the marker is held, so seeing the peer's ready file proves both markers coexisted.
+    const ready = (marker) => marker + '.ready';
+    fs.writeFileSync(ready(lock.file), String(process.pid));
+    const mine = path.basename(ready(lock.file));
+    const deadline = Date.now() + 20000;
+    let peer = 0;
+    while (Date.now() < deadline && !peer) {
+      let names = [];
+      try { names = fs.readdirSync(dir); } catch (e) {}
+      for (const n of names) {
+        if (n === mine || !/^sw\.\d+\.lock\.ready$/.test(n)) continue;
+        try { peer = Number(fs.readFileSync(path.join(dir, n), 'utf8')) || 1; } catch (e) {}
+      }
+      if (!peer) await new Promise((r) => setTimeout(r, 50));
+    }
+    console.log(`child ${process.pid}: holding ${path.basename(lock.file)},`
+      + ` peer marker ${peer ? 'sw.' + peer + '.lock seen at the same time' : 'NEVER SEEN'}`);
+    process.exit(peer ? 0 : 1);
+  }
+  process.exit(0);                                   // the normal-exit path
+}
+
+/** --lock-self-test: every case here, no browser, exit 0/1. */
+async function runLockSelfTest() {
+  const started = Date.now();
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'moshloom-lock-'));
+  let pass = 0, fail = 0;
+  const ok = (name, cond, detail = '') => {
+    if (cond) pass++; else fail++;
+    console.log(`${cond ? 'PASS' : 'FAIL'} ${name}${detail ? ' :: ' + detail : ''}`);
+  };
+  const dir = (tag) => fs.mkdtempSync(path.join(tmp, tag + '-'));
+  const writeFake = (file, pid) => fs.writeFileSync(file,
+    JSON.stringify({ pid, start: '2026-01-01T00:00:00.000Z', cwd: tmp, argv: ['--fake'] }));
+  // A recorded console so the stale-removal lines can be asserted instead of just printed.
+  const quiet = (fn) => {
+    const real = console.log, lines = [];
+    console.log = (...a) => lines.push(a.map(String).join(' '));
+    try { return { value: fn(), lines }; } finally { console.log = real; }
+  };
+  // A pid that is provably dead: a child that has already exited and been reaped.
+  const deadPid = () => {
+    const r = spawnSync(process.execPath, ['-e', '0'], {});
+    if (r.pid && !pidAlive(r.pid)) return r.pid;
+    for (let p = 65000; p < 66000; p++) if (!pidAlive(p)) return p;
+    return 999999;
+  };
+  const envFor = (d, mode) => ({ ...process.env, MOSHLOOM_LOCK_DIR: d, MOSHLOOM_LOCK_CHILD: mode });
+  const childCode = `await import(${JSON.stringify(SELF_URL)})`;
+  const childSync = (d, mode) => spawnSync(process.execPath, ['--input-type=module', '-e', childCode],
+    { env: envFor(d, mode), encoding: 'utf8', timeout: 60000 });
+
+  try {
+    // 1. a live hardware lock blocks a SwiftShader run
+    {
+      const d = dir('hw-blocks-sw');
+      const g = path.join(d, GPU_LOCK);
+      writeFake(g, process.pid);
+      const { value } = quiet(() => acquireRunLock({ dir: d, hardware: false }));
+      ok('a live hardware lock blocks a SwiftShader run',
+        !value.ok && !!value.holders && value.holders[0].pid === process.pid && fs.existsSync(g),
+        `refused=${!value.ok}, holder pid ${value.holders && value.holders[0].pid}, gpu.lock kept=${fs.existsSync(g)}`);
+      ok('the refused SwiftShader run left no marker of its own',
+        !fs.existsSync(path.join(d, swMarker(process.pid))));
+    }
+
+    // 2. a live SwiftShader marker blocks a hardware run
+    {
+      const d = dir('sw-blocks-hw');
+      const m = path.join(d, swMarker(process.pid));
+      writeFake(m, process.pid);
+      const { value } = quiet(() => acquireRunLock({ dir: d, hardware: true }));
+      const g = path.join(d, GPU_LOCK);
+      ok('a live SwiftShader marker blocks a hardware run',
+        !value.ok && value.holders.some((h) => h.file === m) && !fs.existsSync(g),
+        `refused=${!value.ok}, holder ${path.basename(m)}, gpu.lock created=${fs.existsSync(g)}`);
+    }
+
+    // 3. stale locks of both kinds are removed, and the run continues
+    {
+      const d = dir('stale');
+      const dead = deadPid();
+      const g = path.join(d, GPU_LOCK), s = path.join(d, swMarker(dead));
+      writeFake(g, dead); writeFake(s, dead);
+      const { value, lines } = quiet(() => acquireRunLock({ dir: d, hardware: false }));
+      const format = lines.every((l) => new RegExp(`^gpu lock: removed stale .* \\(pid ${dead}\\)$`).test(l));
+      ok('stale locks of both kinds are removed and the run continues',
+        value.ok && lines.length === 2 && format && !fs.existsSync(g) && !fs.existsSync(s),
+        `${lines.length} stale line(s), both in "gpu lock: removed stale <file> (pid ${dead})" form=${format}`);
+      for (const l of lines) console.log('  ' + l);
+      if (value.ok) fs.unlinkSync(value.file);
+    }
+
+    // 3b. a hardware run after a stale gpu.lock takes the exclusive lock (the acquire half of it)
+    {
+      const d = dir('stale-hw');
+      const dead = deadPid();
+      writeFake(path.join(d, GPU_LOCK), dead);
+      const { value, lines } = quiet(() => acquireRunLock({ dir: d, hardware: true }));
+      const body = value.ok ? JSON.parse(fs.readFileSync(value.file, 'utf8')) : {};
+      ok('a stale gpu.lock is removed and a hardware run then takes it exclusively',
+        value.ok && path.basename(value.file) === GPU_LOCK && body.pid === process.pid
+          && typeof body.start === 'string' && Array.isArray(body.argv),
+        `lock=${value.ok ? path.basename(value.file) : 'none'}, record pid ${body.pid}, cwd ${body.cwd}`);
+      for (const l of lines) console.log('  ' + l);
+      if (value.ok) fs.unlinkSync(value.file);
+    }
+
+    // 4. own marker released after a normal exit, and after a thrown error (real child processes)
+    {
+      const d = dir('exit');
+      const r = childSync(d, 'sw');
+      const file = r.pid ? path.join(d, swMarker(r.pid)) : '';
+      ok('the marker is released after a normal exit',
+        r.status === 0 && /child \d+: holding/.test(r.stdout || '') && !!file && !fs.existsSync(file),
+        `child pid ${r.pid} exit ${r.status}, marker gone=${!!file && !fs.existsSync(file)}, child said "${(r.stdout || '').trim()}"`);
+    }
+    {
+      const d = dir('throw');
+      const r = childSync(d, 'throw');
+      const file = r.pid ? path.join(d, swMarker(r.pid)) : '';
+      ok('the marker is released after a thrown error',
+        r.status !== 0 && /child \d+: holding/.test(r.stdout || '') && !!file && !fs.existsSync(file),
+        `child pid ${r.pid} exit ${r.status} (non-zero expected), marker gone=${!!file && !fs.existsSync(file)}`);
+    }
+    {
+      const d = dir('exit-hw');
+      const r = childSync(d, 'hardware');
+      const g = path.join(d, GPU_LOCK);
+      ok('the exclusive gpu.lock is released after a normal exit',
+        r.status === 0 && /child \d+: holding/.test(r.stdout || '') && !fs.existsSync(g),
+        `child pid ${r.pid} exit ${r.status}, gpu.lock gone=${!fs.existsSync(g)}`);
+    }
+
+    // 5. two concurrent SwiftShader runs do not block each other
+    {
+      const d = dir('concurrent');
+      const a = spawn(process.execPath, ['--input-type=module', '-e', childCode],
+        { env: envFor(d, 'hold'), stdio: ['ignore', 'pipe', 'pipe'] });
+      const b = spawn(process.execPath, ['--input-type=module', '-e', childCode],
+        { env: envFor(d, 'hold'), stdio: ['ignore', 'pipe', 'pipe'] });
+      let outA = '', outB = '';
+      a.stdout.on('data', (c) => { outA += c; });
+      b.stdout.on('data', (c) => { outB += c; });
+      const codeOf = (p) => new Promise((res) => p.on('close', res));
+      const [ca, cb] = await Promise.all([codeOf(a), codeOf(b)]);
+      ok('two concurrent SwiftShader runs do not block each other',
+        ca === 0 && cb === 0 && /peer marker sw\.\d+\.lock seen at the same time/.test(outA)
+          && /peer marker sw\.\d+\.lock seen at the same time/.test(outB) && lockNames(d).length === 0,
+        `exits ${ca}/${cb}; "${outA.trim().split('\n').pop()}" | "${outB.trim().split('\n').pop()}"`);
+    }
+    // 6. a gpu.lock that exists but is not written yet is a run being born, not a stale lock
+    {
+      const d = dir('young');
+      const g = path.join(d, GPU_LOCK);
+      fs.closeSync(fs.openSync(g, 'wx'));
+      const { value, lines } = quiet(() => acquireRunLock({ dir: d, hardware: false }));
+      ok('an empty, just-created gpu.lock blocks a SwiftShader run and is not swept',
+        !value.ok && fs.existsSync(g) && lines.length === 0,
+        `refused=${!value.ok}, gpu.lock kept=${fs.existsSync(g)}, stale lines ${lines.length}`);
+    }
+  } finally {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) {}
+  }
+  console.log(`lock self-test:${pass} passed, ${fail} failed, ${Date.now() - started} ms, no browser launched`);
+  process.exit(fail ? 1 : 0);
+}
+
+if (process.env.MOSHLOOM_LOCK_CHILD) await lockChildMode(process.env.MOSHLOOM_LOCK_CHILD);
+if (process.argv.includes('--lock-self-test')) await runLockSelfTest();
+takeRunLock(HARDWARE);
+// ---- end GPU run lock -------------------------------------------------------
 
 const root = import.meta.dirname;
 const html = path.join(root, 'index.html');
@@ -24,7 +361,7 @@ if (!clipImg || !clipVid) { console.error('fixtures/clip.png and a clip video ar
 const outDir = path.join(root, 'out');
 fs.mkdirSync(outDir, { recursive: true });
 
-const HARDWARE = process.argv.includes('--hardware');
+// HARDWARE is read at the top of the file, before the lock is taken.
 // The committed goldens are SwiftShader references. A real adapter renders the same scenes with
 // its own precision/colour path, so hardware mode checks rendering and export but skips that
 // comparison unless a hardware baseline is requested explicitly.
