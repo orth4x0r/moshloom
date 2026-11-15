@@ -740,7 +740,7 @@ function afterAnalysis(keep,fix){
   seek(0);
 }
 function push(){
-  const err=gpuSetProject({blocks,fx,bpm,offs});
+  const err=Renderer.setProject({blocks,fx,bpm,offs});
   if (renderIn === 'worker' && rw) rwCall('project', { blocks, fx, bpm, offs }).catch((e) => toast('render worker: ' + e.message, 'warn'));
   if(err) fail(err);
   const json=JSON.stringify(project());            // outside the try: a throw here is a bug, not a storage failure
