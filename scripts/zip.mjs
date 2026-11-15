@@ -359,16 +359,20 @@ const USAGE = `usage: npm run zip -- --sha <rev> [--out <path>] [--check-pack] <
 
 function checkPack({ sha, treeEntries, tmp }) {
   const wt = path.join(tmp, 'packwt');
-  const nodeModules = path.join(root, 'node_modules');
-  const link = path.join(wt, 'node_modules');
   let added = false;
   try {
     git(['worktree', 'add', '--detach', wt, sha]);
     added = true;
-    if (!fs.existsSync(nodeModules)) {
-      fail(`--check-pack needs node_modules in ${root} because pack.py inlines the muxers`);
+    // Copy the two files pack.py inlines; never link node_modules. A recursive delete through a
+    // Windows junction follows it and empties the real node_modules (it happened once). If a
+    // later pack.py needs more, it exits with "missing ..." and this check fails loudly.
+    for (const rel of ['node_modules/mp4-muxer/build/mp4-muxer.js', 'node_modules/webm-muxer/build/webm-muxer.js']) {
+      const src = path.join(root, rel);
+      if (!fs.existsSync(src)) fail(`--check-pack needs ${rel} in ${root} (run npm ci): pack.py inlines it`);
+      const dst = path.join(wt, rel);
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.copyFileSync(src, dst);
     }
-    fs.symlinkSync(nodeModules, link, process.platform === 'win32' ? 'junction' : 'dir');
 
     const py = process.platform === 'win32' ? ['python', ['pack.py']] : ['python3', ['pack.py']];
     const r = spawnSync(py[0], py[1], { cwd: wt, encoding: 'utf8' });
@@ -381,28 +385,19 @@ function checkPack({ sha, treeEntries, tmp }) {
     const produced = fs.readFileSync(path.join(wt, 'index.html'));
     const entry = treeEntries.find((e) => e.name === 'index.html' || e.name.endsWith('/index.html'));
     const shipped = entryData(entry, 'tree');
-    const norm = (b) => Buffer.from(b.toString('latin1').replace(/\r\n/g, '\n'), 'latin1');
     if (Buffer.compare(produced, shipped) === 0) {
       console.log(`check-pack: index.html ${bytes(produced.length)} bytes, sha256 ${sha256(produced).slice(0, 16)}... matches pack.py output (byte-identical)`);
       return { mode: 'byte-identical', size: produced.length, sha256: sha256(produced) };
     }
-    if (Buffer.compare(norm(produced), norm(shipped)) === 0) {
-      console.log(`check-pack: index.html matches pack.py output after newline normalization (${bytes(produced.length)} vs ${bytes(shipped.length)} bytes: pack.py writes native line endings)`);
-      return { mode: 'newline-normalized', size: shipped.length, sha256: sha256(shipped) };
-    }
+    // Byte-identical or fail, the same bar as pack.yml: a newline-only difference is still a
+    // committed index.html that pack.py would not produce.
     let at = 0;
     while (at < produced.length && at < shipped.length && produced[at] === shipped[at]) at++;
     fail(`--check-pack: the archive's index.html differs from pack.py's output at ${sha.slice(0, 7)} ` +
       `(archive ${bytes(shipped.length)} bytes sha256 ${sha256(shipped).slice(0, 16)}..., ` +
       `pack.py ${bytes(produced.length)} bytes sha256 ${sha256(produced).slice(0, 16)}..., first difference at byte ${at})`);
   } finally {
-    // Unlink the node_modules link before the worktree goes away: a recursive delete through a
-    // Windows junction takes the target with it, and that target is this checkout's real
-    // node_modules. Measured once the hard way; never again.
-    let lst = null;
-    try { lst = fs.lstatSync(link); } catch { /* never created */ }
-    if (lst && lst.isSymbolicLink()) fs.unlinkSync(link);
-    // anything else left at that path was created inside the temp directory, so it is ours
+    // everything under wt, including the copied muxers, was created here, so it is ours to delete
     if (added) {
       const rm = spawnSync('git', ['worktree', 'remove', '--force', wt], { cwd: root, encoding: 'utf8' });
       if (rm.status !== 0) {
@@ -411,9 +406,6 @@ function checkPack({ sha, treeEntries, tmp }) {
         spawnSync('git', ['worktree', 'prune'], { cwd: root, encoding: 'utf8' });
         console.error(`zip.mjs: note: \`git worktree remove\` reported ${rm.status}; removed the directory and pruned instead`);
       }
-    }
-    if (added && !fs.existsSync(nodeModules)) {
-      console.error(`zip.mjs: warning: ${nodeModules} is gone after the pack check; run npm ci`);
     }
   }
 }
@@ -449,7 +441,7 @@ function main(argv) {
   // Everything below cleans up after itself: a temp directory for git archive / the pack
   // worktree, and the output path, which must not exist after a failed run.
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'moshloom-zip-'));
-  let wroteOut = false;
+  let done = false;
   try {
     // logs: reject missing and empty files before anything is written
     const logs = [];
@@ -504,7 +496,9 @@ function main(argv) {
 
     const allEntries = [
       ...treeEntries.map((e) => ({
-        name: e.name, method: e.method, flags: e.flags, time: e.time, date: e.date,
+        // bit 3 (data descriptor) is cleared: our local headers carry crc and sizes, and no
+        // descriptor follows the data
+        name: e.name, method: e.method, flags: e.flags & ~0x0008, time: e.time, date: e.date,
         crc: e.crc, csize: e.csize, usize: e.usize, externalAttrs: e.externalAttrs,
         versionMadeBy: e.versionMadeBy, versionNeeded: e.versionNeeded, compressed: e.compressed,
       })),
@@ -525,7 +519,7 @@ function main(argv) {
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
     const zipBuf = writeZip(allEntries);
     fs.writeFileSync(outPath, zipBuf);
-    wroteOut = true;
+    if (process.env.ZIP_SELFTEST_FAIL_AFTER_WRITE === '1') fail('injected failure after write (ZIP_SELFTEST_FAIL_AFTER_WRITE)');
 
     const back = fs.readFileSync(outPath);
     const readBack = readZip(back, path.basename(outPath));
@@ -571,13 +565,15 @@ function main(argv) {
     console.log(`read back: ${checked}/${readBack.length} entries inflated, CRC ok; 0 forbidden segments, 0 duplicates, all under ${prefix}/`);
     console.log(`logs: ${manifestLogs.length}/${logs.length} size + sha256 match the manifest`);
     if (pack) console.log(`check-pack: PASS (${pack.mode})`);
+    done = true;
     return 0;
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
-    if (!wroteOut && fs.existsSync(outPath)) {
-      // a stale zip from an earlier run would let exit != 0 sit next to an archive
+    if (!done && fs.existsSync(outPath)) {
+      // a stale zip, or one this run wrote before a read-back check failed: exit != 0 must
+      // never sit next to an archive
       fs.rmSync(outPath, { force: true });
-      console.error(`zip.mjs: removed stale ${path.relative(root, outPath).replace(/\\/g, '/')}; a failed run leaves no archive behind`);
+      console.error(`zip.mjs: removed ${path.relative(root, outPath).replace(/\\/g, '/')}; a failed run leaves no archive behind`);
     }
   }
 }
