@@ -1,0 +1,50 @@
+mode: gpu (WebGPU) | err: none
+media image: clip.png added as a Media block
+media video: clip.mp4 added as a Media block | image 160x90, video 160x90
+shaders: Rings:ok
+bad shader -> shader: unresolved value 'nope' (line 3)
+  scene_media_image            98.2% lit
+  scene_media_video            94.2% lit
+  scene_shader                 99.0% lit
+  fx_0                         98.6% lit
+  fx_1                         97.8% lit
+  fx_2                         97.2% lit
+  fx_3                         97.7% lit
+  fx_4                         97.7% lit
+  fx_5                         88.9% lit
+  fx_6                         73.9% lit
+  fx_7                         100.0% lit
+  mods_bloom                   97.0% lit
+fluid (SwiftShader, software - see the real-GPU number in the report): 62.78 ms/frame off, 116.87 on (+54.09), 60 frames from a seek twice: identical
+  fx_fluid                     95.4% lit
+profile: 31 stamps, total 104.89 ms, scene 3.15, fluid 54.73
+thumbs: 57 cached, 39/39 blocks have one
+auto-arrange: no full-frame change closer than 12 frames at 60/90/120/150/180 BPM
+gpu errors: none | lost: no
+projects: schema, round trip, autosave, named store, migrate ok
+analysis worker: up, features from worker, nf 3840, clock 1.638 -> 1.722
+mode probe: skipped in main mode (header: WebGPU); it runs only for worker mode or recovery
+worker smoke: init + 4 frames + readback 1280x720, lum 0.2408
+engine control: worker page switched to main+cpu (CPU fallback ┬╖ worker ready)
+export: skipped here (software adapter cannot encode from the presented canvas)
+tol=2  max-frac=0.002 (0.20%)
+image                  size         diff px      frac   max╬ö  result
+--------------------------------------------------------------------
+fx_0.ppm               640x360            0    0.000%      0  ok
+fx_1.ppm               640x360            0    0.000%      0  ok
+fx_2.ppm               640x360            0    0.000%      0  ok
+fx_3.ppm               640x360            0    0.000%      0  ok
+fx_4.ppm               640x360            0    0.000%      0  ok
+fx_5.ppm               640x360            0    0.000%      0  ok
+fx_6.ppm               640x360            0    0.000%      0  ok
+fx_7.ppm               640x360            0    0.000%      0  ok
+fx_fluid.ppm           640x360            0    0.000%      0  ok
+mods_bloom.ppm         640x360            0    0.000%      0  ok
+scene_media_image.ppm  640x360            0    0.000%      0  ok
+scene_media_video.ppm  640x360            0    0.000%      0  ok
+scene_shader.ppm       640x360            0    0.000%      0  ok
+--------------------------------------------------------------------
+13 image(s): 13 within tolerance, 0 failed, 0 skipped
+
+FAIL
+worker: pixels differ from main (3646029771 vs 1489071608, lum 0.3289 vs 0.32)

@@ -1,0 +1,56 @@
+
+> moshloom@2.5.0 pretest
+> python pack.py
+
+index.html 344991 bytes
+
+> moshloom@2.5.0 test
+> node test.mjs && node gpu_test.mjs
+
+block record 24 floats, effect record 5 floats, render 640x360
+ms/frame 10.35  worst 26.6  frames 3840  lit 99.9%
+strobe/transition: pairs, 12-frame spacing, switch rate and jump recovery ok
+ok
+mode: gpu (WebGPU) | err: none
+media image: clip.png added as a Media block
+media video: clip.mp4 added as a Media block | image 160x90, video 160x90
+shaders: Rings:ok
+bad shader -> shader: unresolved value 'nope' (line 3)
+  scene_media_image            98.2% lit
+  scene_media_video            94.2% lit
+  scene_shader                 99.0% lit
+  fx_0                         98.6% lit
+  fx_1                         97.8% lit
+  fx_2                         97.2% lit
+  fx_3                         97.7% lit
+  fx_4                         97.7% lit
+  fx_5                         88.9% lit
+  fx_6                         73.9% lit
+  fx_7                         100.0% lit
+  mods_bloom                   97.0% lit
+fluid (SwiftShader, software - see the real-GPU number in the report): 60.74 ms/frame off, 114.35 on (+53.61), 60 frames from a seek twice: identical
+  fx_fluid                     95.4% lit
+profile: 31 stamps, total 101.37 ms, scene 3.40, fluid 52.22
+thumbs: 55 cached, 39/39 blocks have one
+auto-arrange: no full-frame change closer than 12 frames at 60/90/120/150/180 BPM
+gpu errors: none | lost: no
+projects: schema, round trip, autosave, named store, migrate ok
+analysis worker: up, features from worker, nf 3840, clock 1.638 -> 1.722
+mode probe: skipped in main mode (header: WebGPU); it runs only for worker mode or recovery
+rwCall: no worker -> "no render worker is running (mode: main+gpu)"
+worker smoke: init + 4 frames + readback 1280x720, lum 0.2409
+worker: main vs worker 1280x720 hash 2576632446 lum 0.3203 IDENTICAL
+engine control: worker page switched to main+cpu (CPU fallback ┬╖ worker ready)
+engine control: CPU -> worker+gpu (WebGPU ┬╖ worker ready)
+engine control: plain #cpu booted main+cpu (CPU fallback)
+export guard: empty encode -> "Export failed: export produced no video data (0 chunks, 0 bytes)"
+export: skipped here (software adapter cannot encode from the presented canvas)
+tol=2  max-frac=0.002 (0.20%)
+image                  size         diff px      frac   max╬ö  result
+--------------------------------------------------------------------
+fx_0.ppm               640x360            0    0.000%      0  ok
+fx_1.ppm               640x360            0    0.000%      0  ok
+fx_2.ppm               640x360            0    0.000%      0  ok
+fx_3.ppm               640x360            0    0.000%      0  ok
+fx_4.ppm               640x360            0    0.000%      0  ok
+fx_5.ppm               640x360            0    0.000%      0  ok
