@@ -815,7 +815,24 @@ function gpuSetProject(p){
   return null;
 }
 
-// The renderer's public surface. setProject/loadFeatures arrive with T1b, when the renderer owns
-// the wasm instance; exportVideo stays in the UI until T1c.
+// Load analysis made elsewhere into the renderer's wasm. The order is not cosmetic: the feature
+// arrays and the mel table come first, then set_grid() derives fPulse/fTT/fHue from them, and
+// plan() reads those every frame -- set_grid before the arrays copies leaves U.T at zero and the
+// picture freezes. Used by the page and by the render worker, so the sequence exists once.
+// Returns null, or a message to show, instead of throwing inside a render loop.
+function gpuLoadFeatures(p){
+  if(!WASM) return 'renderer has no wasm instance';
+  const o=p||{}, n=+o.nf||0, arr=o.arrays||[];
+  WASM.load_features(n);
+  for(let i=0;i<arr.length;i++)
+    new Float32Array(WASM.memory.buffer, WASM.feat(i), n).set(arr[i]);
+  new Float32Array(WASM.memory.buffer, WASM.mel_ptr(), n*24).set(o.mel);
+  WASM.set_grid(o.bpm, o.offs);
+  return null;
+}
+
+// The renderer's public surface: everything a page or a worker needs to render a project with
+// only its own wasm instance. exportVideo stays in the UI.
 const Renderer={attach:gpuAttach,init:gpuInit,frame:gpuFrame,resize:gpuResize,thumb:gpuThumb,
-  addMedia:gpuAddMedia,compileShader:gpuCompile,probe:gpuProbe,reset:gpuReset,dispose:gpuDispose};
+  addMedia:gpuAddMedia,compileShader:gpuCompile,probe:gpuProbe,reset:gpuReset,dispose:gpuDispose,
+  setProject:gpuSetProject,loadFeatures:gpuLoadFeatures};
