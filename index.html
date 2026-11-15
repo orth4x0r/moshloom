@@ -5258,18 +5258,43 @@ $('sSave').onclick=async()=>{
 
 // ---------- export ----------
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+// Resolves when the element actually holds a frame to copy (HAVE_CURRENT_DATA). `seeked` alone is
+// not that: it can fire while readyState is still HAVE_METADATA, and drawImage() then silently
+// leaves the previous frame on the canvas.
+function frameReady(el,ms){
+  if(el.readyState>=2) return Promise.resolve(true);
+  return new Promise(res=>{
+    let done=false;
+    const fin=()=>{ if(done)return; done=true; clearTimeout(t);
+      el.removeEventListener('loadeddata',fin); el.removeEventListener('canplay',fin); res(el.readyState>=2); };
+    const t=setTimeout(fin,ms||400);
+    el.addEventListener('loadeddata',fin); el.addEventListener('canplay',fin);
+  });
+}
 async function seekVideoExact(el,t){
   const d=el.duration||1, q=Math.max(0,Math.min(d-1e-3,Math.round(t*FPS)/FPS));
-  if(Math.abs(el.currentTime-q)>1e-4){
-    await new Promise(res=>{let done=false;const fin=()=>{if(done)return;done=true;el.removeEventListener('seeked',fin);res();};
-      el.addEventListener('seeked',fin,{once:true});el.currentTime=q;setTimeout(fin,2000);});
+  // Always assign, even when currentTime already reads q. An element that was loaded but never
+  // seeked has no frame drawImage() can copy - readyState reaches 4 and drawImage is still a silent
+  // no-op - and the assignment is what gives it one. Chrome fires seeked for a same-position seek.
+  // Skipping it here was the asymmetry: the first export's frame 0 was the previous canvas content
+  // (transparent) while the second export sought back from the end and got the real frame.
+  await new Promise(res=>{let done=false;const fin=()=>{if(done)return;done=true;el.removeEventListener('seeked',fin);res();};
+    el.addEventListener('seeked',fin,{once:true});el.currentTime=q;setTimeout(fin,2000);});
+  await frameReady(el,400);
+}
+// The clip frame as a bitmap, or a loud failure - never a stale one. The media elements are
+// detached, so requestVideoFrameCallback never runs for them (the old wait here was a timer, not a
+// readiness check), and drawImage() of an element whose decoder has not caught up is a silent
+// no-op: it leaves the *previous* clip frame on the canvas, which is why two exports of the same
+// clip disagreed. The canvas is cleared before every draw, so that case is visible instead.
+async function grabClipFrame(m){
+  for(let i=0;i<20;i++){
+    m.c2.clearRect(0,0,m.w,m.h); m.c2.drawImage(m.el,0,0,m.w,m.h);
+    const px=samplePixels(m.cv);
+    if(px&&px.alpha>0.5) return createImageBitmap(m.cv);
+    await sleep(25);
   }
-  // A seeked video is not always ready to draw on a hardware decoder. Only wait when the page is
-  // visible: in a background tab rVFC and its timer are throttled and would stall an export.
-  if(typeof el.requestVideoFrameCallback==='function'&&document.visibilityState==='visible'){
-    await new Promise(res=>{let done=false;const fin=()=>{if(done)return;done=true;res();};
-      try{el.requestVideoFrameCallback(fin);}catch(e){fin();}setTimeout(fin,500);});
-  }
+  throw new Error('the clip frame at '+m.el.currentTime.toFixed(2)+'s did not decode');
 }
 const sizeLabel=sz=>sz>=1e5?(sz/1e6).toFixed(1)+' MB':Math.max(1,Math.round(sz/1024))+' KB';
 async function serveWorkerMedia(p, post){
@@ -5278,8 +5303,7 @@ async function serveWorkerMedia(p, post){
   for(const c of p.clips||[]){
     const m=G.media[c.clip]; if(!m||m.kind!=='video'||!m.el) continue;
     await seekVideoExact(m.el,c.time);
-    m.c2.drawImage(m.el,0,0,m.w,m.h);
-    const bmp=await createImageBitmap(m.cv);
+    const bmp=await grabClipFrame(m);
     out.push({clip:c.clip,bitmap:bmp});
   }
   post('media-frames',{req:p.req,frames:out},out.map(o=>o.bitmap));
@@ -5293,8 +5317,7 @@ async function addWorkerMedia(file){
     const cv=document.createElement('canvas'); cv.width=w; cv.height=h; const c2=cv.getContext('2d',{willReadFrequently:true});
     const m={name:file.name,kind:'video',w,h,dur:el.duration||1,el,cv,c2,file}; G.media.push(m);
     await seekVideoExact(el,0);
-    m.c2.drawImage(el,0,0,w,h);
-    const bmp=await createImageBitmap(m.cv);
+    const bmp=await grabClipFrame(m);
     await rwCall('media-frame',{index:i,bitmap:bmp,w,h,dur:m.dur,kind:'video'},[bmp]);
     return i;
   }
@@ -5310,6 +5333,31 @@ async function seekMedia(f){ if(mode!=='gpu'||!G.media.some(m=>m.el))return; con
     await new Promise(r=>{const done=()=>{m.el.removeEventListener('seeked',done);r();};m.el.addEventListener('seeked',done);m.el.currentTime=t;setTimeout(done,400);}); } }
 function probeCpuLuma(){
   try{ const d=ctx2d.getImageData(0,0,8,8).data; let s=0; for(let i=0;i<d.length;i+=4) s+=d[i]+d[i+1]+d[i+2]; return s/(8*8*3*255); }catch(e){ return null; }
+}
+// A frame is only on the canvas once the compositor has taken it. onSubmittedWorkDone() is a GPU
+// fence, not a presentation, and a WebGPU canvas snapshotted before the paint is blank. Two rAFs
+// put us past the paint; the timeout keeps a hidden tab (rAF throttled) from stalling the export.
+function nextPresent(ms){
+  return new Promise(res=>{
+    let done=false;
+    const fin=()=>{ if(done)return; done=true; clearTimeout(t); res(); };
+    const t=setTimeout(fin,ms||250);
+    try{ requestAnimationFrame(()=>requestAnimationFrame(fin)); }catch(e){ fin(); }
+  });
+}
+// Mean luminance 0..1 and mean alpha 0..1 of anything drawable, or null when it cannot be read.
+// Used both for "what did we actually encode" (the old guard measured the feedback buffer, so it
+// stayed green while every capture was blank) and for "did the clip decoder hand us a frame at
+// all": a canvas that was cleared and then not written to is transparent, a decoded frame is opaque.
+let capCv=null,capCtx=null;
+function samplePixels(src){
+  try{
+    if(!capCv){capCv=document.createElement('canvas');capCv.width=8;capCv.height=8;capCtx=capCv.getContext('2d',{willReadFrequently:true});}
+    capCtx.clearRect(0,0,8,8); capCtx.drawImage(src,0,0,8,8);
+    const d=capCtx.getImageData(0,0,8,8).data; let s=0,a=0;
+    for(let i=0;i<d.length;i+=4){ s+=d[i]+d[i+1]+d[i+2]; a+=d[i+3]; }
+    return {lum:s/(8*8*3*255),alpha:a/(8*8*255)};
+  }catch(e){ return null; }
 }
 function renderClient(){
   return {
@@ -5328,8 +5376,7 @@ async function runExport(client){
     const m=G.media[i]; if(!m||!m.file) continue;
     if(m.kind==='video'){
       await seekVideoExact(m.el,0);
-      m.c2.drawImage(m.el,0,0,m.w,m.h);
-      const bmp=await createImageBitmap(m.cv);
+      const bmp=await grabClipFrame(m);
       await client.call('media-frame',{index:i,bitmap:bmp,w:m.w,h:m.h,dur:m.dur,kind:'video'},[bmp]);
     } else {
       let bmp=await createImageBitmap(m.file);
@@ -5390,16 +5437,22 @@ async function exportVideo(){
     for(let f=0;f<nf;f++){
       if(job.cancel)throw new Error('cancelled'); if(encErr)throw encErr; if(mode==='gpu'&&!G.ok)throw new Error('GPU was lost during export');
       await seekMedia(f); frame(f);
-      // Capture only after the frame has been presented: a WebGPU canvas snapshotted in the same
-      // task as its submit is still blank, which silently produced all-black exports.
-      if(mode==='gpu')await G.dev.queue.onSubmittedWorkDone(); else if(f%3===0)await sleep(0);
-      const vf=new VideoFrame(cv,{timestamp:Math.round(f*1e6/FPS),duration:Math.round(1e6/FPS)}); venc.encode(vf,{keyFrame:f%60===0}); vf.close();
-      const lum=mode==='gpu'?await gpuProbe():probeCpuLuma();
+      // Capture only after the frame has been presented. onSubmittedWorkDone() alone is a fence on
+      // the GPU queue, not a presentation: a canvas snapshot taken right after it is still blank on
+      // a real adapter, which is how exports shipped black while the GPU was drawing fine.
+      if(mode==='gpu'){await G.dev.queue.onSubmittedWorkDone();await nextPresent(250);} else if(f%3===0)await sleep(0);
+      const vf=new VideoFrame(cv,{timestamp:Math.round(f*1e6/FPS),duration:Math.round(1e6/FPS)}); venc.encode(vf,{keyFrame:f%60===0});
+      // Measure the frame we just handed the encoder, not the feedback buffer: only the capture can
+      // tell "the GPU is drawing" apart from "the canvas snapshot is blank".
+      const probeNow=f>0&&(f%15===0||f===nf-1);
+      let lum=null;
+      if(probeNow){ if(mode!=='gpu')lum=probeCpuLuma(); else{const px=samplePixels(vf);lum=px?px.lum:await gpuProbe();} }
+      vf.close();
       while(venc.encodeQueueSize>6)await sleep(2);
-      if(f>0&&(f%15===0||f===nf-1)){
+      if(probeNow){
         probes++;
         if(lum!==null){ if(lum<0.002)blackRun++; else {blackRun=0;litProbes++;} }
-        if(blackRun>=2)throw new Error('export is producing black frames (frame '+f+') - the canvas or the GPU is not delivering pixels');
+        if(blackRun>=2)throw new Error('export is producing black frames (frame '+f+', captured luminance '+(lum===null?'n/a':lum.toFixed(4))+') - the canvas was captured before it was presented');
       }
       if(f%10===0){const p=f/nf;btn.textContent=`■ Cancel ${Math.round(p*100)}%`;status(`exporting ${W}×${H} ${mp4?'mp4':'webm'} · frame ${f}/${nf}`+(f>30?` · about ${Math.ceil((performance.now()-t0)/1000*(1-p)/p)}s left`:''));pos=f/FPS;}
     }
