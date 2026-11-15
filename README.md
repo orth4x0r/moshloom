@@ -44,10 +44,10 @@ node scripts/gate.mjs --run      # npm test, logged to out/gate.log (UTF-8), red
 There is no hosted CI: GitHub Actions is off and every gate runs on the self-hosted machine.
 `gate.mjs --run` prints the line AGENTS.md rule 3 asks for and exits 0 PASS, 1 FAIL, 2 truncated:
 
-    gate: PASS · goldens 13/13, 0 differing px · CPU 9.73 ms/frame · page errors 0 · validation errors 0 · skips: export: software adapter cannot encode from the presented canvas
+    gate: PASS · goldens 13/13, 0 differing px · CPU 13.73 ms/frame · page errors 0 · validation errors 0 · skips: none
 
 It FAILs on any differing pixel, page or validation error, `FAIL` line, non-zero `npm test`
-exit, any skip other than that SwiftShader export skip, and on a committed `index.html` that
+exit, any skip at all, and on a committed `index.html` that
 `pack.py` would not reproduce (pretest re-packs, so a working-tree diff afterwards is a stale or
 hand-edited file). `node scripts/gate.mjs <log>` gates a saved log; PowerShell-redirected logs are
 UTF-16 and are decoded. `node scripts/gate.test.mjs` pins the parser to eight real logs in
@@ -71,11 +71,10 @@ checkout and worktree of the user) before it launches a browser: `--hardware` ta
   and 0.2% of pixels (`--no-golden` skips that, `node scripts/imgtest.mjs` runs it alone).
   The fluid frame is deliberately not a golden: a chaotic solver diverges across engine
   rebuilds, so its determinism is covered by the in-page replay instead.
-  The suite also exports 45 frames from the *visible* canvas (the offscreen hook is dropped
-  for that step) and decodes the result, failing if the frames are black. Software adapters
-  such as SwiftShader cannot encode from a presented WebGPU canvas, so that step reports
-  "skipped here" on them; on hardware it is the regression test for the capture-ordering bug.
-  A lost device during export is a skip too, and an encoder that produces no chunks must fail
+  The suite also exports 45 frames in main mode and decodes the result, failing if the frames
+  are black. Export renders into the offscreen texture and reads every frame back, never the
+  presented canvas, so it runs on SwiftShader too (`export: 1.02 MB video/mp4 640x360 1.5s,
+  decoded luminance 0.273`). A lost device during export is a skip, and an encoder that produces no chunks must fail
   instead of reporting `export done · 0.0 MB`.
   A second part opens a fresh main page and a fresh worker page, runs a worker smoke test
   (init, frames, readback) and compares one readback hash and plan against main. Where the
@@ -93,18 +92,16 @@ checkout and worktree of the user) before it launches a browser: `--hardware` ta
 
 ### Real-GPU export check
 
-`npm test` uses SwiftShader, which cannot encode from a presented WebGPU canvas, so the export
-step always skips there. Before a milestone, run:
+`npm test` uses SwiftShader. Before a milestone, also run the suite on the real adapter:
 
 ```
 npm run test:gpu:hw
 ```
 
 That launches **headed Chrome with the real adapter** (no SwiftShader flags) and runs the same
-suite. Export is not allowed to skip in this mode: a lost device or an encoder that refuses the
-presented canvas is a failure. The export step now really turns the offscreen hook off, so it
-captures the presented canvas. This is the run that covers the real-hardware export path where
-the capture-ordering bug was found.
+suite. Export is not allowed to skip in this mode. Leave the machine alone while it runs: the
+window is headed, and while the machine was in use the results changed between runs with no code
+change (see T1c below).
 
 The committed goldens were recorded on SwiftShader and are adapter-specific, so the hardware
 run skips the golden comparison by default. Pass `--hardware-golden` only if you have baselines
@@ -232,6 +229,11 @@ The same suite on a candidate fix (PR #4) also failed, including a worker export
 lit, so on this machine the hardware result currently changes between runs without a code change.
 Until it is reproducible, no hardware number here is evidence for or against a fix.
 
+Since X2 (#7) every export, main and worker, renders into the offscreen texture and reads it back,
+so an export no longer depends on the window being composited. The harness still decodes the
+exported file inside the headed window, which is the remaining window dependence; H4 moves that
+decode into a separate headless browser.
+
 ### Milestone zip
 
     npm run zip -- --sha <rev> [--out <path>] [--check-pack] <log> [<log> ...]
@@ -332,8 +334,8 @@ default palette to `DEFPAL` in engine.c (raise the scene limit there and in `pac
 - T1c: export, thumbnails and video clips in the worker. Worker export encodes from an offscreen
   texture with the muxers inside the worker; clip frames are requested per export frame, quantized
   to the export rate, and two exports of the same clip project land on the same decoded frame.
-  Worker thumbnails and worker-mode resize are covered by `npm test`. Main-mode export still uses
-  the visible canvas and is the SwiftShader skip.
+  Worker thumbnails and worker-mode resize are covered by `npm test`. Main-mode export later moved
+  to offscreen readback as well (X2, #7).
 - T1b2: the render worker (its own wasm, GPU device and OffscreenCanvas) with the same protocol as
   the analysis worker. Worker mode is chosen by `?mode=`, `#worker` or the header Engine control and
   restarts through recovery. The worker probe is lazy (never in main mode at boot), a worker smoke
