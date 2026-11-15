@@ -29,7 +29,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 /** The one skip a SwiftShader run is allowed to print. Verbatim from gpu_test.mjs. */
@@ -188,9 +188,19 @@ async function run() {
   // (truncated), a different finding from a FAIL line. But a non-zero npm exit is never a PASS,
   // whatever the log says.
   const { result, code } = gateFile(LOG_NAME);
-  if (npmCode !== 0 && code === 0) result.reasons.push(`npm test exited ${npmCode}`);
+  let extra = 0;
+  if (npmCode !== 0) { result.reasons.push(`npm test exited ${npmCode}`); extra = 1; }
+  // pretest re-packs index.html, so a committed index.html that pack.py would not produce shows
+  // up as a working-tree diff here. This is the pack-freshness check (there is no hosted CI).
+  const diff = spawnSync('git', ['diff', '--quiet', '--', 'index.html']);
+  if (diff.status !== 0) {
+    result.reasons.push(diff.status === 1 ? 'index.html differs from the pack.py output (stale or hand-edited)'
+      : `git diff index.html could not run (${diff.status})`);
+    extra = 1;
+  }
   console.log(formatGate(result));
-  process.exit(npmCode !== 0 && code === 0 ? 1 : code);
+  if (result.reasons.length) console.log('gate reasons: ' + result.reasons.join('; '));
+  process.exit(code === 0 && extra ? 1 : code);
 }
 
 function main(argv) {
