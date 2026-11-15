@@ -1,0 +1,24 @@
+{
+  "name": "moshloom",
+  "version": "2.5.0",
+  "private": true,
+  "type": "module",
+  "description": "Audio-reactive datamosh visualizer. wasm decides, WebGPU draws.",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "pack": "python pack.py",
+    "test": "node test.mjs && node gpu_test.mjs",
+    "test:cpu": "node test.mjs",
+    "test:gpu": "node gpu_test.mjs",
+    "test:gpu:hw": "node gpu_test.mjs --hardware",
+    "golden:record": "node gpu_test.mjs --record",
+    "pretest": "python pack.py"
+  },
+  "dependencies": {
+    "mp4-muxer": "^5.2.2",
+    "webm-muxer": "^5.1.4"
+  },
+  "devDependencies": {
+    "playwright": "^1.65.1"
+  }
+}

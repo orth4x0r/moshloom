@@ -1,0 +1,83 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>moshloom p1: worker + WebGPU probe</title>
+<style>
+  body{font:12px/1.5 ui-monospace,Consolas,monospace;background:#0b0b10;color:#cfd3d8;margin:16px}
+  #cv{width:320px;height:180px;border:1px solid #333;image-rendering:pixelated}
+  pre{background:#12121a;border:1px solid #262636;padding:10px;border-radius:4px;white-space:pre-wrap}
+  .ok{color:#5ce08a}.bad{color:#ff6b8a}
+</style>
+<h1 style="font-size:14px;color:#8ea">P1 probe</h1>
+<canvas id="cv" width="320" height="180"></canvas>
+<pre id="out">running…</pre>
+<script type="text/plain" id="src">self.onmessage = async (ev) => {
+  const res = { gpu: false, drew: false, lum: 0, err: null, adapter: '' };
+  try {
+    res.gpu = !!self.navigator.gpu;
+    if (!res.gpu) throw new Error('navigator.gpu is undefined in the worker');
+    const ad = await navigator.gpu.requestAdapter();
+    if (!ad) throw new Error('requestAdapter returned null in the worker');
+    res.adapter = (ad.info && (ad.info.vendor + ' / ' + ad.info.architecture)) || 'adapter';
+    const dev = await ad.requestDevice();
+    dev.addEventListener('uncapturederror', e => { res.err = (res.err ? res.err + ' | ' : '') + e.error.message; });
+    const fmt = navigator.gpu.getPreferredCanvasFormat();
+    const canvas = ev.data.canvas;
+    const ctx = canvas.getContext('webgpu');
+    ctx.configure({ device: dev, format: fmt, alphaMode: 'opaque' });
+    const code = `
+      @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+        var p = array<vec2f,3>(vec2f(-0.7,-0.6), vec2f(0.7,-0.6), vec2f(0.0,0.7));
+        return vec4f(p[i], 0., 1.);
+      }
+      @fragment fn fs() -> @location(0) vec4f { return vec4f(0.15, 0.9, 0.45, 1.); }`;
+    const mod = dev.createShaderModule({ code });
+    const pipe = await dev.createRenderPipelineAsync({ layout: 'auto',
+      vertex: { module: mod, entryPoint: 'vs' },
+      fragment: { module: mod, entryPoint: 'fs', targets: [{ format: fmt }] },
+      primitive: { topology: 'triangle-list' } });
+    const enc = dev.createCommandEncoder();
+    const pass = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(),
+      loadOp: 'clear', storeOp: 'store', clearValue: [0.02, 0, 0.05, 1] }] });
+    pass.setPipeline(pipe); pass.draw(3); pass.end();
+    const tex = dev.createTexture({ size: [64, 64], format: fmt,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    const p2 = enc.beginRenderPass({ colorAttachments: [{ view: tex.createView(),
+      loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] });
+    p2.setPipeline(pipe); p2.draw(3); p2.end();
+    const buf = dev.createBuffer({ size: 64 * 64 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyTextureToBuffer({ texture: tex }, { buffer: buf, bytesPerRow: 256 }, [64, 64]);
+    dev.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const a = new Uint8Array(buf.getMappedRange());
+    let sum = 0; for (let i = 0; i < a.length; i += 4) sum += a[i] + a[i + 1] + a[i + 2];
+    res.lum = +(sum / (64 * 64 * 3 * 255)).toFixed(3);
+    buf.unmap(); buf.destroy(); tex.destroy();
+    res.drew = true;
+  } catch (e) { res.err = String((e && e.message) || e); }
+  self.postMessage(res);
+};</script>
+<script>
+// Three questions, three answers: does a blob worker start, does the worker see navigator.gpu
+// and get a device, and does a frame actually reach the transferred OffscreenCanvas.
+const out = { blobWorker: false, gpu: false, drew: false, lum: 0, err: null, ua: navigator.userAgent.slice(0, 60) };
+const show = () => {
+  const ok = out.blobWorker && out.gpu && out.drew && out.lum > 0.02;
+  out.verdict = ok ? 'PASS' : 'FAIL';
+  document.getElementById('out').innerHTML =
+    JSON.stringify(out, null, 1) + '\n\n<span class="' + (ok ? 'ok' : 'bad') + '">' + out.verdict + '</span>';
+};
+const cv = document.getElementById('cv');
+const src = document.getElementById('src').textContent;
+let worker = null;
+try {
+  worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+  out.blobWorker = true;
+} catch (e) { out.err = 'new Worker(blob:) failed: ' + (e && e.message || e); }
+if (worker) {
+  const off = cv.transferControlToOffscreen();
+  const timer = setTimeout(() => { out.err = out.err || 'worker did not answer in 15 s'; show(); }, 15000);
+  worker.onmessage = (ev) => { clearTimeout(timer); Object.assign(out, ev.data); show(); };
+  worker.onerror = (ev) => { clearTimeout(timer); out.err = 'worker error: ' + ev.message; show(); };
+  worker.postMessage({ canvas: off }, [off]);
+} else show();
+</script>
