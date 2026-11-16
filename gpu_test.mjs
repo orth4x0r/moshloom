@@ -625,7 +625,103 @@ async function launch() {
 const browser = await launch();
 if (HARDWARE) console.log('hardware run: headed Chrome, real GPU; export must produce a file'
   + (CHECK_GOLDENS ? '' : '; SwiftShader goldens skipped (pass --hardware-golden to compare)'));
+
+// ---- H9: one live moshloom window at a time ----------------------------------
+// Measured by the coordinator on the real GPU (AMD RDNA-2, Chrome 157.0.8103.52, display held on):
+// a worker-mode export of 45 frames at 1280x720 finishes in 2.0-6.1 s alone, but hangs forever in
+// gpuCapFrame's `await dev.queue.onSubmittedWorkDone()` in gpu.js when a second window holds a live
+// moshloom page - worker mode or main mode, with the offscreen hook or without it. Navigating that
+// neighbour to about:blank first brings the same export back to 2.0 s, a non-GPU neighbour costs
+// 4.0 s, two worker pages as tabs of one window cost 6.0 s, and with the display off every case
+// passes - which is why the hardware gate was green the day before. Every page in this file is
+// `browser.newPage(...)`, so every page is its own window.
+//
+// The fix cannot be one shared context: index.src.html autosaves the project to
+// localStorage('moshloom') and restores it at boot, so pages sharing a context would leak state
+// into the "fresh page" sections and change what resetSection() starts from. So, before a page
+// does GPU work it becomes the only unparked moshloom window: every other app page is minimized
+// through CDP (a minimized window is not composited, the property the display-off run shows is
+// enough), and woken again with windowState 'normal' + bringToFront when a later section needs it.
+// Pages whose state is done are still closed by their own section. Contexts and localStorage stay
+// per page, so a fresh page is still fresh.
+//
+// This runs in both modes on purpose: the CDP calls are the same in headless Chrome, so the gate
+// exercises the mechanism rather than only the coordinator's hardware run. It cannot change a
+// pixel - every frame the suite reads back comes from the offscreen texture, and the screenshot is
+// taken with the long-lived page in front. The one line at the end of the run is the evidence:
+// `windows: N solo switches, max live GPU windows M`.
+const APP_URL = pathToFileURL(html).href;
+const soloStats = { switches: 0, maxLive: 0, failures: [] };
+const soloState = new WeakMap();            // page -> 'live' | 'parked' (absent = live)
+const soloWindowRef = new WeakMap();        // page -> { session, windowId } for the CDP calls
+// A window-bounds round trip measured under 20 ms; 10 s is a stall, not a slow machine. Bounded like
+// every other wait here (H7): a helper that can hang would hold the GPU lock and block every run.
+const WINDOW_BUDGET_MS = 10000;
+const windowOp = (p, what) => withTimeout(p, WINDOW_BUDGET_MS, `${what}: no answer within ${WINDOW_BUDGET_MS} ms`);
+
+const isClosedErr = (e) => /closed|Target closed|Session closed/i.test(String((e && e.message) || e));
+
+async function windowRef(pg) {
+  let ref = soloWindowRef.get(pg);
+  if (!ref) {
+    const session = await windowOp(pg.context().newCDPSession(pg), 'windows: attach a CDP session to a page');
+    const { windowId } = await windowOp(session.send('Browser.getWindowForTarget'), 'windows: Browser.getWindowForTarget');
+    ref = { session, windowId };
+    soloWindowRef.set(pg, ref);
+  }
+  return ref;
+}
+
+/** Minimize a window ('minimized') or restore it ('normal'); both settle before returning. */
+async function setWindowState(pg, windowState) {
+  const { session, windowId } = await windowRef(pg);
+  await windowOp(session.send('Browser.setWindowBounds', { windowId, bounds: { windowState } }),
+    `windows: set a window to ${windowState}`);
+}
+
+/** Every page of this browser that has loaded the app (each holds its own WebGPU device). */
+const appPages = () => browser.contexts().flatMap((c) => c.pages())
+  .filter((p) => !p.isClosed() && p.url().startsWith(APP_URL));
+
+/**
+ * Make `pg` the only unparked moshloom window, then focus it. Call this at the start of every
+ * section that uses a page, before that page does GPU work: a section that wakes a page it parked
+ * earlier must call this again, because being parked is what stopped the neighbour from stalling it.
+ */
+async function soloWindow(pg, label) {
+  let parked = 0;
+  for (const other of appPages()) {
+    if (other === pg || soloState.get(other) === 'parked') continue;
+    try {
+      await setWindowState(other, 'minimized');
+      soloState.set(other, 'parked');
+      parked++;
+    } catch (e) {
+      if (!isClosedErr(e)) {
+        soloState.set(other, 'live');
+        soloStats.failures.push(`${label}: could not park another moshloom window (${String(e.message || e).split('\n')[0]})`);
+      }
+    }
+  }
+  if (parked) soloStats.switches++;
+  if (soloState.get(pg) === 'parked') {
+    try {
+      await setWindowState(pg, 'normal');
+      soloState.set(pg, 'live');
+    } catch (e) {
+      if (!isClosedErr(e)) soloStats.failures.push(`${label}: could not restore the page under test (${String(e.message || e).split('\n')[0]})`);
+    }
+  }
+  try { await windowOp(pg.bringToFront(), `${label}: bringToFront`); }
+  catch (e) { if (!isClosedErr(e)) soloStats.failures.push(`${label}: could not focus the page under test (${String(e.message || e).split('\n')[0]})`); }
+  // The number this whole task is about: after a solo switch, at most one app page is not parked.
+  const live = (soloState.get(pg) === 'parked' ? 0 : 1)
+    + appPages().filter((p) => p !== pg && soloState.get(p) !== 'parked').length;
+  if (live > soloStats.maxLive) soloStats.maxLive = live;
+}
+
 const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+await soloWindow(page, 'boot');
 const errs = [];
 const skips = [];
 // Chrome on file:// logs this while a test decodes a blob URL into a <video>; the frame still decodes.
@@ -800,6 +896,7 @@ const gridProblems = [];
   const t0 = Date.now();
   try {
     gp = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+    await soloWindow(gp, 'grid order (main)');
     watch(gp);
     await gp.addInitScript(() => { window.__MOSH_OFFSCREEN = true; });
     await boundedGoto(gp, 'grid order: main fresh page', pathToFileURL(html).href + '?mode=main&grid=1&v=' + Date.now());
@@ -818,6 +915,7 @@ const gridProblems = [];
     await gp.close(); gp = null;
 
     wp = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+    await soloWindow(wp, 'grid order (worker)');
     watch(wp);
     await wp.addInitScript(() => { window.__MOSH_OFFSCREEN = true; });
     await boundedGoto(wp, 'grid order: worker fresh page', pathToFileURL(html).href + '?mode=worker&offscreen=1&grid=1&v=' + Date.now());
@@ -875,6 +973,7 @@ const gridProblems = [];
 }
 
 // ---- media ----
+await soloWindow(page, 'media');
 await resetSection();
 await page.selectOption('#res', '640');
 const imgOk = await addMediaFile(page, 'media image', clipImg, errs);
@@ -883,6 +982,7 @@ const vidOk = await addMediaFile(page, 'media video', clipVid, errs);
 console.log('media video:', (await page.textContent('#status'))?.trim(), '|', await boundedEval(page, 'media: list the loaded media', () => G.media.map((m) => `${m.kind} ${m.w}x${m.h}`).join(', ')));
 
 // ---- custom shader: template compiles, broken code reports an error ----
+await soloWindow(page, 'shaders');
 await resetSection();
 await page.click('#bShd');
 await page.fill('#sName', 'Rings');
@@ -899,6 +999,7 @@ if (!/line|error|unknown|undeclared/i.test(serr)) errs.push('broken shader compi
 await page.click('#sClose');
 
 // ---- scenes and effects ----
+await soloWindow(page, 'scenes');
 await resetSection();
 const shot = async (name, sc, extra, fxs) => {
   await boundedEval(page, `scene ${name}: set the block, fx and frame and render`, ([sc, extra, fxs]) => {
@@ -925,6 +1026,7 @@ for (let t = 0; t < 8; t++) {
 await shot('mods_bloom', 10, { mods: [[6, 0, 0.5], [1, 4, 0.5], [0, 2, 0]], bloom: 0.6, mosh: 0.6 });
 
 // ---- fluid (effect type 8): renders, is deterministic from a seek, and costs ----
+await soloWindow(page, 'fluid');
 await resetSection();
 const fluid = await boundedEval(page, 'fluid: 200 frames with the effect off and on, twice from a seek', async (hardware) => {
   const hashOffset = async () => {
@@ -978,6 +1080,7 @@ await boundedEval(page, 'fluid: pin the fluid block and render 12 frames', () =>
 await grab('fx_fluid');
 
 // ---- profiler (task 0c): when the device supports timestamps, per-pass numbers must arrive ----
+await soloWindow(page, 'profiler');
 await resetSection();
 const prof = await boundedEval(page, 'profile: 10 frames with timestamp queries', async () => {
   if (!G.tsQ) return { skipped: true, why: (G.tsWhy || '').slice(0, 80) };
@@ -997,6 +1100,7 @@ else {
 }
 
 // ---- thumbnails ----
+await soloWindow(page, 'thumbnails');
 await resetSection();
 await boundedEval(page, 'thumbnails: auto-arrange the timeline', () => { autoArrange(); }, undefined, 'render');
 const thumbsWait = await waitForThumbs(page, 'thumbs');
@@ -1006,6 +1110,7 @@ if (!thumbsWait.ok) errs.push(`thumbnails: only ${thumbInfo.drawn}/${thumbInfo.b
 else if (thumbInfo.drawn === 0) errs.push('no block thumbnails were generated');
 
 // ---- Auto-arrange must not flicker faster than the flash limit, at any tempo ----
+await soloWindow(page, 'auto-arrange');
 await resetSection();
 const aaFails = await boundedEval(page, 'auto-arrange: plan across five tempos', () => {
   const fails = [];
@@ -1041,6 +1146,7 @@ const lost = await boundedEval(page, 'gpu errors: read G.lostMsg', () => (typeof
 console.log('gpu errors:', gpuErrs.length ? gpuErrs.join(' || ').slice(0, 900) : 'none', '| lost:', lost);
 
 // ---- projects (step A): schema, round trip, both stores, migrate, and the dialog ----
+await soloWindow(page, 'projects');
 await resetSection();
 const projFails = await boundedEval(page, 'projects: schema, round trip, autosave, named store, migrate', async () => {
   const fails = [];
@@ -1125,6 +1231,7 @@ if (errs.length > before) errs.push('projects: the dialog raised a page error');
 
 // ---- analysis worker (T1b1): features come from the worker and are loaded into the render wasm ----
 // plan()[2] is skipres/freeze, not time; scene A's clock is plan()[18] (pack_scene writes o[2]).
+await soloWindow(page, 'analysis worker');
 await resetSection();
 const aw = await boundedEval(page, 'analysis worker: the plan at frames 30 and 31', () => {
   const plan = (f) => new Float32Array(X.memory.buffer, X.plan(f), 512).slice();
@@ -1143,6 +1250,7 @@ if (!(aw.t31 > aw.t30)) errs.push('analysis: the clock did not advance between f
 console.log(`analysis worker: ${aw.worker}, features from ${aw.source}, nf ${aw.nf}, clock ${aw.t30.toFixed(3)} -> ${aw.t31.toFixed(3)}`);
 
 // ---- render-mode probe (T1b2): lazy, never at boot in main mode ----
+await soloWindow(page, 'mode probe');
 const probeInfo = await boundedEval(page, 'mode probe: header, engine control and options', () => ({
   worker: window.__workerGpu, header: $('mode').textContent, mode,
   engine: $('engine') ? $('engine').value : null,
@@ -1170,6 +1278,7 @@ let mainCmpPage = null, workerPage = null, workerOut = null, mainRef = null, wor
 const workerT0 = Date.now();
 try {
   mainCmpPage = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+  await soloWindow(mainCmpPage, 'worker comparison (main)');
   const merrs = [];
   mainCmpPage.on('pageerror', (e) => merrs.push('PAGEERR ' + e.message));
   mainCmpPage.on('console', (m) => { if (m.type() === 'error' && !benignConsole(m.text())) merrs.push('CONSOLE ' + m.text().slice(0, 500)); });
@@ -1201,6 +1310,7 @@ try {
   if (merrs.length) throw new Error('main comparison page: ' + merrs[0]);
 
   workerPage = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+  await soloWindow(workerPage, 'worker comparison (worker)');
   const werrs = [];
   workerPage.on('pageerror', (e) => werrs.push('PAGEERR ' + e.message));
   workerPage.on('console', (m) => { if (m.type() === 'error' && !benignConsole(m.text())) werrs.push('CONSOLE ' + m.text().slice(0, 500)); });
@@ -1403,6 +1513,7 @@ if (workerWhy) {
   const openStatsPage = async (label, query) => {
     const pg = await browser.newPage({ viewport: { width: 1400, height: 900 } });
     statsPages.push(pg);
+    await soloWindow(pg, `stats ${label}`);
     pg.on('pageerror', (e) => statsProblems.push(`stats ${label}: page error ${e.message}`));
     pg.on('console', (m) => {
       if (m.type() === 'error' && !benignConsole(m.text())) statsProblems.push(`stats ${label}: console error ${m.text().slice(0, 300)}`);
@@ -1507,7 +1618,10 @@ if (workerWhy) {
   const statsT0 = Date.now();
   try {
     // Let the long-lived page's queue go idle first. Worker mode boots through the mode probe and a
-    // software adapter that is still busy with the previous section can starve it.
+    // software adapter that is still busy with the previous section can starve it. Wake the page
+    // first (H9): the fresh-page sections before this one left it parked, and a parked page's queue
+    // is not the queue this drain is about.
+    await soloWindow(page, 'stats');
     await boundedEval(page, 'stats: drain the long-lived page queue', () => (typeof G !== 'undefined' && G.dev ? G.dev.queue.onSubmittedWorkDone() : null))
       .catch(() => {});
     const mp = await openStatsPage('main', '?mode=main&offscreen=1');
@@ -1618,6 +1732,7 @@ for (const name of ['device-lost', 'onerror']) {
   const rT0 = Date.now();
   try {
     rp = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+    await soloWindow(rp, `recovery ${name}`);
     const rerrs = [];
     rp.on('pageerror', (e) => rerrs.push('PAGEERR ' + e.message));
     rp.on('console', (m) => { if (m.type() === 'error' && !benignConsole(m.text())) rerrs.push('CONSOLE ' + m.text().slice(0, 500)); });
@@ -1719,6 +1834,7 @@ for (const name of ['device-lost', 'onerror']) {
 }
 
 // ---- export guard: an encoder that yields no chunks must fail, not report "done · 0.0 MB" ----
+await soloWindow(page, 'export');
 await resetSection();
 const emptyExport = await boundedEval(page, 'export guard: an encoder that yields no chunks', async () => {
   const RealVE = window.VideoEncoder, RealVF = window.VideoFrame;
@@ -1875,6 +1991,13 @@ if (CHECK_GOLDENS && fs.existsSync(goldenDir)) {
 
 await closeDecodePage();
 await browser.close();
+
+// H9: one line per run, the number the invariant is judged by. A park that failed is a real finding
+// (the next hardware section would meet a second live window), so it fails the run instead of
+// being counted quietly.
+for (const f of soloStats.failures) errs.push('windows: ' + f);
+console.log(`windows: ${soloStats.switches} solo switches, max live GPU windows ${soloStats.maxLive}`
+  + (soloStats.failures.length ? `, ${soloStats.failures.length} park failure(s)` : ''));
 
 // The numbers the budgets are 5x of, printed by every run: the slowest wait of each kind.
 console.log('bounded waits: ' + Object.entries(WAITS)
