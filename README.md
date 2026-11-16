@@ -59,6 +59,18 @@ checkout and worktree of the user) before it launches a browser: `--hardware` ta
 `gpu lock: refused ...` and exits 3 without starting Chromium; a lock whose pid is dead is removed.
 `node gpu_test.mjs --lock-self-test` checks this without a browser (10 cases).
 
+**No wait is unbounded.** Every `page.evaluate`, `waitForFunction` and `goto` in `gpu_test.mjs`
+has a budget (60 s to boot or evaluate, 120 s to render or export, about 5 times the measured
+duration with a 60 s floor). A timeout names the section and what it waited for, closes that page,
+and fails the run: it never hangs and never becomes a skip. The run ends with a `bounded waits:`
+line listing the slowest wait of each kind against its budget.
+
+The suite also checks the timing grid right after the first feature load, on a fresh main page and
+a fresh worker page, against constants (`grid order, main, f30 scene A clock 1.638, ...`), because
+a main-vs-worker comparison cannot see a fault both sides share. It checks the stats overlay in
+both modes (`stats main: ...`, `stats worker: ...`, including 0 worker messages after the panel
+closes).
+
 - `pretest` re-packs `index.html` so the tests always run against the current sources.
 - `test.mjs` renders 3,840 frames of the CPU path at 640x360, reports ms/frame, then replays
   from a reset and fails on any frame that changed between runs, or on a mostly black run.
@@ -142,8 +154,18 @@ The app can ask whether a worker can present a WebGPU canvas, on a **throwaway c
 test. That probe is lazy: it runs only when worker mode is requested (`?mode=worker`, `#worker`
 or the header control) or when recovery has to decide whether a worker mode is available. Main
 mode never starts it at boot, because a cosmetic label must not create a second GPU device or be
-able to destroy the main one. The header shows no worker suffix until the probe has answered;
-then it reads `WebGPU · worker ready` or `WebGPU · no worker`.
+able to destroy the main one. The header shows no worker suffix until the probe starts, then
+`worker: checking` (and `worker: checking (retry)`), and only an answer gives `WebGPU · worker
+ready` or `WebGPU · no worker`.
+
+A timeout is not an answer (P1). The probe worker reports each step it reaches (start, adapter,
+device, submit, readback), and progress re-arms its stall timer. An attempt that goes 5 s without
+a message is retried once on a fresh worker with 10 s, both under a 15 s cap. Idle, the probe takes
+40-190 ms. If both attempts stall, the header says `worker: no answer yet`, `window.__workerGpu`
+stays null, and the next Engine-control choice or recovery probes again. Before P1, one slow probe
+was cached as `no: probe timed out` and disabled worker mode for the session. Real failures (no
+`navigator.gpu` in the worker, worker or transfer refused, an unlit readback, a worker error) are
+still cached as `no: <reason>`. `window.__workerProbe` holds `{state, attempt, ms, why}`.
 
 The probe clears a small texture and reads it back, so "no worker" means the worker really failed
 rather than a copy being silently dropped. Two lessons are baked into it: `bytesPerRow` must be a
