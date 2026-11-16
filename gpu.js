@@ -571,24 +571,52 @@ async function gpuInit(cv){
   const ad=await navigator.gpu.requestAdapter(); if(!ad) throw new Error('no GPU adapter');
   const adHas=f=>!!(ad.features&&ad.features.has&&ad.features.has(f));
   const tsFeats=['timestamp-query','chromium-experimental-timestamp-query-inside-passes'].filter(adHas);
+  // Why the timestamps are missing has to survive to the overlay: a device that quietly dropped
+  // them is the difference between "this adapter has no timestamps" and "the request was refused
+  // here", and that was invisible before (worker mode asked for both features, was refused both,
+  // fell back to a device with none, and said nothing).
+  G.tsWhy=tsFeats.length?'':'the adapter offers no timestamp-query feature';
+  G.tsNote='';
   let dev;
   try{ dev=await ad.requestDevice(tsFeats.length?{requiredFeatures:tsFeats}:undefined); }
-  catch(e){ dev=await ad.requestDevice(); }          // an experimental feature may be refused; never lose the GPU path for it
+  catch(e){
+    // An experimental feature may be refused where the plain one is fine (a worker is exactly
+    // that case on some builds: refusing `inside-passes` used to drop `timestamp-query` with it).
+    // Ask for the plain feature on its own before giving up on timestamps altogether.
+    G.tsWhy='requestDevice refused ['+tsFeats.join(' + ')+']: '+((e&&e.message)||e);
+    if(tsFeats.length>1){
+      try{ dev=await ad.requestDevice({requiredFeatures:['timestamp-query']}); }
+      catch(e1){ dev=await ad.requestDevice(); }     // never lose the GPU path for a profiler
+    } else dev=await ad.requestDevice();
+  }
   G.dev=dev;
   G.tsQ=dev.features.has('timestamp-query');
+  // Recovery re-inits on a new device: buffers from the old one (and a map still in flight on it)
+  // must not be reused, and the last wall-clock completion belongs to the old queue.
+  G.tsSlots=null; G.wallSlots=null; G.wallSrc=null; G.wallLastAt=0;
+  if(!G.tsQ&&!G.tsWhy) G.tsWhy='the device has no timestamp-query feature';
   if(G.tsQ){
     try{
       G.qs=dev.createQuerySet({type:'timestamp',count:64});
-      G.rb=dev.createBuffer({size:512,usage:GPUBufferUsage.QUERY_RESOLVE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
-      G.rbMap=dev.createBuffer({size:512,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+      // Two readback slots: one frame's map can still be in flight (SwiftShader takes about a
+      // second) while the next frame records its own. A frame with no free slot is not measured
+      // and never overwrites a number it did not produce.
+      G.tsSlots=[0,1].map(()=>({
+        rb:dev.createBuffer({size:512,usage:GPUBufferUsage.QUERY_RESOLVE|GPUBufferUsage.COPY_SRC}),
+        map:dev.createBuffer({size:512,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}),
+        busy:false}));
       // Some builds allow stamps only on a command encoder, some only inside passes, and some
       // require an experimental flag for passes. Probe once; a refusal is not an error.
       const probe=dev.createTexture({size:[1,1],format:'rgba8unorm',usage:GPUTextureUsage.RENDER_ATTACHMENT});
       const pe=dev.createCommandEncoder();
       const pp=pe.beginRenderPass({colorAttachments:[{view:probe.createView(),loadOp:'clear',storeOp:'discard'}]});
       pp.writeTimestamp(G.qs,0); pp.end(); probe.destroy();
-    }catch(e){ G.tsQ=false; G.qs=G.rb=G.rbMap=null; G.tsWhy=(e&&e.message)||String(e); }
+    }catch(e){ G.tsQ=false; G.qs=null; G.tsSlots=null; G.tsWhy='a timestamp probe inside a pass was refused: '+((e&&e.message)||String(e)); }
   }
+  // `tsWhy` is only ever the reason timestamps are missing; a device that got them anyway (the pair
+  // was refused, the plain feature was not) keeps that story in `tsNote` so it is still reportable.
+  if(G.tsQ){ G.tsNote=G.tsWhy||''; G.tsWhy=''; }
+  else if(!G.tsWhy) G.tsWhy='the device has no timestamp-query feature';
   dev.lost.then(i=>{G.ok=false;G.lostMsg=i.message||i.reason;if(G.onLost)G.onLost(G.lostMsg);});
   dev.addEventListener('uncapturederror',e=>{G.errs.push(e.error.message);console.error('WebGPU:',e.error.message);if(G.onError)G.onError(e.error.message);});
   G.ctx=cv.getContext('webgpu'); if(!G.ctx) throw new Error('no WebGPU canvas context');
@@ -796,14 +824,19 @@ function gpuMel(f){ const nf=WASM.get_nf(); const mel=new Float32Array(WASM.memo
   for(let a=0;a<128;a++){const o=Math.max(0,f-a)*24;for(let k=0;k<24;k++)mb[a*24+k]=Math.min(255,mel[o+k]*196);}
   G.dev.queue.writeTexture({texture:G.melT},mb,{bytesPerRow:24},[24,128]); }
 function gpuFrame(f){
+  const wallT0=(G.prof&&!G.tsQ)?performance.now():0;   // start of this frame's wall clock, if it has one
   const dev=G.dev, pl=new Float32Array(WASM.memory.buffer,WASM.plan(f),512), enc=dev.createCommandEncoder();
   const bg=(p,entries)=>dev.createBindGroup({layout:p.getBindGroupLayout(0),entries:entries.map((r,i)=>({binding:i,resource:r}))});
   const full=(view,pipeline,group,seg,end)=>{const p=enc.beginRenderPass({colorAttachments:[{view,loadOp:'clear',storeOp:'store',clearValue:[0,0,0,1]}]});if(pipeline){p.setPipeline(pipeline);p.setBindGroup(0,group);if(markPass)markPass(p,seg||'post');p.draw(3);}if(end&&markPass)markPass(p,'end');p.end();};
   const canvasView=G.off?G.off.v:G.ctx.getCurrentTexture().createView();
-  const prof=G.prof&&G.tsQ&&!G.profBusy;
+  // Two different sources, never mixed. Timestamps when the device records them; a per-frame
+  // wall clock when it does not. Before this, the wall clock also ran while the timestamp path was
+  // merely busy, and it timed the whole queue draining instead of one frame (200-56000 ms).
+  const prof=G.prof&&G.tsQ;
+  const tsSlot=prof?gpuSlot():null;                    // a readback whose map has landed, or null
   if(prof){ G.tsN=0; G.tsSeg=[]; }
-  markPass=prof?((p,seg)=>{ if(G.tsN<63){ p.writeTimestamp(G.qs,G.tsN); G.tsSeg.push(seg); G.tsN++; } }):null;
-  if(pl[0]){ full(canvasView,null); dev.queue.submit([enc.finish()]); G.valid=false; return; }
+  markPass=(prof&&tsSlot)?((p,seg)=>{ if(G.tsN<63){ p.writeTimestamp(G.qs,G.tsN); G.tsSeg.push(seg); G.tsN++; } }):null;
+  if(pl[0]){ full(canvasView,null); dev.queue.submit([enc.finish()]); G.valid=false; if(tsSlot) tsSlot.busy=false; return; }
   gpuMel(f);
   const xf=pl[10], iframe=pl[1]>0||!G.valid, freeze=pl[3]>0;
   const scA=gpuSU(G.uA,pl,16,f,G.w,G.h), scB=xf>=0?gpuSU(G.uB,pl,40,f,G.w,G.h):-1;
@@ -829,21 +862,59 @@ function gpuFrame(f){
   full(G.buf[1-G.bi].v,G.pFb,bg(G.pFb,[{buffer:G.uF},G.nm,cur.v,prv.v,G.buf[G.bi].v,G.mvT.v,G.fluid.velA.v]),'feedback'); G.bi^=1;
   full(canvasView,G.pOut,bg(G.pOut,[{buffer:G.uF},G.nr,G.buf[G.bi].v]),'output',true);
   markPass=null;
-  if(prof&&G.tsN>1){ enc.resolveQuerySet(G.qs,0,G.tsN,G.rb,0); enc.copyBufferToBuffer(G.rb,0,G.rbMap,0,G.tsN*8); }
+  // The resolve belongs to this frame's encoder, so the map that follows it cannot report work
+  // from a later frame.
+  if(prof&&tsSlot&&G.tsN>1){ enc.resolveQuerySet(G.qs,0,G.tsN,tsSlot.rb,0); enc.copyBufferToBuffer(tsSlot.rb,0,tsSlot.map,0,G.tsN*8); }
+  // No timestamps on this device: fence this frame's own submit, so "wall clock" is one frame's
+  // submit plus its GPU work and not the queue draining (that measured 211-1457 ms for a ~100 ms
+  // frame on SwiftShader, and 56203 ms on a real GPU).
+  let wallSlot=null;
+  if(G.prof&&!G.tsQ){ wallSlot=gpuWallSlot(); if(wallSlot) enc.copyBufferToBuffer(G.wallSrc,0,wallSlot.buf,0,8); }
   dev.queue.submit([enc.finish()]); G.si^=1; G.valid=true;
-  if(prof&&G.tsN>1){
-    G.profBusy=true; const segs=G.tsSeg.slice(), n=G.tsN, buf=G.rbMap;
-    buf.mapAsync(GPUMapMode.READ).then(()=>{
-      const raw=new BigInt64Array(buf.getMappedRange().slice(0)); buf.unmap(); G.profBusy=false;
-      const at=i=>Number(raw[i])/1e6;                 // GPU timestamps are 64-bit nanoseconds
-      const acc={scene:0,pre:0,motion:0,fluid:0,feedback:0,output:0,post:0};
-      for(let i=0;i<n-1;i++){ const ms=Math.max(0,at(i+1)-at(i)); if(acc[segs[i]]!==undefined) acc[segs[i]]+=ms; }
-      G.timings={...acc,total:Math.max(0,at(n-1)-at(0)),ts:true};
-    }).catch(()=>{ G.profBusy=false; });
-  } else if(G.prof){
-    const t0=performance.now();
-    dev.queue.onSubmittedWorkDone().then(()=>{ G.timings={total:performance.now()-t0,ts:false}; });
+  if(prof&&tsSlot){
+    const slot=tsSlot;
+    if(G.tsN>1){
+      const segs=G.tsSeg.slice(), n=G.tsN;
+      slot.map.mapAsync(GPUMapMode.READ).then(()=>{
+        const raw=new BigInt64Array(slot.map.getMappedRange().slice(0)); slot.map.unmap(); slot.busy=false;
+        const at=i=>Number(raw[i])/1e6;                 // GPU timestamps are 64-bit nanoseconds
+        const acc={scene:0,pre:0,motion:0,fluid:0,feedback:0,output:0,post:0};
+        for(let i=0;i<n-1;i++){ const ms=Math.max(0,at(i+1)-at(i)); if(acc[segs[i]]!==undefined) acc[segs[i]]+=ms; }
+        G.timings={...acc,total:Math.max(0,at(n-1)-at(0)),ts:true,why:''};
+      }).catch(()=>{ slot.busy=false; });
+    } else slot.busy=false;                            // too few marks to say anything
   }
+  if(wallSlot){
+    const slot=wallSlot;
+    slot.buf.mapAsync(GPUMapMode.READ).then(()=>{
+      slot.buf.unmap(); slot.busy=false;
+      // One frame, from two clocks, whichever is smaller: this frame's own submit-to-complete
+      // (the frame's cost when the queue was idle) and the gap since the previous frame completed
+      // (its share when frames are queued behind each other). Neither can report the queue draining
+      // as a frame: a cold SwiftShader frame is ~1.5 s of warm-up, steady state is ~140 ms.
+      const now=performance.now(), own=now-wallT0, gap=G.wallLastAt?now-G.wallLastAt:Infinity;
+      G.wallLastAt=now;
+      G.timings={total:Math.min(own,gap),ts:false,why:G.tsWhy||'timestamps unavailable'};
+    }).catch(()=>{ slot.busy=false; });
+  }
+}
+
+// A free timestamp readback slot, marked busy, or null when both are still in flight.
+function gpuSlot(){
+  const s=(G.tsSlots||[]).find(r=>!r.busy);
+  if(!s) return null;
+  s.busy=true; return s;
+}
+// A free wall-clock fence slot. Four of them: with a frame every 200 ms a slow map must not cost
+// every second sample, and a frame with no slot free is skipped rather than misreported.
+function gpuWallSlot(){
+  if(!G.wallSlots){
+    G.wallSrc=G.dev.createBuffer({size:8,usage:GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
+    G.wallSlots=[0,1,2,3].map(()=>({buf:G.dev.createBuffer({size:8,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}),busy:false}));
+  }
+  const s=G.wallSlots.find(r=>!r.busy);
+  if(!s) return null;
+  s.busy=true; return s;
 }
 // 160x90 thumbnail of block i at frame f -> ImageData
 async function gpuThumb(i,f){

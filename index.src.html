@@ -190,9 +190,13 @@ function wReply(type, payload, id, transfer) { self.postMessage(PROTO.make(type,
 let statsTimer = null;
 function statsPayload() {
   const T = G && G.timings;
+  // `tsQ` / `tsWhy` ride along with the numbers so the overlay can say whether the frame time is a
+  // GPU timestamp or a wall clock, and why it is one when the device would not record them. Both
+  // sides of the app (page and worker) send the same fields, from the same renderer G.
   return { ok: !!(G && G.ok), w: (G && G.w) || 0, h: (G && G.h) || 0,
     timings: T ? { ...T } : null, texBytes: gpuTexBytes(G),
-    fluidOn: !!(G && G.fluidOn), errs: G && G.errs ? G.errs.length : 0 };
+    fluidOn: !!(G && G.fluidOn), errs: G && G.errs ? G.errs.length : 0,
+    tsQ: !!(G && G.tsQ), tsWhy: (G && G.tsWhy) || '', tsNote: (G && G.tsNote) || '' };
 }
 function mediaTex(i, w, h, kind) {
   let m = G.media[i];
@@ -475,6 +479,12 @@ function statsNumbers(){
   const inWorker=renderIn==='worker', w=inWorker?rwStats:null, g=(typeof G!=='undefined')?G:null;
   const T=inWorker?(w?w.timings:null):(g?g.timings:null);
   const tex=inWorker?(w?+w.texBytes||0:0):gpuBytes();
+  // The source of `timings.total` and, when it is not a GPU timestamp, why: both renderers record
+  // it in gpu.js and the worker forwards its own in the `stats` payload, so the page never guesses.
+  const tsQ=inWorker?(w?!!w.tsQ:false):!!(g&&g.tsQ);
+  const tsWhy=inWorker?(w?(w.tsWhy||''):''):((g&&g.tsWhy)||'');
+  const tsNote=inWorker?(w?(w.tsNote||''):''):((g&&g.tsNote)||'');
+  const source=T?(T.ts?'gpu timestamps':'wall clock'):null;
   let heap=null; try{ if(performance.memory) heap=performance.memory.usedJSHeapSize; }catch(e){}
   return {
     runMode: window.__runMode,
@@ -482,7 +492,10 @@ function statsNumbers(){
     mode,                                      // 'gpu' or 'cpu'
     w: inWorker&&w?w.w:W, h: inWorker&&w?w.h:H,
     live: inWorker?!!(w&&w.ok):!!(g&&g.ok&&mode==='gpu'),
-    timings: T?{...T}:null,                    // {total, ts, scene, pre, motion, fluid, feedback, output}
+    timings: T?{...T}:null,                    // {total, ts, why, scene, pre, motion, fluid, feedback, output}
+    frameMsSource: source,                     // 'gpu timestamps' | 'wall clock' | null
+    frameMsWhy: tsWhy,                         // why timestamps are unavailable, '' when they are
+    tsQ, tsWhy, tsNote,                        // tsNote: how the device ended up with them, if at all
     texBytes: tex,
     memoryBytes: memBytes(tex),
     analyzeMs: lastAnalyzeMs,
@@ -496,7 +509,7 @@ function refreshStats(){
   const el=$('stats'); if(!el) return;
   const S=statsNumbers(), T=S.timings, f=v=>v===undefined?'-':(+v).toFixed(2);
   const L=[`${S.runMode}  ${S.w}x${S.h}`,
-    `frame ${T?(f(T.total)+' ms'+(T.ts?' (gpu timestamps)':' (wall clock)')):(S.renderer==='worker'?(S.live?'- (waiting for the render worker)':'- (no GPU in the render worker)'):'-')}`];
+    `frame ${T?(f(T.total)+' ms ('+S.frameMsSource+(T.ts?'':': '+(S.frameMsWhy||'timestamps unavailable'))+')'):(S.renderer==='worker'?(S.live?'- (waiting for the render worker)':'- (no GPU in the render worker)'):'-')}`];
   if(T&&T.ts){ L.push(`scene ${f(T.scene)}   pre ${f(T.pre)}   me ${f(T.motion)}`);
                L.push(`fluid ${f(T.fluid)}   feedback ${f(T.feedback)}   output ${f(T.output)}`); }
   L.push(`analyze ${lastAnalyzeMs?lastAnalyzeMs.toFixed(0)+' ms':'not measured yet'}`);
