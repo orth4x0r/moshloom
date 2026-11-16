@@ -221,9 +221,13 @@ The worker's own `device-lost` message and the worker `onerror` call the same fu
 `terminate()` cannot be made to look like a crash, so `npm test` delivers both triggers through the
 handlers the page installs on `rw`, each on a fresh worker page:
 
-    recovery device-lost: worker+gpu -> main+gpu, new canvas, lum 0.5152 (G.off texture), page errors 0, validation errors 0
-    recovery onerror: worker+gpu -> main+gpu, new canvas, lum 0.5375 (G.off texture), page errors 0, validation errors 0
+    recovery device-lost: worker+gpu -> main+gpu, new canvas, lum 0.6111 (G.off texture), page errors 0, validation errors 0, recovered in 434 ms (budget 120000 ms)
+    recovery onerror: worker+gpu -> main+gpu, new canvas, lum 0.6696 (G.off texture), page errors 0, validation errors 0, recovered in 443 ms (budget 120000 ms)
 
+The wait for recovery uses the 120 s render budget. A recovery that does not finish in time
+fails as `recovery <trigger>: __runMode is still worker+gpu after 120000 ms`, not as a wrong
+step-down. Before H8 a 45 s wait was swallowed, and a slow recovery on a busy machine was reported
+as `stepped down to worker+gpu`. No wait a later assertion depends on swallows its timeout (H8).
 A real device loss or a real worker crash is not simulated.
 
 ### T1c: export, thumbnails and media in the worker
@@ -327,6 +331,14 @@ the run mode (`worker+gpu 1280x720`, `main+gpu ...`). `window.__statsSnapshot()`
 numbers for tests. Measured on SwiftShader in worker mode: before, `frame -` and ~70.3 MB (no
 textures); after, `frame 145.76 ms (gpu timestamps)` with per-pass lines and ~126.8 MB, the same
 texture total as main mode.
+
+The frame time is GPU timestamps whenever the device has `timestamp-query` (A2). Timestamps are
+resolved into two readback slots, so a frame never falls back to a wall clock just because the
+previous frame's readback is still mapping. Before A2 that fallback timed the whole queue
+draining: 200-56,000 ms in worker mode on a real GPU. A device without timestamps gets a per-frame
+wall clock and says why (`frame 12.34 ms (wall clock: <reason>)`). If the experimental
+inside-passes feature is refused, device creation asks for plain `timestamp-query` alone.
+`__statsSnapshot()` carries `tsQ`, `tsWhy`, `frameMsSource` and `frameMsWhy`.
 
 ## Adding a visual
 
