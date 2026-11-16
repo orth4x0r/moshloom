@@ -1202,6 +1202,212 @@ if (workerWhy) {
   console.log(`worker: skipped here (${workerWhy})`);
 }
 
+// ---- stats overlay (H6): the panel describes the renderer that is drawing -------------------------
+// U1 (#13) made the overlay follow `renderIn` instead of `mode`: in worker mode the page's own G
+// never draws, so the page sends `stats-on` / `stats-off` and the render worker sets its own
+// G.prof and posts `stats` about 4 times a second while the panel is open. Before U1, worker mode
+// showed `frame -` and no texture bytes, and nothing in this suite covered any of it.
+//
+// Each mode gets its own fresh page, so this section cannot leave a tempo, an open panel or a
+// profiling flag behind for a later section (AGENTS.md, "Sections share one long-lived page"),
+// and the two texture totals are compared only against each other, at the same size.
+// The panel is opened the way a user opens it: a backquote keydown on the page body.
+{
+  const STATS_MS = 2000;                 // the ~2 s measurement window the task asks for
+  const statsPages = [];
+  const statsProblems = [];
+  const readStats = (pg) => pg.evaluate(() => {
+    const S = window.__statsSnapshot();
+    return Object.assign(S, { first: ($('stats').textContent || '').split('\n')[0] });
+  });
+  const openStatsPage = async (label, query) => {
+    const pg = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+    statsPages.push(pg);
+    pg.on('pageerror', (e) => statsProblems.push(`stats ${label}: page error ${e.message}`));
+    pg.on('console', (m) => {
+      if (m.type() === 'error' && !benignConsole(m.text())) statsProblems.push(`stats ${label}: console error ${m.text().slice(0, 300)}`);
+    });
+    await pg.addInitScript(() => { window.__MOSH_OFFSCREEN = true; });
+    await pg.goto(pathToFileURL(html).href + query + '&v=' + Date.now());
+    await pg.waitForFunction(() => window.__featReady === true, null, { timeout: 30000 }).catch(() => {});
+    return pg;
+  };
+  // Same sentence the other worker sections print when worker+GPU is not available here.
+  const bootSkip = (pg, want) => pg.evaluate((want) => {
+    const b = { runMode: window.__runMode, workerGpu: window.__workerGpu,
+      note: typeof gpuNote === 'string' ? gpuNote : '' };
+    if (b.runMode === want) return '';
+    return (b.workerGpu && b.workerGpu !== 'yes' ? b.workerGpu : 'run mode is ' + (b.runMode || 'unknown'))
+      + (b.note ? ' (' + b.note + ')' : '');
+  }, want);
+  // A lit, known project in both modes. Frame 0 is a black plan (gpuFrame clears and returns), so
+  // the measured frames start at 20 s (frame 600) and every frame the profiler samples is a real
+  // scene frame. push() sends the same project to the render worker. The `stats` count wraps the
+  // handler the page installed on the render worker: a push is `t === 'stats'`, never its ack.
+  const prepare = (pg) => pg.evaluate(() => {
+    pause(); bpm = 120; offs = 0; X.set_grid(bpm, offs);
+    const b = $('bpm'); if (b) b.value = bpm.toFixed(2);
+    blocks = [newBlock(9, { len: 256, mosh: 0.6, glitch: 0, var: 1, rgb: 0.3 })];
+    fx = []; push(); pos = 20; seek(20);
+    window.__statsMsgs = 0;
+    if (renderIn === 'worker' && typeof rw !== 'undefined' && rw && rw.onmessage) {
+      const h = rw.onmessage;
+      rw.onmessage = (ev) => { if (ev && ev.data && ev.data.t === 'stats') window.__statsMsgs++; return h(ev); };
+    }
+    const a = document.activeElement; if (a && a.blur) a.blur();   // keydown ignores INPUT/SELECT/TEXTAREA
+  });
+  // One frame at a time for the measurement window, waiting for each frame to finish. The app's own
+  // playback runs the rAF loop at 30 frames/s against a software adapter that needs ~120 ms per
+  // 1280x720 frame, so it builds a backlog that outlives the page: measured on this machine, a
+  // fresh worker page opened right after a 2 s playback needed 5-24 s to boot and its 5 s mode
+  // probe timed out (2 of 2 runs), while the same page after paced frames probed in 350 ms.
+  // Rendering on demand gives the overlay the same frame time and leaves no backlog behind.
+  const renderWindow = (pg, ms) => pg.evaluate(async (ms) => {
+    const t0 = performance.now();
+    let f = 600, n = 0;
+    if (renderIn === 'worker') await rwCall('seek', {});
+    while (performance.now() - t0 < ms) {
+      if (renderIn === 'worker') {
+        await rwCall('frame', { f: f++ });
+        await new Promise((r) => setTimeout(r, 200));   // the worker replies on submit, so pace it
+      } else {
+        gpuFrame(f++);
+        await G.dev.queue.onSubmittedWorkDone();
+      }
+      n++;
+    }
+    return n;
+  }, ms);
+  const drainFrames = (pg) => pg.evaluate(async () => {
+    if (renderIn === 'worker') await rwCall('readback', {});   // the copy queues behind every frame
+    else await G.dev.queue.onSubmittedWorkDone();
+  });
+  const openPanel = async (pg, label) => {
+    await pg.bringToFront();
+    await pg.keyboard.press('Backquote');
+    const opened = await pg.waitForFunction(() => $('stats').style.display === 'block',
+      null, { timeout: 5000 }).then(() => true).catch(() => false);
+    if (!opened) statsProblems.push(`stats ${label}: backquote did not open the panel`);
+    await pg.evaluate(() => { window.__statsMsgs = 0; });     // the 2 s window starts here
+    const t0 = Date.now();
+    const frames = await renderWindow(pg, STATS_MS);
+    await drainFrames(pg).catch(() => {});
+    const waited = Date.now() - t0;
+    const snap = await readStats(pg);
+    const msgs = await pg.evaluate(() => window.__statsMsgs || 0);
+    // Deliberately no pause(): pause() calls thumbsSoon(), and 39 thumbnail renders plus their
+    // readbacks are more load to leave behind for the next fresh page's worker probe.
+    return { snap, msgs, waited, frames };
+  };
+  // Every number the task lists, from the panel's own source. A failed assertion here is reported
+  // with the value that was read, never as "the overlay is wrong".
+  const checkMode = (label, want, r) => {
+    const s = r.snap, bad = [], renderer = want.split('+')[0];
+    if (s.runMode !== want) bad.push(`runMode is ${s.runMode}, expected ${want}`);
+    if (s.renderer !== renderer) bad.push(`the panel reads the ${s.renderer} renderer, expected ${renderer}`);
+    if (!String(s.first).startsWith(want)) bad.push(`the panel's first line is "${s.first}", expected it to start with "${want}"`);
+    if (!(s.timings && s.timings.total > 0))
+      bad.push(`frame time is ${s.timings ? s.timings.total : 'null'} after ${r.frames} frames in ${r.waited} ms`);
+    if (!(s.texBytes > 0)) bad.push('texBytes is ' + s.texBytes);
+    if (s.gpuErrors !== 0) bad.push('gpuErrors is ' + s.gpuErrors);
+    for (const b of bad) statsProblems.push(`stats ${label}: ${b}`);
+    const t = s.timings;
+    console.log(`stats ${label}: ${s.runMode} ${s.w}x${s.h}, frame `
+      + (t ? `${(+t.total).toFixed(2)} ms (${t.ts ? 'gpu timestamps' : 'wall clock'})` : '-')
+      + ` after ${r.frames} frames in ${r.waited} ms, texBytes ${s.texBytes}, first panel line "${s.first}"`);
+    return !bad.length;
+  };
+
+  let mainSnap = null, workerSnap = null;
+  try {
+    // Let the long-lived page's queue go idle first. Worker mode boots through the mode probe, a
+    // separate worker with a fixed 5 s timeout (`gpuWorkerProbe`), and a software adapter that is
+    // still busy with the previous section can starve it into "probe timed out".
+    await page.evaluate(() => (typeof G !== 'undefined' && G.dev ? G.dev.queue.onSubmittedWorkDone() : null)).catch(() => {});
+    const mp = await openStatsPage('main', '?mode=main&offscreen=1');
+    const mSkip = await bootSkip(mp, 'main+gpu');
+    if (mSkip) statsProblems.push('stats main: ' + mSkip);
+    else {
+      await prepare(mp);
+      const mainRun = await openPanel(mp, 'main');
+      mainSnap = mainRun.snap;
+      checkMode('main', 'main+gpu', mainRun);
+    }
+    // One extra page at a time: this suite runs on a software adapter where every extra device
+    // slows the next section, and the H2 recovery pages probe a worker with the same 5 s timeout.
+    await mp.close().catch(() => {});
+
+    // A probe that timed out is a starved probe, not a missing capability: the earlier worker
+    // sections on this machine report worker+gpu. So say so and give it one more fresh page. Any
+    // other refusal, and a second timeout, is reported as the skip it is.
+    let wp = null, workerWhyStats = '';
+    for (let attempt = 0; attempt < 2 && !wp; attempt++) {
+      await page.evaluate(() => (typeof G !== 'undefined' && G.dev ? G.dev.queue.onSubmittedWorkDone() : null)).catch(() => {});
+      const cand = await openStatsPage('worker', '?mode=worker&offscreen=1');
+      const why = await bootSkip(cand, 'worker+gpu');
+      if (!why) { wp = cand; break; }
+      if (attempt || !/probe timed out/.test(why)) { workerWhyStats = why; break; }
+      console.log(`stats worker: the mode probe timed out on a fresh page (${why}); retrying on one more fresh page`);
+      await cand.close().catch(() => {});
+    }
+    if (!wp && !workerWhyStats) workerWhyStats = 'no worker page could be opened';
+    if (!wp) {
+      // Gate FAILs on a skip, so this is only reachable on a machine where worker + GPU really is
+      // unavailable; it is the same reason string the other worker sections print.
+      skips.push('stats: ' + workerWhyStats);
+      console.log(`stats: skipped the worker side here (${workerWhyStats})`);
+    } else {
+      await prepare(wp);
+      const workerRun = await openPanel(wp, 'worker');
+      workerSnap = workerRun.snap;
+      const openMsgs = workerRun.msgs;
+      checkMode('worker', 'worker+gpu', workerRun);
+
+      // The texture total is one number in one formula (Renderer.texBytes / gpuTexBytes). Both pages
+      // boot at 1280x720; if a side ever moves, put the worker on the main page's Size option and
+      // re-read while the panel is still open, so the comparison is at one size either way.
+      if (mainSnap && (workerSnap.w !== mainSnap.w || workerSnap.h !== mainSnap.h)) {
+        await wp.selectOption('#res', String(mainSnap.w));
+        await wp.waitForFunction((w) => window.__statsSnapshot().w === w, mainSnap.w,
+          { timeout: 15000, polling: 100 }).catch(() => {});
+        workerSnap = await readStats(wp);
+        console.log(`stats worker: the modes booted at different sizes, re-read the worker at ${workerSnap.w}x${workerSnap.h}`);
+      }
+      if (mainSnap) {
+        if (workerSnap.w !== mainSnap.w || workerSnap.h !== mainSnap.h)
+          statsProblems.push(`stats: the modes rendered at different sizes (${mainSnap.w}x${mainSnap.h} vs ${workerSnap.w}x${workerSnap.h}), so texBytes cannot be compared`);
+        else if (workerSnap.texBytes !== mainSnap.texBytes)
+          statsProblems.push(`stats: worker texBytes ${workerSnap.texBytes} != main ${mainSnap.texBytes} at ${mainSnap.w}x${mainSnap.h}`);
+        else console.log(`stats: texBytes ${mainSnap.texBytes} in both modes at ${mainSnap.w}x${mainSnap.h}`);
+      }
+
+      // Closing the panel must stop the pushes, not slow them down. The extra stats-off is
+      // acknowledged after the panel's own one on the same port (FIFO), so nothing can still be in
+      // flight when this window starts counting.
+      await wp.bringToFront();
+      await wp.keyboard.press('Backquote');
+      const closed = await wp.waitForFunction(() => $('stats').style.display === 'none',
+        null, { timeout: 5000 }).then(() => true).catch(() => false);
+      if (!closed) statsProblems.push('stats worker: a second backquote did not close the panel');
+      await wp.evaluate(() => rwCall('stats-off').catch(() => {}));
+      await wp.evaluate(() => { window.__statsMsgs = 0; });
+      await wp.waitForTimeout(STATS_MS);
+      const closedMsgs = await wp.evaluate(() => window.__statsMsgs || 0);
+      console.log(`stats worker: ${openMsgs} stats messages in ${workerRun.waited} ms with the panel open, `
+        + `${closedMsgs} in ${STATS_MS} ms after closing it`);
+      if (!(openMsgs >= 4))
+        statsProblems.push(`stats worker: ${openMsgs} stats messages in ${workerRun.waited} ms with the panel open, expected at least 4`);
+      if (closedMsgs !== 0)
+        statsProblems.push(`stats worker: ${closedMsgs} stats messages in ${STATS_MS} ms after the panel closed, expected 0`);
+    }
+  } catch (e) {
+    statsProblems.push('stats: ' + e.message.split('\n')[0]);
+  } finally {
+    for (const pg of statsPages) await pg.close().catch(() => {});
+  }
+  errs.push(...statsProblems);
+}
+
 // ---- spontaneous worker failures (H2): the device-lost message and onerror both recover ---------
 // README, Recovery: "The worker's own `device-lost` message and the worker `onerror` call the same
 // function. A silent `terminate()` cannot be made to look like a crash, so the mechanism is tested
