@@ -382,6 +382,17 @@ fs.mkdirSync(outDir, { recursive: true });
 // catch pushes it into `errs`, closes its page and carries on; one that does not still ends the run
 // with a FAIL line (see failAndExit below), never with a stack trace and never as a skip: a stall
 // says nothing about the capability a section is testing.
+//
+// H8: bounding a wait is only half of it. A wait whose result a later assertion reads must not be
+// given up on silently - `waitForFunction(..., { timeout: N }).catch(() => {})` throws the timeout
+// away, and the next assertion then reports a cause of its own, which can be a different and wrong
+// one. Two of four real-GPU runs on 49985ae printed
+//   recovery device-lost: worker+gpu stepped down to worker+gpu, expected main+gpu
+//   recovery device-lost: no frame rendered after recovery (lum null via no readable frame)
+// from a 45 s give-up on `__runMode`, which recover() sets only in its finally block: recovery had
+// not finished, it had not stepped down. Those waits are `boundedCheck` below: one error that says
+// what did not happen and the limit, and a false return so the dependent assertions are skipped
+// instead of adding a wrong cause.
 const BUDGET = { goto: 30000, boot: 60000, eval: 60000, render: 120000, export: 120000, decode: 60000 };
 // Every bounded wait is counted here, so the run itself prints the numbers the budgets are 5x of.
 const WAITS = Object.fromEntries(Object.keys(BUDGET).map((k) => [k, { n: 0, ms: 0, label: '' }]));
@@ -417,13 +428,66 @@ function boundedEval(pg, label, fn, arg, band = 'eval') {
 }
 
 /** page.waitForFunction with a budget; Playwright's own timeout stays just behind the budget. */
-function boundedWait(pg, label, fn, arg, band = 'boot') {
-  return timed(pg.waitForFunction(fn, arg, { timeout: BUDGET[band] + 5000 }), band, `waitForFunction (${label})`);
+function boundedWait(pg, label, fn, arg, band = 'boot', opts) {
+  const o = Object.assign({}, opts || {}, { timeout: BUDGET[band] + 5000 });
+  return timed(pg.waitForFunction(fn, arg, o), band, `waitForFunction (${label})`);
 }
 
 /** page.goto with a budget. */
 function boundedGoto(pg, label, url, band = 'goto') {
   return timed(pg.goto(url, { timeout: BUDGET[band] + 5000 }), band, `page.goto (${label}): no load within ${BUDGET[band]} ms`);
+}
+
+/**
+ * A wait whose result a later assertion reads (H8). `what` is what the timeout has to say, as the
+ * thing that did not happen: "__runMode is still worker+gpu". On a timeout one line goes into
+ * `problems` with the budget that ran out, and the return value is false so the caller can skip the
+ * assertions that read the state the wait never reached. Never throws, never gives up silently.
+ */
+async function boundedCheck(pg, label, fn, arg, band, problems, what, opts) {
+  try {
+    await boundedWait(pg, label, fn, arg, band, opts);
+    return true;
+  } catch (e) {
+    if (e && e.timeout) problems.push(`${label}: ${what} after ${BUDGET[band]} ms`);
+    else problems.push(`${label}: ${what} (${String((e && e.message) || e).split('\n')[0]})`);
+    return false;
+  }
+}
+
+/**
+ * Add one media file and wait for the media list to grow inside a budget (H8). The page prints
+ * `loading <name> …`, decodes the file (an image directly, a video through a <video> element), calls
+ * addMedia - in worker mode that also posts the clip to the render worker - and only then says
+ * `<name> added as a Media block`. The two media scenes, fx_1 and the worker clip export read the
+ * result, so the old `waitForFunction(/added|Could not/, { timeout: 20000 }).catch(() => {})` left
+ * them to fail later as "FAIL over tolerance" or as a missing clip frame. Waits for the list itself,
+ * so stale #status text cannot satisfy it, and reports the app's own reason when the add fails.
+ */
+async function addMediaFile(pg, label, file, problems) {
+  const count = () => boundedEval(pg, `${label}: count the loaded media`, () => (typeof G !== 'undefined' && G.media ? G.media.length : -1));
+  const n0 = await count();
+  const t0 = Date.now();
+  await pg.setInputFiles('#mfile', file);
+  try {
+    await boundedWait(pg, `${label}: ${file.split(/[\\/]/).pop()} is added`, (n) => {
+      const s = $('status').textContent || '';
+      if (/^Could not/.test(s)) return true;                       // the app gave a reason: report that
+      return typeof G !== 'undefined' && G.media && G.media.length > n && !/^loading /.test(s);
+    }, n0, 'eval');
+  } catch (e) {
+    problems.push(`${label}: G.media still had ${n0} entries after ${BUDGET.eval} ms`
+      + (e && e.timeout ? '' : ` (${String((e && e.message) || e).split('\n')[0]})`));
+    return false;
+  }
+  const n1 = await count();
+  if (n1 > n0) {
+    console.log(`${label}: added in ${Date.now() - t0} ms (G.media ${n1})`);
+    return true;
+  }
+  const st = ((await boundedEval(pg, `${label}: read #status`, () => ($('status').textContent || '').trim())) || '').trim();
+  problems.push(`${label}: G.media still had ${n0} entries after ${Date.now() - t0} ms (#status: "${st}")`);
+  return false;
 }
 
 // A timeout that reaches the top of the run (a section without its own catch) is still a FAIL
@@ -572,20 +636,28 @@ page.on('console', (m) => { if (m.type() === 'error' && !benignConsole(m.text())
 // the offscreen hook: headless SwiftShader loses the device when presenting to a canvas
 await page.addInitScript(() => { window.__MOSH_OFFSCREEN = true; });
 await boundedGoto(page, 'boot: open index.html', pathToFileURL(html).href, 'boot');
-await boundedWait(page, 'boot: the header names a mode', () => {
+const headerNamed = await boundedCheck(page, 'boot: the header names a mode', () => {
   const m = document.querySelector('#mode');
-  return m && m.textContent && m.textContent !== '.';
-}).catch(() => {});
+  return !!(m && m.textContent && m.textContent !== '.');
+}, undefined, 'boot', errs, '#mode is still empty');
 await page.waitForTimeout(1500);
 
 // The analysis worker round trip. A boot that does not finish inside its budget is an error here,
 // not a later mystery.
-await boundedWait(page, 'boot: __featReady (analysis worker + demo)', () => window.__featReady === true).catch((e) => errs.push(e.message));
+const featReady = await boundedCheck(page, 'boot: __featReady (analysis worker + demo)', () => window.__featReady === true, undefined, 'boot', errs, '__featReady is still false');
 const modeLabel = (await page.textContent('#mode'))?.trim();
 const modeNow = await boundedEval(page, 'boot: read mode', () => (typeof mode === 'string' ? mode : null));
 const err = (await page.textContent('#err'))?.trim();
 console.log(`mode: ${modeNow} (${modeLabel}) | err: ${err || 'none'}`);
 if (modeNow !== 'gpu') {
+  // A boot that never finished is not a graphics verdict: name the wait that ran out instead of
+  // reporting "not on the WebGPU path", which is what a missing mode looks like from the outside.
+  if (!headerNamed || !featReady) {
+    console.log(errs.slice(0, 10).join('\n'));
+    console.log('\nFAIL\nboot did not finish; see the bounded wait above');
+    await browser.close();
+    process.exit(1);
+  }
   console.log('NOTE: not on the WebGPU path; the GPU suite has nothing to test.');
   console.log(errs.slice(0, 6).join('\n') || 'no page errors');
   await browser.close();
@@ -805,11 +877,9 @@ const gridProblems = [];
 // ---- media ----
 await resetSection();
 await page.selectOption('#res', '640');
-await page.setInputFiles('#mfile', clipImg);
-await page.waitForFunction(() => /added|Could not/.test($('status').textContent), null, { timeout: 20000 }).catch(() => {});
+const imgOk = await addMediaFile(page, 'media image', clipImg, errs);
 console.log('media image:', (await page.textContent('#status'))?.trim());
-await page.setInputFiles('#mfile', clipVid);
-await page.waitForTimeout(1500);
+const vidOk = await addMediaFile(page, 'media video', clipVid, errs);
 console.log('media video:', (await page.textContent('#status'))?.trim(), '|', await boundedEval(page, 'media: list the loaded media', () => G.media.map((m) => `${m.kind} ${m.w}x${m.h}`).join(', ')));
 
 // ---- custom shader: template compiles, broken code reports an error ----
@@ -838,11 +908,18 @@ const shot = async (name, sc, extra, fxs) => {
   await grab(name);
 };
 
-await shot('scene_media_image', 16, { clip: 0 });
-await shot('scene_media_video', 16, { clip: 1, pal: 2 });
+// Both media scenes and fx_1 (scene 16, clip 0) read the media list, so they are rendered only when
+// the file it needs was added: the add reports its own reason above, and a black frame here would add
+// "FAIL over tolerance" on top of it, which is not the cause.
+if (imgOk) await shot('scene_media_image', 16, { clip: 0 });
+else console.log('scene_media_image: not rendered (the image Media block was not added)');
+if (vidOk) await shot('scene_media_video', 16, { clip: 1, pal: 2 });
+else console.log('scene_media_video: not rendered (the video Media block was not added)');
 await shot('scene_shader', 17, {});
 for (let t = 0; t < 8; t++) {
-  await shot(`fx_${t}`, [9, 16, 7, 7, 0, 10, 15, 12][t], { clip: 0, mosh: t === 2 || t === 3 || t === 6 ? 0.7 : 0 },
+  const sc = [9, 16, 7, 7, 0, 10, 15, 12][t];
+  if (sc === 16 && !imgOk) { console.log(`fx_${t}: not rendered (scene 16 needs the image Media block)`); continue; }
+  await shot(`fx_${t}`, sc, { clip: 0, mosh: t === 2 || t === 3 || t === 6 ? 0.7 : 0 },
     [{ type: t, start: 0, len: 999, amt: 0.9, par: t === 0 ? 0.4 : 0.6 }]);
 }
 await shot('mods_bloom', 10, { mods: [[6, 0, 0.5], [1, 4, 0.5], [0, 2, 0]], bloom: 0.6, mosh: 0.6 });
@@ -1211,11 +1288,13 @@ try {
       errs.push(`worker resize: readback ${workerResize.w}x${workerResize.h}, page ${workerResize.W}x${workerResize.H}`);
     else console.log(`worker resize: ${workerResize.w}x${workerResize.h}, ${workerResize.run}`);
     // A video Media block exercises the request/transfer path, and two exports must land on the
-    // same clip frame at the same timestamp.
+    // same clip frame at the same timestamp. The clip export reads the media list, so its assertions
+    // are skipped when the add itself is the failure (H8): "no file" or "not repeatable" would name
+    // the wrong cause.
     await workerPage.bringToFront();
-    await workerPage.setInputFiles('#mfile', clipVid);
-    await workerPage.waitForFunction(() => /added|Could not/.test($('status').textContent), null, { timeout: 20000 }).catch(() => {});
-    const mediaExport = await boundedEval(workerPage, 'worker media export: the same clip export twice', async () => {
+    const wMedia = await addMediaFile(workerPage, 'worker media export', clipVid, errs);
+    if (!wMedia) console.log('worker media export: skipped the two clip exports (the video Media block was not added)');
+    const mediaExport = wMedia ? await boundedEval(workerPage, 'worker media export: the same clip export twice', async () => {
       const b64Of = async (blob) => {
         const a = new Uint8Array(await blob.arrayBuffer());
         let s = '';
@@ -1234,17 +1313,19 @@ try {
       const a = await run(), b = await run();
       nf = savedNf;
       return { a, b };
-    }, undefined, 'export');
+    }, undefined, 'export') : null;
     // Both files go through the one headless page, so a difference between the two hashes comes
     // from the encoded frames, not from which page decoded them.
-    if (mediaExport.a.b64) Object.assign(mediaExport.a, await decodeVideoFile(mediaExport.a.b64, mediaExport.a.type, 'worker media export (first)'));
-    if (mediaExport.b.b64) Object.assign(mediaExport.b, await decodeVideoFile(mediaExport.b.b64, mediaExport.b.type, 'worker media export (second)'));
-    if (!(mediaExport.a.blob > 0) || !(mediaExport.b.blob > 0))
-      errs.push('worker media export: no file (' + mediaExport.a.status + ' / ' + mediaExport.b.status + ')');
-    else if (!(mediaExport.a.lum > 0.01)) errs.push('worker media export decoded to black frames');
-    else if (mediaExport.a.hash !== mediaExport.b.hash)
-      errs.push(`worker media export is not repeatable: ${mediaExport.a.hash >>> 0} vs ${mediaExport.b.hash >>> 0}`);
-    else console.log(`worker media export: clip frame hash ${mediaExport.a.hash >>> 0} twice, luminance ${mediaExport.a.lum}`);
+    if (mediaExport) {
+      if (mediaExport.a.b64) Object.assign(mediaExport.a, await decodeVideoFile(mediaExport.a.b64, mediaExport.a.type, 'worker media export (first)'));
+      if (mediaExport.b.b64) Object.assign(mediaExport.b, await decodeVideoFile(mediaExport.b.b64, mediaExport.b.type, 'worker media export (second)'));
+      if (!(mediaExport.a.blob > 0) || !(mediaExport.b.blob > 0))
+        errs.push('worker media export: no file (' + mediaExport.a.status + ' / ' + mediaExport.b.status + ')');
+      else if (!(mediaExport.a.lum > 0.01)) errs.push('worker media export decoded to black frames');
+      else if (mediaExport.a.hash !== mediaExport.b.hash)
+        errs.push(`worker media export is not repeatable: ${mediaExport.a.hash >>> 0} vs ${mediaExport.b.hash >>> 0}`);
+      else console.log(`worker media export: clip frame hash ${mediaExport.a.hash >>> 0} twice, luminance ${mediaExport.a.lum}`);
+    }
     // T1c: thumbnails render in the worker too.
     await boundedEval(workerPage, 'worker thumbnails: auto-arrange the timeline', () => { autoArrange(); }, undefined, 'render');
     const workerThumbsWait = await waitForThumbs(workerPage, 'worker thumbnails');
@@ -1254,21 +1335,32 @@ try {
     else if (workerThumbs.drawn === 0) errs.push('worker thumbnails: no block thumbnail was generated');
     if (werrs.length) errs.push('worker page: ' + werrs[0]);
   }
-  // The header control must restart through recovery. A machine can always reach CPU.
+  // The header control must restart through recovery, so both switches below use the `render` budget
+  // the run documents for a recovery - not the 15 s / 20 s give-ups that H7 left swallowed. A
+  // swallowed give-up here reported "choosing CPU ended in worker+gpu": a step-down that had not
+  // happened, when recovery had simply not finished (H8, the same bug as the recovery section).
+  const cpuAt = Date.now();
   await workerPage.selectOption('#engine', 'cpu');
-  await workerPage.waitForFunction(() => window.__runMode === 'main+cpu', null, { timeout: 15000 }).catch(() => {});
-  const cpuSwitch = await boundedEval(workerPage, 'engine control: run mode after choosing CPU', () => ({ mode: window.__runMode, header: $('mode').textContent, engine: $('engine').value }));
-  if (cpuSwitch.mode !== 'main+cpu' || cpuSwitch.engine !== 'cpu')
-    errs.push(`engine control: choosing CPU ended in ${cpuSwitch.mode} (select ${cpuSwitch.engine})`);
-  else console.log(`engine control: worker page switched to ${cpuSwitch.mode} (${cpuSwitch.header})`);
+  const cpuReached = await boundedCheck(workerPage, 'engine control',
+    () => window.__runMode === 'main+cpu', undefined, 'render', errs, '__runMode is still not main+cpu');
+  if (cpuReached) {
+    const cpuSwitch = await boundedEval(workerPage, 'engine control: run mode after choosing CPU', () => ({ mode: window.__runMode, header: $('mode').textContent, engine: $('engine').value }));
+    if (cpuSwitch.mode !== 'main+cpu' || cpuSwitch.engine !== 'cpu')
+      errs.push(`engine control: choosing CPU ended in ${cpuSwitch.mode} (select ${cpuSwitch.engine})`);
+    else console.log(`engine control: worker page switched to ${cpuSwitch.mode} (${cpuSwitch.header}) in ${Date.now() - cpuAt} ms`);
+  }
   // CPU -> worker through the same control; where worker+GPU is unavailable it must fall back cleanly.
   const hadWorker = ws.workerGpu === 'yes';
+  const wAt = Date.now();
   await workerPage.selectOption('#engine', 'worker');
-  await workerPage.waitForFunction(() => window.__runMode && window.__runMode !== 'main+cpu', null, { timeout: 20000 }).catch(() => {});
-  const wSwitch = await boundedEval(workerPage, 'engine control: run mode after choosing worker', () => ({ mode: window.__runMode, header: $('mode').textContent, engine: $('engine').value }));
-  if (hadWorker && wSwitch.mode !== 'worker+gpu')
-    errs.push(`engine control: choosing worker ended in ${wSwitch.mode} (select ${wSwitch.engine})`);
-  else console.log(`engine control: CPU -> ${wSwitch.mode} (${wSwitch.header})`);
+  const wReached = await boundedCheck(workerPage, 'engine control',
+    () => window.__runMode && window.__runMode !== 'main+cpu', undefined, 'render', errs, '__runMode is still main+cpu');
+  if (wReached) {
+    const wSwitch = await boundedEval(workerPage, 'engine control: run mode after choosing worker', () => ({ mode: window.__runMode, header: $('mode').textContent, engine: $('engine').value }));
+    if (hadWorker && wSwitch.mode !== 'worker+gpu')
+      errs.push(`engine control: choosing worker ended in ${wSwitch.mode} (select ${wSwitch.engine})`);
+    else console.log(`engine control: CPU -> ${wSwitch.mode} (${wSwitch.header}) in ${Date.now() - wAt} ms`);
+  }
   // A plain fragment must select a mode without a query string (the published page has none).
   await boundedGoto(workerPage, 'engine control: #cpu fragment', pathToFileURL(html).href + '#cpu');
   await boundedWait(workerPage, 'engine control: #cpu page ready (__featReady)', () => window.__featReady === true);
@@ -1375,21 +1467,26 @@ if (workerWhy) {
     await pg.keyboard.press('Backquote');
     const opened = await pg.waitForFunction(() => $('stats').style.display === 'block',
       null, { timeout: 5000 }).then(() => true).catch(() => false);
-    if (!opened) statsProblems.push(`stats ${label}: backquote did not open the panel`);
+    if (!opened) statsProblems.push(`stats ${label}: a backquote did not open the panel within 5000 ms`);
     await boundedEval(pg, `stats ${label}: reset the stats message counter`, () => { window.__statsMsgs = 0; });   // the 2 s window starts here
     const t0 = Date.now();
     const frames = await renderWindow(pg, STATS_MS);
-    await drainFrames(pg).catch(() => {});
+    // A stall here is a finding of its own (H8): swallowing it left the panel's frame time to be
+    // reported as missing after N frames, which is not the cause.
+    await drainFrames(pg).catch((e) => statsProblems.push(`stats ${label}: the frames in flight did not finish (${e.message})`));
     const waited = Date.now() - t0;
     const snap = await readStats(pg);
     const msgs = await boundedEval(pg, `stats ${label}: count the stats messages`, () => window.__statsMsgs || 0);
     // Deliberately no pause(): pause() calls thumbsSoon(), and 39 thumbnail renders plus their
     // readbacks are more load to leave behind for the next fresh page's worker probe.
-    return { snap, msgs, waited, frames };
+    return { snap, msgs, waited, frames, opened };
   };
   // Every number the task lists, from the panel's own source. A failed assertion here is reported
-  // with the value that was read, never as "the overlay is wrong".
+  // with the value that was read, never as "the overlay is wrong". A panel that never opened has no
+  // numbers to read, and the open already reported why, so nothing is checked from its snapshot
+  // (H8: "frame time is null after N frames" was a second, wrong cause of a closed panel).
   const checkMode = (label, want, r) => {
+    if (!r.opened) { console.log(`stats ${label}: the panel did not open, so its numbers were not checked`); return false; }
     const s = r.snap, bad = [], renderer = want.split('+')[0];
     if (s.runMode !== want) bad.push(`runMode is ${s.runMode}, expected ${want}`);
     if (s.renderer !== renderer) bad.push(`the panel reads the ${s.renderer} renderer, expected ${renderer}`);
@@ -1419,7 +1516,7 @@ if (workerWhy) {
     else {
       await prepare(mp);
       const mainRun = await openPanel(mp, 'main');
-      mainSnap = mainRun.snap;
+      mainSnap = mainRun.opened ? mainRun.snap : null;   // no panel, no numbers to compare
       checkMode('main', 'main+gpu', mainRun);
     }
     // One extra page at a time: this suite runs on a software adapter where every extra device
@@ -1441,21 +1538,28 @@ if (workerWhy) {
     if (!why) {
       await prepare(wp);
       const workerRun = await openPanel(wp, 'worker');
-      workerSnap = workerRun.snap;
       const openMsgs = workerRun.msgs;
+      // A panel that never opened has no snapshots and no message counts; the open already named the
+      // wait, so the comparisons below read nothing and report nothing (H8).
+      workerSnap = workerRun.opened ? workerRun.snap : null;
       checkMode('worker', 'worker+gpu', workerRun);
 
       // The texture total is one number in one formula (Renderer.texBytes / gpuTexBytes). Both pages
       // boot at 1280x720; if a side ever moves, put the worker on the main page's Size option and
       // re-read while the panel is still open, so the comparison is at one size either way.
-      if (mainSnap && (workerSnap.w !== mainSnap.w || workerSnap.h !== mainSnap.h)) {
+      // H8: the 15 s give-up on the resize was swallowed, so a worker that never resized reported
+      // "the modes rendered at different sizes" - a size comparison, not the wait that ran out.
+      let sized = true;
+      if (mainSnap && workerSnap && (workerSnap.w !== mainSnap.w || workerSnap.h !== mainSnap.h)) {
         await wp.selectOption('#res', String(mainSnap.w));
-        await wp.waitForFunction((w) => window.__statsSnapshot().w === w, mainSnap.w,
-          { timeout: 15000, polling: 100 }).catch(() => {});
+        sized = await boundedCheck(wp, 'stats worker: the Size control',
+          (w) => window.__statsSnapshot().w === w, mainSnap.w, 'eval', statsProblems,
+          `the worker is still not ${mainSnap.w} px wide`);
         workerSnap = await readStats(wp);
-        console.log(`stats worker: the modes booted at different sizes, re-read the worker at ${workerSnap.w}x${workerSnap.h}`);
+        if (sized) console.log(`stats worker: the modes booted at different sizes, re-read the worker at ${workerSnap.w}x${workerSnap.h}`);
+        else console.log(`stats worker: the resize did not land, the worker is ${workerSnap.w}x${workerSnap.h}; the size and texBytes comparison was skipped`);
       }
-      if (mainSnap) {
+      if (mainSnap && workerSnap && sized) {
         if (workerSnap.w !== mainSnap.w || workerSnap.h !== mainSnap.h)
           statsProblems.push(`stats: the modes rendered at different sizes (${mainSnap.w}x${mainSnap.h} vs ${workerSnap.w}x${workerSnap.h}), so texBytes cannot be compared`);
         else if (workerSnap.texBytes !== mainSnap.texBytes)
@@ -1470,16 +1574,16 @@ if (workerWhy) {
       await wp.keyboard.press('Backquote');
       const closed = await wp.waitForFunction(() => $('stats').style.display === 'none',
         null, { timeout: 5000 }).then(() => true).catch(() => false);
-      if (!closed) statsProblems.push('stats worker: a second backquote did not close the panel');
+      if (!closed && workerRun.opened) statsProblems.push('stats worker: a second backquote did not close the panel within 5000 ms');
       await boundedEval(wp, 'stats worker: stop the render worker stats', () => rwCall('stats-off').catch(() => {}));
       await boundedEval(wp, 'stats worker: reset the closed-panel counter', () => { window.__statsMsgs = 0; });
       await wp.waitForTimeout(STATS_MS);
       const closedMsgs = await boundedEval(wp, 'stats worker: count messages after closing', () => window.__statsMsgs || 0);
       console.log(`stats worker: ${openMsgs} stats messages in ${workerRun.waited} ms with the panel open, `
         + `${closedMsgs} in ${STATS_MS} ms after closing it`);
-      if (!(openMsgs >= 4))
+      if (workerRun.opened && !(openMsgs >= 4))
         statsProblems.push(`stats worker: ${openMsgs} stats messages in ${workerRun.waited} ms with the panel open, expected at least 4`);
-      if (closedMsgs !== 0)
+      if (workerRun.opened && closedMsgs !== 0)
         statsProblems.push(`stats worker: ${closedMsgs} stats messages in ${STATS_MS} ms after the panel closed, expected 0`);
     } else if (timedOut) {
       // A page whose probe did not answer is not evidence about the machine, and it is not a skip:
@@ -1536,6 +1640,7 @@ for (const name of ['device-lost', 'onerror']) {
     // and returns), so ask for frame 600 - the frame the rest of the suite reads back - by moving
     // the playhead before the trigger: recover() replays the current frame. recover() sets
     // window.__runMode in its finally block.
+    const triggerAt = Date.now();
     await boundedEval(rp, `recovery ${name}: deliver the ${name} trigger through the page's own handler`, (kind) => {
       window.__h2old = $('cv');
       window.__h2gpuErrs = (typeof G !== 'undefined' && G.errs) ? G.errs.length : 0;
@@ -1543,8 +1648,24 @@ for (const name of ['device-lost', 'onerror']) {
       if (kind === 'device-lost') rw.onmessage({ data: PROTO.make('device-lost', { message: 'test' }, null) });
       else rw.onerror(new ErrorEvent('error', { message: 'test' }));
     }, name);
-    await rp.waitForFunction(() => window.__runMode && window.__runMode !== 'worker+gpu', null, { timeout: 45000, polling: 100 }).catch(() => {});
-    const after = await boundedEval(rp, `recovery ${name}: the run mode and a frame after recovery`, async () => {
+    // H8: this was `{ timeout: 45000, polling: 100 }).catch(() => {})`, and 45 s is less than the
+    // 120 s budget this file documents for a recovery. When it gave up, the run mode was read while
+    // recover() was still running and the report said "worker+gpu stepped down to worker+gpu, expected
+    // main+gpu" - a step-down that never happened. Now: the `render` budget, and on a timeout one
+    // error that names the wait, with the assertions that read recovery's output skipped.
+    const recovered = await boundedCheck(rp, `recovery ${name}`,
+      () => window.__runMode && window.__runMode !== 'worker+gpu', undefined, 'render', errs,
+      '__runMode is still worker+gpu', { polling: 100 });
+    const recoveredMs = Date.now() - triggerAt;
+    if (!recovered) {
+      // Nothing after this point can tell a slow recovery from a step-down: the canvas swap, the run
+      // mode and the luminance are all written by the recovery that has not finished. So those checks
+      // are skipped and cannot add a cause of their own. Page errors are still reported, because they
+      // may be why it did not finish.
+      console.log(`recovery ${name}: recovery did not finish within ${BUDGET.render} ms; `
+        + 'the run mode, canvas and luminance checks were skipped');
+    }
+    const after = recovered ? await boundedEval(rp, `recovery ${name}: the run mode and a frame after recovery`, async () => {
       const lumOf = (a) => {
         let s = 0;
         for (let i = 0; i < a.length; i += 4) s += a[i] + a[i + 1] + a[i + 2];
@@ -1574,15 +1695,20 @@ for (const name of ['device-lost', 'onerror']) {
         swapped: now !== old && !old.isConnected,
         gpuNew: ((typeof G !== 'undefined' && G.errs) ? G.errs.length : 0) - window.__h2gpuErrs,
       };
-    }, undefined, 'render');
-    console.log(`recovery ${name}: ${before.runMode} -> ${after.runMode}, `
-      + `${after.swapped ? 'new canvas' : 'SAME canvas'}, lum ${after.lum} (${after.route}), `
-      + `page errors ${rerrs.length}, validation errors ${after.gpuNew}`);
-    if (after.runMode !== 'main+gpu')
-      errs.push(`recovery ${name}: ${before.runMode} stepped down to ${after.runMode}, expected main+gpu`);
-    if (!after.swapped) errs.push(`recovery ${name}: the canvas element was not replaced`);
-    if (!(after.lum > 0.01)) errs.push(`recovery ${name}: no frame rendered after recovery (lum ${after.lum} via ${after.route})`);
-    if (after.gpuNew) errs.push(`recovery ${name}: ${after.gpuNew} new WebGPU validation error(s)`);
+    }, undefined, 'render') : null;
+    // The measured recovery time is trigger -> __runMode changed, on the recovery line itself, so the
+    // next hardware run has a number instead of "it took a while".
+    if (after) {
+      console.log(`recovery ${name}: ${before.runMode} -> ${after.runMode}, `
+        + `${after.swapped ? 'new canvas' : 'SAME canvas'}, lum ${after.lum} (${after.route}), `
+        + `page errors ${rerrs.length}, validation errors ${after.gpuNew}, `
+        + `recovered in ${recoveredMs} ms (budget ${BUDGET.render} ms)`);
+      if (after.runMode !== 'main+gpu')
+        errs.push(`recovery ${name}: ${before.runMode} stepped down to ${after.runMode}, expected main+gpu`);
+      if (!after.swapped) errs.push(`recovery ${name}: the canvas element was not replaced`);
+      if (!(after.lum > 0.01)) errs.push(`recovery ${name}: no frame rendered after recovery (lum ${after.lum} via ${after.route})`);
+      if (after.gpuNew) errs.push(`recovery ${name}: ${after.gpuNew} new WebGPU validation error(s)`);
+    }
     if (rerrs.length) errs.push(`recovery ${name}: page error: ${rerrs[0]}`);
   } catch (e) {
     errs.push(`recovery ${name}: ${e.message}`);
