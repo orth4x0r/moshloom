@@ -424,13 +424,19 @@ const ENV={doc:null,offscreen:false};
 function gpuAttach(o){ if(o&&o.doc)ENV.doc=o.doc; if(o&&o.offscreen!==undefined)ENV.offscreen=!!o.offscreen; return ENV; }
 // The mode probe runs on a throwaway canvas: transferControlToOffscreen() is one-shot, so the
 // real canvas must never be spent on a capability test.
+// The worker says which step it is on before each step that can block, so the page can tell a slow
+// adapter from a worker that never started: progress re-arms the stall timer, an answer ends it.
 const PROBE_SRC = `
+const stage = (s) => self.postMessage({ stage: s });
 self.onmessage = async (ev) => {
   const out = { gpu: false, drew: false, lum: 0, err: null };
   try {
+    stage('start');
     if (!self.navigator.gpu) throw new Error('no navigator.gpu in worker');
+    stage('adapter');
     const ad = await navigator.gpu.requestAdapter();
     if (!ad) throw new Error('no adapter in worker');
+    stage('device');
     const dev = await ad.requestDevice();
     dev.addEventListener('uncapturederror', (e) => { out.err = e.error.message; });
     const fmt = navigator.gpu.getPreferredCanvasFormat();
@@ -448,7 +454,9 @@ self.onmessage = async (ev) => {
     const ROW = 256;                                   // bytesPerRow must be a multiple of 256
     const buf = dev.createBuffer({ size: ROW * 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     enc.copyTextureToBuffer({ texture: tex }, { buffer: buf, bytesPerRow: ROW }, [8, 8]);
+    stage('submit');
     dev.queue.submit([enc.finish()]);
+    stage('readback');
     await buf.mapAsync(GPUMapMode.READ);
     const a = new Uint8Array(buf.getMappedRange());
     let sum = 0;
@@ -460,31 +468,78 @@ self.onmessage = async (ev) => {
   } catch (e) { out.err = String((e && e.message) || e); }
   self.postMessage(out);
 };`;
-function gpuWorkerProbe(){
+// Probe budgets, in ms. Idle, the whole probe is a few hundred milliseconds, so a stall budget of
+// 5 s is more than ten times the room that needs. Under load it is not enough: against a SwiftShader
+// adapter that another Chromium was already driving, a fresh worker page reported `no: probe timed
+// out` in 2 of 2 tries at 5 s, so a single stall is not a verdict. Attempt 2 is a new worker with a
+// new throwaway canvas and double the room; both attempts share one cap, so a worker that never
+// answers holds the caller for at most 15 s and then reports "no answer", never "no worker".
+const PROBE_STALL_MS = [5000, 10000];        // per attempt: no message for this long ends it
+const PROBE_TOTAL_MS = 15000;                // both attempts together, setup included
+const probeNow = () => (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+// One attempt on a fresh worker and a fresh throwaway canvas. Resolves with the worker's answer
+// (ok or not: both are final), a refusal, or a stall. `stall` is how long the attempt may go with
+// no message from the worker; `deadline` is the absolute time the whole probe must be done by.
+function gpuProbeAttempt(stall, deadline){
   return new Promise((resolve) => {
     const doc = ENV.doc;
-    if (!doc) return resolve({ ok: false, why: 'no document to make a throwaway canvas' });
+    if (!doc) return resolve({ ok: false, why: 'no document to make a throwaway canvas', ms: 0 });
+    const t0 = probeNow();
     let w = null, canvas = null;
     try {
       canvas = doc.createElement('canvas'); canvas.width = 8; canvas.height = 8;
       w = new Worker(URL.createObjectURL(new Blob([PROBE_SRC], { type: 'text/javascript' })));
-    } catch (e) { return resolve({ ok: false, why: 'worker refused: ' + ((e && e.message) || e) }); }
-    let settled = false;
+    } catch (e) { return resolve({ ok: false, why: 'worker refused: ' + ((e && e.message) || e), ms: Math.round(probeNow() - t0) }); }
+    let settled = false, timer = 0, stage = 'start';
     const done = (r) => {
       if (settled) return; settled = true;
+      clearTimeout(timer);
       try { w.terminate(); } catch (e) {}
       try { canvas.remove(); } catch (e) {}
+      r.stage = stage; r.ms = Math.round(probeNow() - t0);
       resolve(r);
     };
-    const timer = setTimeout(() => done({ ok: false, why: 'probe timed out' }), 5000);
-    w.onmessage = (ev) => { clearTimeout(timer); const d = ev.data || {};
-      done({ ok: !!(d.drew && d.lum > 0.02), why: d.err || '', lum: d.lum }); };
-    w.onerror = (ev) => { clearTimeout(timer); done({ ok: false, why: ev.message || 'worker error' }); };
+    // Progress re-arms the timer; the absolute deadline still ends an attempt that keeps talking.
+    const arm = () => {
+      clearTimeout(timer);
+      const left = Math.min(stall, deadline - probeNow());
+      if (!(left > 0)) return done({ ok: false, timedOut: true, why: 'no answer in time' });
+      timer = setTimeout(() => done({ ok: false, timedOut: true,
+        why: 'no answer within ' + Math.round(stall) + ' ms (stage: ' + stage + ')' }), left);
+    };
+    w.onmessage = (ev) => {
+      const d = ev.data || {};
+      if (d.stage) { stage = d.stage; return arm(); }          // progress, not an answer
+      done({ ok: !!(d.drew && d.lum > 0.02), why: d.err || '', lum: d.lum });
+    };
+    w.onerror = (ev) => { done({ ok: false, why: ev.message || 'worker error' }); };
     try {
       const off = canvas.transferControlToOffscreen();
       w.postMessage({ canvas: off }, [off]);
-    } catch (e) { clearTimeout(timer); done({ ok: false, why: 'transfer refused: ' + ((e && e.message) || e) }); }
+    } catch (e) { return done({ ok: false, why: 'transfer refused: ' + ((e && e.message) || e) }); }
+    arm();
   });
+}
+// The probe the app calls: attempt 1, and only after a stall a second attempt with more room. An
+// answer of either kind is final; a stall is not, so it comes back as `timedOut` for the caller to
+// decide what to do with (the app does not cache it). `onAttempt({attempt, retry})` fires as each
+// attempt starts, so the UI can say it is still checking instead of claiming an answer.
+async function gpuWorkerProbe(onAttempt){
+  const t0 = probeNow(), deadline = t0 + PROBE_TOTAL_MS;
+  let tries = 0, last = null;
+  for (let i = 0; i < PROBE_STALL_MS.length; i++) {
+    const left = deadline - probeNow();
+    if (!(left > 0)) break;
+    tries++;
+    if (typeof onAttempt === 'function') { try { onAttempt({ attempt: tries, retry: i > 0 }); } catch (e) {} }
+    const r = await gpuProbeAttempt(Math.min(PROBE_STALL_MS[i], left), deadline);
+    if (!r.timedOut) { r.tries = tries; r.ms = Math.round(probeNow() - t0); return r; }
+    last = r;
+  }
+  const ms = Math.round(probeNow() - t0);
+  return { ok: false, timedOut: true, lum: last && last.lum, ms, tries: tries || 1, stage: last && last.stage,
+    why: 'probe timed out after ' + ms + ' ms (' + (tries || 1) + ((tries || 1) === 1 ? ' attempt' : ' attempts')
+      + (last ? ', last: ' + last.why : '') + ')' };
 }
 // Live texture memory for one renderer, in bytes. It takes its G as an argument and reads nothing
 // else, because there are two renderers now: the page's own (main mode) and the render worker's

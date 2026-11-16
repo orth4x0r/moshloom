@@ -433,7 +433,8 @@ const $=id=>document.getElementById(id);
 const FPS=30;
 let STRIDE=24,FXSTRIDE=5;   // read from the engine at boot; these are only pre-boot defaults
 let X,mem,img,ctx2d=null,mode='cpu',gpuNote='';
-window.__workerGpu = null;   // null = the probe has not run; 'yes' or 'no: reason' once it has
+window.__workerGpu = null;   // a verdict only: null = none yet, else 'yes' or 'no: reason'
+window.__workerProbe = null; // the last probe's story, {state:checking|retry|yes|no|timeout, attempt, ms, why}
 let W=640,H=360,nf=0,bpm=120,offs=0,dur=0;
 let blocks=[],fx=[],shaders=[],sections=[],sel=0,fsel=0,selK='blk',ppb=14;
 let actx=null,abuf=null,asrc=null,gain=null,playing=false,pos=0,t0=0,lastF=-1,recording=null,exporting=null,exportClient=null,lastBlob=null,dlcap=null;
@@ -544,14 +545,32 @@ const sceneIds=()=>mode==='gpu'?[...SCENES.keys(),16,...shaders.map((s,i)=>s.ok?
 let workerProbeP=null;
 // Ask a worker whether it can present a WebGPU canvas. This is deliberately lazy: in main mode a
 // cosmetic probe must never run, because on some machines it destroys the main GPU device.
+// A verdict is cached; a timeout is not. "Did not answer in time" says nothing about the machine:
+// the same probe takes a few hundred ms idle and has been measured past 5 s while another Chromium
+// was driving the SwiftShader adapter, and caching that as `no` disabled worker mode for the rest of
+// the session. So only a real failure (no navigator.gpu, worker refused, transfer refused, a
+// readback that is not lit, a worker error) becomes `no: reason` and stays cached; a timeout leaves
+// `__workerGpu` null, so the next Engine-control choice or the next recovery probes again. The probe
+// itself retries once with a longer budget before it reports a timeout at all (gpuWorkerProbe).
 async function ensureWorkerProbe(){
   if(window.__workerGpu==='yes') return {ok:true,why:''};
   if(typeof window.__workerGpu==='string' && window.__workerGpu.indexOf('no: ')===0)
     return {ok:false,why:window.__workerGpu.slice(4)};
   if(workerProbeP) return workerProbeP;
   const p=(async()=>{
-    const r=await gpuWorkerProbe();
-    window.__workerGpu=r.ok?'yes':'no: '+(r.why||'worker probe failed');
+    const say=(state,extra)=>{ window.__workerProbe=Object.assign({state,attempt:1,ms:0,why:''},extra||{});
+      if(typeof modeUI==='function') modeUI(); };
+    say('checking');
+    let r;
+    try{ r=await gpuWorkerProbe(ev=>say(ev.retry?'retry':'checking',{attempt:ev.attempt})); }
+    catch(e){ r={ok:false,why:String((e&&e.message)||e)}; }   // never leave the header mid-check
+    if(r.timedOut){
+      window.__workerGpu=null;                                // not a verdict: the next ask re-probes
+      window.__workerProbe={state:'timeout',attempt:r.tries||1,ms:r.ms||0,why:r.why||'probe timed out'};
+    }else{
+      window.__workerGpu=r.ok?'yes':'no: '+(r.why||'worker probe failed');
+      window.__workerProbe={state:r.ok?'yes':'no',attempt:r.tries||1,ms:r.ms||0,why:r.why||''};
+    }
     if(typeof modeUI==='function') modeUI();
     return r;
   })();
@@ -580,7 +599,10 @@ async function boot(){
         W=1280; H=720;
         await startRenderWorker({offscreen:qs.get('offscreen')==='1', cpu});
         mode=cpu?'cpu':'gpu'; renderIn='worker';
-      }else{ toast('worker mode refused: '+probe.why,'warn'); want='main'; }
+      }else{
+        toast('worker mode refused: '+probe.why+(probe.timedOut?' — that is a timeout, not a failure: ask for worker again':''),'warn');
+        want='main';
+      }
     }
     if(renderIn!=='worker' && want!=='cpu'){
       await gpuInit($('cv')); mode='gpu'; W=1280; H=720; $('cv').width=W; $('cv').height=H; gpuResize(W,H);
@@ -607,9 +629,13 @@ function toCpu(why){ mode='cpu'; gpuNote=why; W=640; H=360; const o=$('cv'),n=o.
 function modeUI(){
   $('mode').textContent=mode==='gpu'?'WebGPU':'CPU fallback';
   // The worker label appears only after the probe has actually run. No probe in main mode means no claim.
-  const wg=window.__workerGpu;
+  // A probe that is still running, or that ran out of time, is not an answer, so neither label below.
+  const wg=window.__workerGpu, wp=window.__workerProbe;
   if(wg==='yes') $('mode').textContent += ' · worker ready';
   else if(typeof wg==='string' && wg.indexOf('no: ')===0) $('mode').textContent += ' · no worker';
+  else if(wp&&wp.state==='retry') $('mode').textContent += ' · worker: checking (retry)';
+  else if(wp&&wp.state==='checking') $('mode').textContent += ' · worker: checking';
+  else if(wp&&wp.state==='timeout') $('mode').textContent += ' · worker: no answer yet';
   $('mode').title=mode==='gpu'?'Rendering on the GPU':'WebGPU unavailable here ('+gpuNote+'). CPU engine: first 8 visuals only, no effects, media or custom shaders.';
   $('mode').style.color=mode==='gpu'?'var(--ac)':'var(--hot)';
   $('res').innerHTML=(mode==='gpu'?[640,960,1280,1920]:[640,960,1280]).map(w=>`<option value="${w}"${w===W?' selected':''}>${w}×${w*9/16}</option>`).join('');
@@ -698,7 +724,11 @@ async function recover(why, target) {
     // A worker+GPU choice needs an answer, and this is the other place allowed to ask for one.
     if (MODES[next] === 'worker+gpu' && window.__workerGpu !== 'yes') await ensureWorkerProbe();
     if (target && MODES[next] === 'worker+gpu' && window.__workerGpu !== 'yes') {
-      toast('worker mode unavailable: ' + String(window.__workerGpu || 'probe failed').replace(/^no: /, ''), 'warn');
+      const wp = window.__workerProbe;
+      const why = wp && wp.state === 'timeout'
+        ? wp.why + ' — not cached: ask for worker again'
+        : String(window.__workerGpu || 'worker probe failed').replace(/^no: /, '');
+      toast('worker mode unavailable: ' + why, 'warn');
       next = MODES.indexOf('main+gpu');
     }
     if (!target) {
