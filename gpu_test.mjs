@@ -588,6 +588,137 @@ async function grab(name) {
   console.log(`  ${name.padEnd(28)} ${(frac * 100).toFixed(1)}% lit`);
 }
 
+// ---- H5: the grid is derived after the feature arrays, measured at the first and only load ----
+// gpuLoadFeatures() in gpu.js copies the 7 feature arrays and the mel table into wasm and only then
+// calls set_grid(), because set_grid() derives fPulse/fTT/fHue from those arrays and plan() reads
+// them every frame. Nothing in this suite could see the order reversed: resetSection() re-derives
+// the grid, and the main-vs-worker comparison sends `features` a second time, so both heal it
+// before a value is read. Main vs worker cannot see it either, because both sides call the same
+// loader. So this section reads the FIRST and ONLY feature load on fresh pages and compares it
+// against absolute constants from engine.c, never against the other side.
+//
+// The reference is set_grid() over demo()'s features. demo() asks the analysis worker for
+// synth(30*128 frames, 120 BPM): pure math, no audio and no Math.random, and synth() leaves offs 0,
+// so nothing here depends on when the analysis worker answers.
+//   fTT[f]    = sum(k<=f) (0.5 + 1.4*fRms[k] + 2.2*fPulse[k]*fBass[k]) / 30   scene A's clock
+//   fHue[f]   = sum(k<=f) (0.004 + 0.01*fHigh[k]) / 3                        scene A's hue
+//   fPulse[f] = exp(-4*frac(f/30*120/60))                                    the beat pulse
+// pack_scene() writes those to plan[18], plan[19] and plan[25] for a block with speed 1 and var 0,
+// which is all the pinned one-block project below has. plan() returns 24 floats over the worker
+// protocol, so the worker side checks the clock and the hue only. If set_grid() ran before the
+// copies it would read zeros and leave the clock at (f+1)/60 and the hue at (f+1)*0.004/3: 0.517 and
+// 0.041 at frame 30, against 1.638 and 0.095 below. Frames 30 and 31 are the two the
+// analysis-worker section already uses.
+const GRID_FRAMES = [30, 31];
+const GRID_TOL = 0.0015;                  // the wrong order costs the clock ~1.1 at frame 30
+const GRID_WHAT = { 18: 'scene A clock', 19: 'scene A hue', 25: 'beat pulse' };
+const GRID_WANT = {
+  18: [1.638, 1.722],
+  19: [0.095, 0.098],
+  25: [1, 0.766],
+};
+// frames: { 30: {18,19,25}, 31: {18,19,25} }; a null want or a null value means "not on this side".
+function gridCompare(side, frames) {
+  const bad = [], parts = [];
+  GRID_FRAMES.forEach((f, j) => {
+    const got = [];
+    for (const i of [18, 19, 25]) {
+      const want = GRID_WANT[i][j];
+      const v = frames[f] ? frames[f][i] : undefined;
+      if (want === null || v === null) continue;
+      if (typeof v !== 'number') { bad.push(`${side}: ${GRID_WHAT[i]} (plan[${i}]) at frame ${f} was not read`); continue; }
+      got.push(`${GRID_WHAT[i]} ${v.toFixed(3)}`);
+      if (!(Math.abs(v - want) <= GRID_TOL))
+        bad.push(`${side}: ${GRID_WHAT[i]} (plan[${i}]) at frame ${f} is ${v}, expected ${want}`);
+    }
+    if (got.length) parts.push(`f${f} ` + got.join(', '));
+  });
+  return { line: `${side}, ` + parts.join(' | '), bad };
+}
+
+const gridProblems = [];
+{
+  let gm = null, gw = null, gridWhy = '';
+  const gerrs = [];
+  const watch = (pg) => {
+    pg.on('pageerror', (e) => gerrs.push('PAGEERR ' + e.message));
+    pg.on('console', (m) => { if (m.type() === 'error' && !benignConsole(m.text())) gerrs.push('CONSOLE ' + m.text().slice(0, 500)); });
+  };
+  try {
+    const gp = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+    watch(gp);
+    await gp.addInitScript(() => { window.__MOSH_OFFSCREEN = true; });
+    await gp.goto(pathToFileURL(html).href + '?mode=main&grid=1&v=' + Date.now());
+    // __featSource is set right after demo() returns, so wait for both, or 'pending' wins the race.
+    await gp.waitForFunction(() => window.__featReady === true && window.__featSource !== 'pending',
+      null, { timeout: 30000 }).catch(() => {});
+    gm = await gp.evaluate(() => {
+      const plan = (f) => new Float32Array(X.memory.buffer, X.plan(f), 512).slice();
+      // Records only: Renderer.setProject writes blocks/fx and never calls set_grid, so this pins
+      // the plan's speed/var without touching the grid derived at boot.
+      blocks = [newBlock(0, { len: 256, mosh: 0, glitch: 0, var: 0, speed: 1 })];
+      fx = []; push();
+      const a = plan(30), b = plan(31);
+      return { nf, mode: typeof mode === 'string' ? mode : 'unknown', source: window.__featSource,
+        black: a[0], frames: { 30: { 18: a[18], 19: a[19], 25: a[25] }, 31: { 18: b[18], 19: b[19], 25: b[25] } } };
+    });
+    await gp.close();
+
+    const wp = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+    watch(wp);
+    await wp.addInitScript(() => { window.__MOSH_OFFSCREEN = true; });
+    await wp.goto(pathToFileURL(html).href + '?mode=worker&offscreen=1&grid=1&v=' + Date.now());
+    await wp.waitForFunction(() => window.__featReady === true && window.__featSource !== 'pending',
+      null, { timeout: 30000 }).catch(() => {});
+    const wpre = await wp.evaluate(() => ({ runMode: window.__runMode, workerGpu: window.__workerGpu,
+      source: window.__featSource, nf, note: typeof gpuNote === 'string' ? gpuNote : '' }));
+    if (wpre.runMode !== 'worker+gpu') {
+      gridWhy = (wpre.workerGpu && wpre.workerGpu !== 'yes' ? wpre.workerGpu : 'run mode is ' + (wpre.runMode || 'unknown'))
+        + (wpre.note ? ' (' + wpre.note + ')' : '');
+    } else {
+      // The boot analysis is already the one and only `features` message: applyFeatures() sends it
+      // once. A second send is exactly what hides a wrong order, so none is sent here; messages are
+      // FIFO, so the worker has the arrays before it applies this project or answers `plan`.
+      gw = await wp.evaluate(async () => {
+        await rwCall('project', { blocks: [newBlock(0, { len: 256, mosh: 0, glitch: 0, var: 0, speed: 1 })],
+          fx: [], bpm, offs });
+        const a = (await rwCall('plan', { f: 30 })).p, b = (await rwCall('plan', { f: 31 })).p;
+        return { nf, source: window.__featSource, black: a[0],
+          frames: { 30: { 18: a[18], 19: a[19], 25: null }, 31: { 18: b[18], 19: b[19], 25: null } } };
+      });
+    }
+    await wp.close();
+    if (gerrs.length) gridProblems.push('grid order: page error on a fresh page: ' + gerrs[0]);
+  } catch (e) {
+    gridProblems.push('grid order: fresh pages failed: ' + e.message.split('\n')[0]);
+  }
+
+  // Main: the loader must have run (source 'worker'), on a full-length synth analysis, and not be
+  // looking at a black plan, or the numbers below would mean nothing.
+  if (gm) {
+    if (gm.mode !== 'gpu') gridProblems.push('grid order: the fresh main page is not on the WebGPU path (' + gm.mode + ')');
+    if (gm.source !== 'worker') gridProblems.push('grid order: boot features did not come from the analysis worker (' + gm.source + '), so the loader never ran');
+    if (gm.nf !== 30 * 128) gridProblems.push('grid order: the main page has nf ' + gm.nf + ', expected ' + (30 * 128));
+    if (gm.black !== 0) gridProblems.push('grid order: plan is black at frame 30, so it returned before the scene');
+    const r = gridCompare('main', gm.frames);
+    gridProblems.push(...r.bad);
+    if (!r.bad.length) console.log(`grid order, ${r.line} (fresh page, first feature load)`);
+  }
+  if (gw) {
+    if (gw.source !== 'worker') gridProblems.push('grid order: the worker page boot features did not come from the analysis worker (' + gw.source + ')');
+    if (gw.nf !== 30 * 128) gridProblems.push('grid order: the worker has nf ' + gw.nf + ', expected ' + (30 * 128));
+    if (gw.black !== 0) gridProblems.push('grid order: the worker plan is black at frame 30');
+    const r = gridCompare('worker', gw.frames);
+    gridProblems.push(...r.bad);
+    if (!r.bad.length) console.log(`grid order, ${r.line} (fresh worker page, one features message)`);
+  }
+  if (gridWhy) {
+    skips.push('grid order: ' + gridWhy);
+    console.log(`grid order: skipped the worker side here (${gridWhy})`);
+  }
+  errs.push(...gridProblems);
+}
+
 // ---- media ----
 await resetSection();
 await page.selectOption('#res', '640');
