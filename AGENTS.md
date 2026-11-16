@@ -36,7 +36,7 @@ Up to **four** workers at once, one lane each, never two workers in the same lan
 
 | lane | owns | queue, in order |
 | --- | --- | --- |
-| **A · UI / worker** | `index.src.html`, `gpu.js`, `pack.py` | R1 → U1 → T1d |
+| **A · UI / worker** | `index.src.html`, `gpu.js`, `pack.py` | T1d (parked, see State) |
 | **B · harness** | `gpu_test.mjs`, `test.mjs` | (empty) |
 | **C · gates** | `scripts/gate*`, `scripts/testdata/**` | (empty) |
 | **D · tooling** | `scripts/zip.mjs`, `package.json`, `package-lock.json` | (empty) |
@@ -73,9 +73,12 @@ Two rules that make this survivable:
   the window is not composited. So export runs on SwiftShader too: `npm test` has **no allowed
   skip**, and the gate FAILs on any skip, including the old `export: software adapter cannot
   encode from the presented canvas`.
-- **Hardware runs need an untouched machine.** `npm run test:gpu:hw` drives a headed window; while
-  someone is using the machine its results changed between runs with no code change. Quote the
-  idle state with any hardware number.
+- **Hardware runs need an untouched machine with the display held on.** `npm run test:gpu:hw`
+  drives headed windows. In worker mode, a second window showing a live WebGPU page stalls GPU
+  readbacks while the display is on, and with the display off everything passes, so a run's result
+  depends on display state as well as on the code. Since H9 the harness keeps one live app window
+  (`windows: ... max live GPU windows 1`). Hold the display on, and quote the display and idle state
+  with any hardware number.
 - **The worker + GPU comparison needs a machine that can present from a worker.** Elsewhere it
   prints a skip with its reason. A skip is not a pass — quote it verbatim.
 - **Sections share one long-lived page.** Every section starts with `resetSection()` (120 BPM,
@@ -100,11 +103,14 @@ one branch per task, and never touch another worker's area.
 - In: M0, T1a, T1b1, T1b2. Worker mode exists and is **off by default on purpose**, until it has
   been used for real through the header Engine control.
 - In: T1c (thumbnails, export and repeatable clip exports in the worker), with X2 (exports read
-  back from the texture), H1-H4, Z1, C2. Hardware gate green at dd5a5ec: two back-to-back
-  `npm run test:gpu:hw` runs, identical numbers, `skips: none` (README, T1c section).
-- Next: the milestone zip to the reviewer, then lane A's R1 -> U1 -> T1d.
+  back from the texture), H1-H8, Z1, C2, R1, U1, P1, A2, A3 (a stalled export readback fails after
+  15 s) and H9 (one live window). Hardware gate green at b0eb768, display held on, two back-to-back
+  runs (README, T1c section). The earlier dd5a5ec green was display-off luck.
+- Known limit for T1d: worker mode stalls readbacks when another window shows a live WebGPU page
+  with the display on; A3 turns the export hang into an error. Tabs in one window are fine.
+- Next: T1d, still parked until the human has used worker mode through the header Engine control.
+  The reviewer zip is no longer part of the flow (human decision, 2026-11-15).
 - Ceiling: lane A is one file. `T1e` (split `index.src.html` into UI / worker body / export, with
   `pack.py` inlining modules) is the only task that widens the fan-out beyond four. It must land
   with 13/13 goldens untouched, and it does not go before a milestone gate.
-- Milestone gate: `npm run test:gpu:hw` green, then a zip to the reviewer, who reviews the whole
-  thread split.
+- Milestone gate: `npm run test:gpu:hw` green twice back to back with the display held on.

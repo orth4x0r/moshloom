@@ -115,6 +115,26 @@ suite. Export is not allowed to skip in this mode. Leave the machine alone while
 window is headed, and while the machine was in use the results changed between runs with no code
 change (see T1c below).
 
+**One live WebGPU window at a time.** On the reference machine (AMD RDNA-2, Chrome 157), a page in
+worker mode stops getting GPU readbacks while *another window* shows a live WebGPU page and the
+display is on: `queue.onSubmittedWorkDone()` and `mapAsync()` never resolve. Measured with a
+45-frame 1280x720 worker export: alone 2.0-6.1 s; a second moshloom window (worker or main mode)
+open: never finishes; that window on about:blank: 2.0 s; a non-GPU page in the other window: 4.0 s;
+the two pages as tabs of one window: 6.0 s. With the display off or the machine in standby every
+case passes, which is how the dd5a5ec gate below came out green. Since H9 (#24) the harness keeps
+one moshloom window live: before a section does GPU work it minimizes every other app window over
+CDP and prints `windows: N solo switches, max live GPU windows 1`. Pages keep their own contexts,
+because the app autosaves to `localStorage` and a shared context would leak state into the
+fresh-page sections. Hold the display on during a hardware run (`SetThreadExecutionState` with
+`ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED`) so standby cannot freeze it, and quote the
+display state with the idle state.
+
+**A stalled readback fails the export.** Since A3 (#23) `gpuCapFrame` gives each readback wait
+15 s (`capStallMs`, more than 100x a normal 17-90 ms capture) and then rejects with
+`the GPU did not answer a frame readback for 15 s (stage: work done)` (or `stage: map`), so the
+status line says `Export failed: ...` instead of `frame 0/45` forever. A test can shrink the budget
+with `window.__capStallMs`; an export request carries the page's value to the worker.
+
 The committed goldens were recorded on SwiftShader and are adapter-specific, so the hardware
 run skips the golden comparison by default. Pass `--hardware-golden` only if you have baselines
 from that adapter and want to compare against them.
@@ -247,7 +267,28 @@ source includes that text.
 On SwiftShader (`npm test`, main at 6bcd8dd): worker export 1.94 MB 1280x720, decoded luminance
 0.111; the clip export lands on hash 1500507020 twice; worker thumbnails 39/39.
 
-**Hardware gate: green at dd5a5ec, two back-to-back runs, identical numbers.**
+**Hardware gate: green at b0eb768 (A3 + H9), display held on, two back-to-back runs.**
+
+| line | run 1 (19:59-20:00, 68 s) | run 2 (20:00-20:01, 69 s) |
+| --- | --- | --- |
+| main export | 1.02 MB 640x360, decoded luminance 0.273 | same |
+| worker export | 1.96 MB 1280x720, decoded luminance 0.11 | same |
+| worker clip export | hash 195076583 twice, luminance 0.022 | same |
+| main vs worker | hash 3336782791, lum 0.3203, IDENTICAL | same |
+| recovery device-lost / onerror | recovered in 320 / 417 ms | 317 / 316 ms |
+| stats frame, main / worker | 5.29 / 8.04 ms (gpu timestamps) | 6.47 / 5.45 ms |
+| windows | 4 solo switches, max live GPU windows 1 | same |
+| result | `ok: 13 frames rendered, no validation errors`, gpu errors none | same |
+
+Idle state: the display was held on; idle 16 s at 19:57, 136 s at 19:59, 94-124 s at 20:01 (input
+about 19:59:30). Before H9, every hardware run of main at ccdd626 failed (6 of 6: 3 with the
+display known to be on, 1 frozen by standby) - worker export and device-lost recovery readback timed
+out at 120 s - and dd5a5ec hung at worker export in 2 of 2 runs with the display held on (killed at a
+1200 s cap). With the display off, dd5a5ec and every merge up to 80b9096 passed (7 of 7 runs). So
+the dd5a5ec result below was the display state, not that code.
+
+**Earlier: green at dd5a5ec, two back-to-back runs, identical numbers (display state not recorded;
+see above).**
 
 | line | run 1 (19:49-20:02) | run 2 (20:02-20:11) |
 | --- | --- | --- |
@@ -276,6 +317,9 @@ exported files in a separate headless Chromium (`--use-angle=swiftshader`, so th
 match the SwiftShader run) instead of inside the headed window.
 
 ### Milestone zip
+
+No longer a required step (2026-11-15): there is no external reviewer zip in the milestone flow.
+The tool still works:
 
     npm run zip -- --sha <rev> [--out <path>] [--check-pack] <log> [<log> ...]
 
