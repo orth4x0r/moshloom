@@ -3988,6 +3988,22 @@ function gpuWorkerProbe(){
     } catch (e) { clearTimeout(timer); done({ ok: false, why: 'transfer refused: ' + ((e && e.message) || e) }); }
   });
 }
+// Live texture memory for one renderer, in bytes. It takes its G as an argument and reads nothing
+// else, because there are two renderers now: the page's own (main mode) and the render worker's
+// (worker mode). The stats overlay asks this for whichever one is drawing, and the worker sends
+// the same number in its `stats` message, so the two can never compute it differently.
+function gpuTexBytes(g){
+  const s=g||G;
+  if(!(s&&s.ok&&s.w)) return 0;
+  const w=s.w,h=s.h;
+  let b=((s.src?s.src.length:0)+(s.buf?s.buf.length:0))*w*h*8;
+  b+=3*w*h*8;                                  // tmpA, tmpB, tmpC
+  if(s.off) b+=w*h*4;
+  b+=2*320*180*8+40*23*8+160*90*8+160*90*4;    // reaction-diffusion, motion, thumbnails
+  b+=1024*8*4+512*512*4+24*128+4;              // palette, cellular automaton, spectrum history, blank
+  b+=6*256*144*8;                              // fluid solver
+  return b;
+}
 function gpuDispose(){
   try{
     const ts=[...(G.src||[]),...(G.buf||[]),G.tmpA,G.tmpB,G.tmpC,G.off,G.half];
@@ -4337,7 +4353,7 @@ function gpuLoadFeatures(p){
 // only its own wasm instance. exportVideo stays in the UI.
 const Renderer={attach:gpuAttach,init:gpuInit,frame:gpuFrame,resize:gpuResize,thumb:gpuThumb,
   addMedia:gpuAddMedia,compileShader:gpuCompile,probe:gpuProbe,reset:gpuReset,dispose:gpuDispose,
-  setProject:gpuSetProject,loadFeatures:gpuLoadFeatures};
+  setProject:gpuSetProject,loadFeatures:gpuLoadFeatures,texBytes:gpuTexBytes};
 
 </script>
 <script id="proto">
@@ -4350,7 +4366,10 @@ const Renderer={attach:gpuAttach,init:gpuInit,frame:gpuFrame,resize:gpuResize,th
       'frame', 'frame-done', 'readback', 'readback-done', 'plan', 'plan-done',
       'media-image', 'media-image-ok', 'media-frame', 'media-frame-ok',
       'media-request', 'media-frames', 'thumb', 'thumb-done',
-      'export', 'export-progress', 'export-done', 'export-cancel'],
+      'export', 'export-progress', 'export-done', 'export-cancel',
+      // stats: `stats-on` / `stats-off` are requests from the page (the worker sets its own G.prof),
+      // `stats` is the worker's push (~4/s while profiling) and `stats-ok` acknowledges a request.
+      'stats-on', 'stats-off', 'stats', 'stats-ok'],
     make(type, payload, id) { return { v: P.version, t: type, id: id === undefined ? null : id, p: payload || {} }; },
     check(m) { return !!m && typeof m === 'object' && m.v === P.version && P.types.indexOf(m.t) >= 0; },
     // fields the sender may transfer (a transfer detaches the buffer on the sending side)
@@ -4398,6 +4417,17 @@ self.onmessage = (ev) => {
 let WSV = null, mediaReq = 0, mediaWait = new Map(), exportCancel = false;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function wReply(type, payload, id, transfer) { self.postMessage(PROTO.make(type, payload, id), transfer || []); }
+// ---- stats: the overlay is in the page, the numbers are here ----
+// The page asks for these; this worker owns G.prof, so it also owns when timestamps are recorded.
+// While the overlay is open it pushes `stats` about 4x per second; `stats-off` stops both the
+// messages and the recording, which is what keeps the frame cost of a closed overlay at zero.
+let statsTimer = null;
+function statsPayload() {
+  const T = G && G.timings;
+  return { ok: !!(G && G.ok), w: (G && G.w) || 0, h: (G && G.h) || 0,
+    timings: T ? { ...T } : null, texBytes: gpuTexBytes(G),
+    fluidOn: !!(G && G.fluidOn), errs: G && G.errs ? G.errs.length : 0 };
+}
 function mediaTex(i, w, h, kind) {
   let m = G.media[i];
   if (!m) { m = {}; G.media[i] = m; }
@@ -4582,6 +4612,16 @@ self.onmessage = async (ev) => {
     }
     if (m.t === 'plan') { const X = gpuWasm(); const p = Array.from(new Float32Array(X.memory.buffer, X.plan(m.p.f), 24));
       return wReply('plan-done', { f: m.p.f, p }, m.id); }
+    if (m.t === 'stats-on') {
+      if (G && G.ok && !(WSV && WSV.cpu)) G.prof = true;
+      if (!statsTimer) statsTimer = setInterval(() => wReply('stats', statsPayload(), null), 250);
+      return wReply('stats-ok', { on: true }, m.id);
+    }
+    if (m.t === 'stats-off') {
+      if (G) G.prof = false;
+      if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+      return wReply('stats-ok', { on: false }, m.id);
+    }
     if (m.t === 'readback') {
       if (WSV && WSV.cpu) { const X2 = gpuWasm();
         const a = new Uint8Array(X2.memory.buffer, X2.frame_ptr(), WSV.w * WSV.h * 4).slice();
@@ -4646,37 +4686,76 @@ function toast(msg,kind='err'){
   setTimeout(()=>{d.remove();},8000);
 }
 // ---------- stats overlay (toggle with `) ----------
-let statsOn=false,statsAt=0,lastAnalyzeMs=0;
+// Two renderers exist now: the page's own (main mode) and the render worker's (worker mode). The
+// overlay must describe the one that is drawing, so its source is `renderIn`, never a guess from
+// `mode`: in worker mode the page's G has never drawn a frame and every number from it is zero.
+let statsOn=false,statsAt=0,lastAnalyzeMs=0,rwStats=null;
 const mb=n=>(n/1048576).toFixed(1)+' MB';
 function gpuBytes(){
-  if(!(mode==='gpu'&&typeof G!=='undefined'&&G.ok&&G.w)) return 0;
-  const w=G.w,h=G.h;
-  let b=((G.src?G.src.length:0)+(G.buf?G.buf.length:0))*w*h*8;
-  b+=3*w*h*8;                                  // tmpA, tmpB, tmpC
-  if(G.off) b+=w*h*4;
-  b+=2*320*180*8+40*23*8+160*90*8+160*90*4;    // reaction-diffusion, motion, thumbnails
-  b+=1024*8*4+512*512*4+24*128+4;              // palette, cellular automaton, spectrum history, blank
-  b+=6*256*144*8;                              // fluid solver
-  return b;
+  if(mode!=='gpu'||typeof G==='undefined') return 0;
+  return Renderer.texBytes(G);                 // one formula, in gpu.js, shared with the worker
 }
-function memBytes(){
+function memBytes(texBytes){
   let b=0;
   try{ b+=X.memory.buffer.byteLength; }catch(e){}
   if(abuf) b+=abuf.length*abuf.numberOfChannels*4;
   for(const k in feats){ const a=feats[k]; if(a&&a.length) b+=a.length*4; }
-  return b+gpuBytes();
+  return b+(texBytes===undefined?gpuBytes():texBytes);
 }
+// Every number the overlay shows, from whichever renderer is live. Read-only: nothing here draws,
+// and nothing is cached in a way a test could see lag.
+function statsNumbers(){
+  const inWorker=renderIn==='worker', w=inWorker?rwStats:null, g=(typeof G!=='undefined')?G:null;
+  const T=inWorker?(w?w.timings:null):(g?g.timings:null);
+  const tex=inWorker?(w?+w.texBytes||0:0):gpuBytes();
+  let heap=null; try{ if(performance.memory) heap=performance.memory.usedJSHeapSize; }catch(e){}
+  return {
+    runMode: window.__runMode,
+    renderer: inWorker?'worker':'main',        // who owns the numbers, not what kind of canvas it is
+    mode,                                      // 'gpu' or 'cpu'
+    w: inWorker&&w?w.w:W, h: inWorker&&w?w.h:H,
+    live: inWorker?!!(w&&w.ok):!!(g&&g.ok&&mode==='gpu'),
+    timings: T?{...T}:null,                    // {total, ts, scene, pre, motion, fluid, feedback, output}
+    texBytes: tex,
+    memoryBytes: memBytes(tex),
+    analyzeMs: lastAnalyzeMs,
+    fluidOn: inWorker?!!(w&&w.fluidOn):!!(g&&g.fluidOn),
+    gpuErrors: inWorker?(w?+w.errs||0:0):(g?g.errs.length:0),
+    jsHeapBytes: heap,
+  };
+}
+window.__statsSnapshot=()=>statsNumbers();    // read-only test hook: the numbers the overlay shows
 function refreshStats(){
   const el=$('stats'); if(!el) return;
-  const T=(typeof G!=='undefined')?G.timings:null, f=v=>v===undefined?'-':v.toFixed(2);
-  const L=[`mode ${mode}  ${W}x${H}`,`frame ${T?(f(T.total)+' ms'+(T.ts?' (gpu timestamps)':' (wall clock)')):'-'}`];
+  const S=statsNumbers(), T=S.timings, f=v=>v===undefined?'-':(+v).toFixed(2);
+  const L=[`${S.runMode}  ${S.w}x${S.h}`,
+    `frame ${T?(f(T.total)+' ms'+(T.ts?' (gpu timestamps)':' (wall clock)')):(S.renderer==='worker'?(S.live?'- (waiting for the render worker)':'- (no GPU in the render worker)'):'-')}`];
   if(T&&T.ts){ L.push(`scene ${f(T.scene)}   pre ${f(T.pre)}   me ${f(T.motion)}`);
                L.push(`fluid ${f(T.fluid)}   feedback ${f(T.feedback)}   output ${f(T.output)}`); }
   L.push(`analyze ${lastAnalyzeMs?lastAnalyzeMs.toFixed(0)+' ms':'not measured yet'}`);
-  L.push(`memory ~${mb(memBytes())}  (wasm + audio + features + textures)`);
-  try{ if(performance.memory) L.push(`js heap ${mb(performance.memory.usedJSHeapSize)}`); }catch(e){}
-  L.push(`fluid ${(typeof G!=='undefined'&&G.fluidOn)?'on':'off'}   gpu errors ${(typeof G!=='undefined')?G.errs.length:0}`);
+  L.push(`memory ~${mb(S.memoryBytes)}  (wasm + audio + features + textures)`);
+  if(S.jsHeapBytes!==null) L.push(`js heap ${mb(S.jsHeapBytes)}`);
+  L.push(`fluid ${S.fluidOn?'on':'off'}   gpu errors ${S.gpuErrors}`);
   el.textContent=L.join('\n');
+}
+// Profiling follows the overlay and the live renderer: timestamps are recorded only while the panel
+// is open, and only on the side that draws. In worker mode that is the worker's own G.prof, and
+// closing the overlay also stops its `stats` messages.
+function statsProf(on){
+  if(renderIn==='worker'){
+    if(typeof G!=='undefined') G.prof=false;        // the page's renderer draws nothing here
+    if(rw) rwCall(on?'stats-on':'stats-off').catch(()=>{});
+    if(!on) rwStats=null;
+  } else {
+    if(typeof G!=='undefined') G.prof=on&&mode==='gpu';
+    rwStats=null;
+  }
+}
+function statsToggle(){
+  statsOn=!statsOn;
+  $('stats').style.display=statsOn?'block':'none';
+  statsProf(statsOn);
+  if(statsOn) refreshStats();
 }
 // one schema for both stores (moshloom, moshloom:projects) and for pasted projects
 const SCHEMA=2;
@@ -4791,6 +4870,7 @@ function exportProgress(p) {
 }
 async function startRenderWorker(opts) {
   opts = opts || {};
+  rwStats = null;                              // no worker numbers survive a new worker
   const src = [$('proto').textContent, $('mux-src').textContent, $('gpu-src').textContent, $('render-worker').textContent].join('\n');
   rw = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
   rw.onmessage = (ev) => {
@@ -4798,6 +4878,7 @@ async function startRenderWorker(opts) {
     if (m.t === 'device-lost') { recover('device lost in the render worker: ' + m.p.message); return; }
     if (m.t === 'media-request') { serveWorkerMedia(m.p, (type, payload, transfer) => { if (rw) rw.postMessage(PROTO.make(type, payload, null), transfer || []); }).catch((e) => toast('export media: ' + e.message, 'warn')); return; }
     if (m.t === 'export-progress') { exportProgress(m.p); return; }
+    if (m.t === 'stats') { rwStats = m.p; if (statsOn) refreshStats(); return; }
     if (m.t === 'error' && !m.id) { toast('render worker: ' + m.p.message, 'warn'); return; }
     const p = rwPending.get(m.id); if (!p) return;
     rwPending.delete(m.id);
@@ -4879,6 +4960,7 @@ async function recover(why, target) {
     status('recovery failed: ' + e.message);
   } finally {
     window.__runMode = modeNow();
+    if(statsOn) statsProf(true);               // the new renderer records timings, the old one stops
     recovering = false;
   }
   return modeNow();
@@ -5210,7 +5292,7 @@ addEventListener('keydown',e=>{
   if(e.ctrlKey||e.metaKey)return;
   if(e.code==='Space'){e.preventDefault();playing?pause():play();}
   else if(e.key==='d'||e.key==='D')act('dup'); else if(e.key==='s'||e.key==='S')act('split'); else if(e.key==='t'||e.key==='T')tap();
-  else if(e.key==='`'||e.code==='Backquote'){statsOn=!statsOn;if(typeof G!=='undefined')G.prof=statsOn&&mode==='gpu';$('stats').style.display=statsOn?'block':'none';if(statsOn)refreshStats();}
+  else if(e.key==='`'||e.code==='Backquote'){statsToggle();}
   else if(e.key==='Delete'||e.key==='Backspace')act('del');
   else if(e.key==='ArrowRight'){selK='blk';sel=Math.min(blocks.length-1,sel+1);drawTimeline();drawInspector();}
   else if(e.key==='ArrowLeft'){selK='blk';sel=Math.max(0,sel-1);drawTimeline();drawInspector();}

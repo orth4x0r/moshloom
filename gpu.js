@@ -486,6 +486,22 @@ function gpuWorkerProbe(){
     } catch (e) { clearTimeout(timer); done({ ok: false, why: 'transfer refused: ' + ((e && e.message) || e) }); }
   });
 }
+// Live texture memory for one renderer, in bytes. It takes its G as an argument and reads nothing
+// else, because there are two renderers now: the page's own (main mode) and the render worker's
+// (worker mode). The stats overlay asks this for whichever one is drawing, and the worker sends
+// the same number in its `stats` message, so the two can never compute it differently.
+function gpuTexBytes(g){
+  const s=g||G;
+  if(!(s&&s.ok&&s.w)) return 0;
+  const w=s.w,h=s.h;
+  let b=((s.src?s.src.length:0)+(s.buf?s.buf.length:0))*w*h*8;
+  b+=3*w*h*8;                                  // tmpA, tmpB, tmpC
+  if(s.off) b+=w*h*4;
+  b+=2*320*180*8+40*23*8+160*90*8+160*90*4;    // reaction-diffusion, motion, thumbnails
+  b+=1024*8*4+512*512*4+24*128+4;              // palette, cellular automaton, spectrum history, blank
+  b+=6*256*144*8;                              // fluid solver
+  return b;
+}
 function gpuDispose(){
   try{
     const ts=[...(G.src||[]),...(G.buf||[]),G.tmpA,G.tmpB,G.tmpC,G.off,G.half];
@@ -835,4 +851,4 @@ function gpuLoadFeatures(p){
 // only its own wasm instance. exportVideo stays in the UI.
 const Renderer={attach:gpuAttach,init:gpuInit,frame:gpuFrame,resize:gpuResize,thumb:gpuThumb,
   addMedia:gpuAddMedia,compileShader:gpuCompile,probe:gpuProbe,reset:gpuReset,dispose:gpuDispose,
-  setProject:gpuSetProject,loadFeatures:gpuLoadFeatures};
+  setProject:gpuSetProject,loadFeatures:gpuLoadFeatures,texBytes:gpuTexBytes};
