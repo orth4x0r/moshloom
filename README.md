@@ -296,6 +296,16 @@ offers it. Where either is refused — including some Chromium builds — the ov
 wall-clock time around `onSubmittedWorkDone()` and shows the frame total only. Timestamps are only
 recorded while the panel is open.
 
+The numbers always come from the renderer that is drawing. In worker mode the page's own `G` draws
+nothing, so the page sends `stats-on` / `stats-off` to the render worker, which sets its own
+`G.prof` and, while the panel is open, posts `stats` about 4 times a second (timings, texture bytes,
+fluid, error count, size). Closing the panel stops both the recording and the messages. Texture
+memory is one formula, `Renderer.texBytes(G)` in gpu.js, used on both sides. The first line names
+the run mode (`worker+gpu 1280x720`, `main+gpu ...`). `window.__statsSnapshot()` returns the panel's
+numbers for tests. Measured on SwiftShader in worker mode: before, `frame -` and ~70.3 MB (no
+textures); after, `frame 145.76 ms (gpu timestamps)` with per-pass lines and ~126.8 MB, the same
+texture total as main mode.
+
 ## Adding a visual
 
 Append a fragment shader to `WG_SCENES` in gpu.js (uniforms in `SU`: T, hue, bass,
@@ -358,6 +368,7 @@ default palette to `DEFPAL` in engine.c (raise the scene limit there and in `pac
   clearly when no worker is running.
 - T1a: `gpu.js` touches no `document` or `window`. `gpuAttach({doc, offscreen})` supplies both, and
   the renderer's surface is exposed as `Renderer` (init, frame, resize, thumb, addMedia,
-  compileShader, probe, reset, dispose). `setProject`/`loadFeatures` arrive with T1b, when the
-  renderer owns its wasm instance. The 13 goldens were unchanged by this refactor.
+  compileShader, probe, reset, dispose). `setProject` and `loadFeatures` were added in R1: the
+  feature-loading sequence (arrays, mel, then `set_grid`) exists once, in `gpuLoadFeatures`, used by the
+  page and the render worker. The 13 goldens were unchanged by the T1a refactor and by R1.
 - Not built: live audio input, MIDI, desktop packaging.
