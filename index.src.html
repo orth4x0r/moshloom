@@ -292,6 +292,9 @@ async function runWorkerExport(p, id) {
     gpuAttach({ offscreen: true }); gpuResize(w, h);
     const X = gpuWasm(); X.reset(); gpuReset();
     const dev = G.dev;
+    // The page owns the stall budget a test sets (window.__capStallMs); this worker is a separate
+    // script scope, so an export carries the value here. 0/absent keeps the 15000 ms default.
+    if (+p.stallMs > 0) capStallSet(p.stallMs);
     cap = gpuCapOpen(w, h);
     let blackRun = 0, probes = 0, litProbes = 0;
     for (let f = 0; f < nf; f++) {
@@ -1304,7 +1307,7 @@ async function runExport(client){
     const channels=[...Array(ch).keys()].map(c=>abuf.getChannelData(c).slice(0,total));
     audio={sampleRate:sr,channels}; transfer=channels.map(a=>a.buffer);
   }
-  const r=await client.call('export',{w:W,h:H,nf,fps:FPS,bpm,offs,audio},transfer);
+  const r=await client.call('export',{w:W,h:H,nf,fps:FPS,bpm,offs,audio,stallMs:capStallGet()},transfer);
   lastBlob={blob:new Blob([r.buf],{type:r.type}),ext:r.ext};
   if(!lastBlob.blob.size)throw new Error('export produced an empty file (0-byte blob)');
   $('bExp').textContent='⬇ Save video';

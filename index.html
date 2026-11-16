@@ -4214,22 +4214,74 @@ function gpuReset(){ G.valid=false; G.fluidOn=false; }   // call next to WASM.re
 // result changed between runs, so every export switches to an offscreen texture, renders into
 // G.off and reads that texture back. Only the texture path is independent of the window.
 // One MAP_READ buffer per export, reused for every frame. bytesPerRow must be a multiple of 256.
+// `dead` marks a buffer a stall already abandoned, so a caller that keeps going gets a message
+// instead of a WebGPU validation error about a buffer that is not unmapped.
 function gpuCapOpen(w,h){
   const row=Math.ceil(w*4/256)*256;
-  return {w,h,row,bgra:G.fmt.indexOf('bgra')===0,
+  return {w,h,row,bgra:G.fmt.indexOf('bgra')===0,dead:false,
     buf:G.dev.createBuffer({size:row*h,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ})};
 }
-function gpuCapClose(cap){ try{cap.buf.destroy();}catch(e){} }
+// Closes a buffer whose map may still be pending (a stalled readback) and may already be destroyed
+// (gpuCapFrame abandons it when the budget runs out). Neither is an error: the next export opens a
+// fresh buffer in gpuCapOpen, so a stall never leaves the next capture reading a half-mapped one.
+function gpuCapClose(cap){
+  if(!cap) return;
+  try{ if(cap.buf&&cap.buf.mapState==='mapped')cap.buf.unmap(); }catch(e){}
+  try{ if(cap.buf)cap.buf.destroy(); }catch(e){}
+  cap.buf=null; cap.dead=true;
+}
+
+// ---- bounded readback: an export fails with a reason instead of waiting forever --------------
+// A normal capture of one 1280x720 frame takes 17-90 ms end to end on the reference adapter, so
+// this budget is >100x a normal capture: time past it means the GPU is stuck, not slow. Measured
+// cause (AMD RDNA-2, Chrome 157): while another window shows a live WebGPU page in worker mode,
+// queue.onSubmittedWorkDone() here never resolves, and without it mapAsync hangs instead.
+// Test hook, documented: assign `window.__capStallMs` (page) or `self.__capStallMs` (render
+// worker) to shrink the budget, e.g. 1, to reach the stall path without waiting 15 s. An export
+// request carries the page's value to the worker (runExport in index.src.html), so one assignment
+// covers both export modes; `Renderer.capStallMs` / `Renderer.setCapStallMs` read and set it too.
+let capStallMs=15000;
+function capStallGet(){ return capStallMs; }
+function capStallSet(ms){ const n=+ms; if(isFinite(n)&&n>0)capStallMs=n; return capStallMs; }
+try{
+  const scope=typeof window!=='undefined'?window:self;
+  Object.defineProperty(scope,'__capStallMs',{get:capStallGet,set:capStallSet,configurable:true});
+}catch(e){}
+// "15 s", "0.3 s", "1 ms": the budget as the message says it, so a test's short budget reads right.
+function capStallLabel(ms){
+  if(ms<1000) return ms+' ms';
+  const s=ms/1000; return (s%1?s.toFixed(2):String(s))+' s';
+}
+// Reject with a message naming the stage if `p` has not settled within the budget. The timer is
+// cleared on the normal path, so a healthy capture pays one setTimeout and one clearTimeout and no
+// extra await: frames, their order and their pixels are the same as before this guard existed.
+function capBounded(p,stage){
+  const budget=capStallMs; let timer=0;
+  const guard=new Promise((_,reject)=>{ timer=setTimeout(()=>reject(new Error(
+    'the GPU did not answer a frame readback for '+capStallLabel(budget)+' (stage: '+stage+')')),budget); });
+  return Promise.race([p,guard]).finally(()=>clearTimeout(timer));
+}
 // Copies G.off into a tight RGBA frame in `cap` and returns it with the luminance sampled from
 // those same bytes. The guard has to measure what the encoder is handed: the feedback buffer stays
 // bright while a blank capture is encoded, which is how black exports shipped green once.
 async function gpuCapFrame(cap){
   const dev=G.dev;
-  await dev.queue.onSubmittedWorkDone();
-  const ce=dev.createCommandEncoder();
-  ce.copyTextureToBuffer({texture:G.off},{buffer:cap.buf,bytesPerRow:cap.row},[cap.w,cap.h]);
-  dev.queue.submit([ce.finish()]);
-  await cap.buf.mapAsync(GPUMapMode.READ);
+  if(!cap||!cap.buf||cap.dead)
+    throw new Error('the export frame readback buffer was abandoned after a GPU stall (stage: buffer)');
+  try{
+    await capBounded(dev.queue.onSubmittedWorkDone(),'work done');
+    const ce=dev.createCommandEncoder();
+    ce.copyTextureToBuffer({texture:G.off},{buffer:cap.buf,bytesPerRow:cap.row},[cap.w,cap.h]);
+    dev.queue.submit([ce.finish()]);
+    await capBounded(cap.buf.mapAsync(GPUMapMode.READ),'map');
+  }catch(e){
+    // A buffer whose map is still pending cannot be reused, and a hung GPU may never finish that
+    // map, so abandon this one instead of leaving the readback in a state the next call trips on.
+    cap.dead=true;
+    try{ cap.buf.destroy(); }catch(e2){}
+    cap.buf=null;
+    throw e;
+  }
   const mapped=new Uint8Array(cap.buf.getMappedRange());
   const copy=new Uint8Array(mapped.length); copy.set(mapped); cap.buf.unmap();
   let sum=0,cnt=0;
@@ -4479,7 +4531,9 @@ function gpuLoadFeatures(p){
 // only its own wasm instance. exportVideo stays in the UI.
 const Renderer={attach:gpuAttach,init:gpuInit,frame:gpuFrame,resize:gpuResize,thumb:gpuThumb,
   addMedia:gpuAddMedia,compileShader:gpuCompile,probe:gpuProbe,reset:gpuReset,dispose:gpuDispose,
-  setProject:gpuSetProject,loadFeatures:gpuLoadFeatures,texBytes:gpuTexBytes};
+  setProject:gpuSetProject,loadFeatures:gpuLoadFeatures,texBytes:gpuTexBytes,
+  // the frame-readback stall budget in ms (default 15000, see gpuCapFrame); a test may shrink it
+  capStallMs:capStallGet,setCapStallMs:capStallSet};
 
 </script>
 <script id="proto">
@@ -4652,6 +4706,9 @@ async function runWorkerExport(p, id) {
     gpuAttach({ offscreen: true }); gpuResize(w, h);
     const X = gpuWasm(); X.reset(); gpuReset();
     const dev = G.dev;
+    // The page owns the stall budget a test sets (window.__capStallMs); this worker is a separate
+    // script scope, so an export carries the value here. 0/absent keeps the 15000 ms default.
+    if (+p.stallMs > 0) capStallSet(p.stallMs);
     cap = gpuCapOpen(w, h);
     let blackRun = 0, probes = 0, litProbes = 0;
     for (let f = 0; f < nf; f++) {
@@ -5664,7 +5721,7 @@ async function runExport(client){
     const channels=[...Array(ch).keys()].map(c=>abuf.getChannelData(c).slice(0,total));
     audio={sampleRate:sr,channels}; transfer=channels.map(a=>a.buffer);
   }
-  const r=await client.call('export',{w:W,h:H,nf,fps:FPS,bpm,offs,audio},transfer);
+  const r=await client.call('export',{w:W,h:H,nf,fps:FPS,bpm,offs,audio,stallMs:capStallGet()},transfer);
   lastBlob={blob:new Blob([r.buf],{type:r.type}),ext:r.ext};
   if(!lastBlob.blob.size)throw new Error('export produced an empty file (0-byte blob)');
   $('bExp').textContent='⬇ Save video';
