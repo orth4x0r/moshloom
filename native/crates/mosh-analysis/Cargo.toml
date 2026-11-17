@@ -14,6 +14,7 @@ live-analysis = []
 
 [dependencies]
 mosh-core = { path = "../mosh-core" }
+rustfft = "6.4.1"
 serde = { version = "1.0", features = ["derive"] }
 symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "pcm", "wav"] }
 toml = "0.8"
