@@ -478,6 +478,7 @@ Vulkan SDK (1.4.363.0 on the reference machine). `cargo test --workspace` is the
 | loopback capture | 185-187 blocks/s at 48 kHz, within one block of wall time |
 | overlay decode (160x90 fixture, debug) | 0.18 ms/frame |
 | 16 web scenes at 960x540 (debug, integrated GPU) | all lit at 3 levels x 3 seeds (144/144 draws), 0 validation messages; 0.10-0.32 ms each except Numogram 3.4-9.5 ms and Swarm 1.6-4.5 ms |
+| datamosh refresh (I-frame) | on a clip change, a drop, every fourth bar of Live's bars, and playback jumps; new picture 25/255 without, 255/255 with the refresh |
 | datamosh, one layer (debug, integrated GPU) | 0.88 ms at 960x540, 2.09 ms at 1280x720; a static picture stays exact (0/255), a moving bar leaves its trail behind it |
 | fluid visualizer, one layer at 1280x720 internal (debug) | 0.80-1.12 ms (17 passes, 8 pressure iterations); 10 000 noisy frames with no NaN |
 | effects lane, all 8 effects in one pass at 960x540 (debug, integrated GPU) | 0.91-1.01 ms; amount 0 is the exact identity (0 of 9216 pixels change) |
@@ -490,10 +491,6 @@ needs a cheaper version or a lower internal scale before it goes in a set.
 Known gap: in that 54 s run the intensity level reached 4 at bar 5 and stayed there; the rules
 need the hand-placed marks before they mean much. The first second after start logs one budget
 line (shader compilation, 6-14 ms on the render thread).
-
-Known gap: a clip change cannot force a datamosh refresh (I-frame) yet; the mosh refreshes on
-drops, every fourth bar and playback jumps. Adding a "clip changed" input is a contract change for
-after Phase 2.
 
 Known gap: an overlay layer is drawn in its own submission that the CPU waits on (1.7-2.6 ms per
 layer in debug), because the frame recorder only samples render targets; it has to move into the
