@@ -15,6 +15,10 @@ const SHADERS: &[(&str, &str)] = &[
     ("fullscreen.vert.wgsl", "FULLSCREEN_VERT"),
     ("compositor.frag.wgsl", "COMPOSITOR_FRAG"),
     ("compositor_stack.frag.wgsl", "COMPOSITOR_STACK_FRAG"),
+    (
+        "compositor_stack_masked.frag.wgsl",
+        "COMPOSITOR_STACK_MASKED_FRAG",
+    ),
 ];
 
 fn compile(path: &Path) -> Vec<u32> {

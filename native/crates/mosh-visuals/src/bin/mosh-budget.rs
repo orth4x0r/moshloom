@@ -16,6 +16,9 @@
 //!   the fluid solver and helper passes such as mel and reaction-diffusion), plus that frame's
 //!   `frame_ms`;
 //! * the compositor's own pass, from `Compositor::timings()`;
+//! * the **stack cases** (`stack_cases`): the same two picture layers composited through
+//!   `mosh_visuals::stack::Stack` as a plain stack, with a `Mask` layer, and with an `Adjustment`
+//!   layer, so the two new layer kinds have a GPU cost of their own next to the composite line;
 //! * render-thread CPU per frame: the recording half only (overlay upload, `draw_layer` per layer,
 //!   `FrameRecorder::submit`), which is the same segment `shell.rs` calls `cpu_ms`. The app's
 //!   number also carries the analyser and the show's update; those are measured elsewhere
@@ -35,7 +38,10 @@ use mosh_core::{
     ActiveTransition, AnalysisFrame, ClipParams, EffectKind, EffectSlot, EventFlags, LayerState,
     TransitionKind,
 };
-use mosh_render::{Compositor, FrameRecorder, Gpu, GpuPreference, OutputImage};
+use mosh_render::{
+    CompositeTarget, Compositor, FrameRecorder, Gpu, GpuPreference, OutputImage, submission_count,
+};
+use mosh_visuals::stack::{Stack, StackLayer};
 use mosh_visuals::{LayerSlot, Visuals};
 
 /// The stress project's layers, exactly as `mosh-stress-project` writes them: blend mode, opacity
@@ -89,8 +95,197 @@ fn main() {
     );
 
     for (width, height) in sizes {
+        stack_cases(&gpu, width, height, frames, warmup);
         let report = run(&gpu, width, height, frames, warmup);
         report.print();
+    }
+}
+
+/// The Adjustment and Mask layers' cost, with the frame report's own instrument: two picture
+/// layers drawn once, then the whole stack composited every frame with kinds the case adds.
+///
+/// Measured per frame is the wall clock of `Stack::compose`, which submits its composite passes and
+/// waits for them, so it is their GPU time plus the recording cost — the same quantity as the
+/// frame report's `composite + present blit` line, plus whatever extra segments the case has. The
+/// layer draws themselves are not part of it: they happen once, here, and the real per-frame layer
+/// cost is the frame report above.
+fn stack_cases(gpu: &Gpu, width: u32, height: u32, frames: usize, warmup: usize) {
+    let (layer_w, layer_h) = (
+        ((width as f32 * 0.5) as u32).max(16),
+        ((height as f32 * 0.5) as u32).max(16),
+    );
+    let mut visuals = Visuals::new(gpu, layer_w, layer_h).expect("visuals");
+    let mut slots: Vec<LayerSlot> = (0..3)
+        .map(|index| LayerSlot::new(gpu, index, layer_w, layer_h))
+        .collect();
+    let frame = analysis(0);
+    // Real pictures in every slot, so the mask has luminance and the effects have something to
+    // move: the composite's cost does not depend on the content, but the pixels it produces do.
+    let mut recorder = FrameRecorder::new(gpu);
+    for (index, slot) in slots.iter_mut().enumerate() {
+        let state = stack_state(index, index == 2);
+        visuals
+            .draw_layer(&mut recorder, slot, &state, &frame, 0.0)
+            .expect("draw layer");
+    }
+    gpu.wait_frame(recorder.submit());
+
+    let out = OutputImage::new_with_format(gpu, width, height, mosh_render::STAGE_FORMAT);
+    let states: Vec<LayerState> = (0..3).map(|index| stack_state(index, index == 2)).collect();
+    let before_stack = gpu.allocated_bytes();
+
+    // The cases are measured round-robin over the same frames, so a GPU clock ramp or another
+    // process stealing the machine hits all three instead of whichever one ran first.
+    let mut stacks = [
+        ("plain", Stack::new()),
+        ("mask", Stack::new()),
+        ("adjustment", Stack::new()),
+    ];
+    let mut times: Vec<Vec<f32>> = vec![Vec::with_capacity(frames); stacks.len()];
+    let mut submissions = vec![0u64; stacks.len()];
+    for index in 0..(warmup + frames) {
+        for (slot, (case, stack)) in stacks.iter_mut().enumerate() {
+            let plan = stack_plan(case, &slots, &states);
+            let before = submission_count();
+            let start = Instant::now();
+            stack
+                .compose(
+                    FrameRecorder::new(gpu),
+                    None,
+                    &plan,
+                    CompositeTarget::Output(&out),
+                    &frame,
+                    0.0,
+                )
+                .expect("compose the stack");
+            let elapsed = start.elapsed().as_secs_f32() * 1_000.0;
+            let submitted = submission_count() - before;
+            if index >= warmup {
+                times[slot].push(elapsed);
+                submissions[slot] += submitted;
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "== stack cases: {width}x{height} output, 2 picture layers at {layer_w}x{layer_h} =="
+    );
+    // Per frame: the wall clock of `Stack::compose` — its composite passes, their submits and the
+    // waits for them — and how many submissions that is. The layer frame's own submission is
+    // included in both, because the app submits one per frame either way.
+    println!(
+        "{:<24} {:>9} {:>9} {:>9} {:>8} {:>11}",
+        "case", "median", "mean", "p95", "sub/f", "vs plain"
+    );
+    let plain = median(&times[0]);    for (slot, (case, _)) in stacks.iter().enumerate() {
+        let ms = median(&times[slot]);
+        println!(
+            "{:<24} {:>9.3} {:>9.3} {:>9.3} {:>8.2} {:>11}",
+            case,
+            ms,
+            mean(&times[slot]),
+            percentile(&times[slot], 0.95),
+            submissions[slot] as f32 / frames as f32,
+            if slot == 0 {
+                "today's pass".to_string()
+            } else {
+                format!("{:+.3} ms", ms - plain)
+            }
+        );
+    }
+    let pairs = 2.0 * 2.0 * f64::from(width) * f64::from(height) * 8.0;
+    println!(
+        "            stack intermediates: {:.2} MB allocated by the three stacks, {:.2} MB of it \
+         the adjustment's two half-float targets at the output size (a third when its clip has a \
+         Mosh slot)",
+        (gpu.allocated_bytes() - before_stack) as f64 / (1024.0 * 1024.0),
+        pairs / (1024.0 * 1024.0)
+    );
+    let messages = gpu.validation_messages();
+    println!("            validation: {} message(s)", messages.len());
+}
+
+/// A layer state for the stack cases: `index` names the clip, `adjusted` gives it the effects an
+/// Adjustment layer applies.
+fn stack_state(index: usize, adjusted: bool) -> LayerState {
+    let effects = if adjusted {
+        vec![
+            EffectSlot {
+                kind: EffectKind::Fold,
+                amount: 1.0,
+                param: 0.4,
+            },
+            EffectSlot {
+                kind: EffectKind::Negative,
+                amount: 1.0,
+                param: 0.0,
+            },
+        ]
+    } else {
+        Vec::new()
+    };
+    LayerState {
+        layer: index,
+        clip: Some(index as u32 + 1),
+        visualizer: Some("tunnel".to_string()),
+        params: ClipParams {
+            p: [0.5; 8],
+            palette: 0,
+            seed: 7,
+        },
+        effects,
+        transition: None,
+        blend: mosh_core::BlendMode::Normal,
+        opacity: 1.0,
+        seed: 7,
+    }
+}
+
+/// The layer list of one stack case, in draw order.
+fn stack_plan<'a>(
+    case: &str,
+    slots: &'a [LayerSlot],
+    states: &'a [LayerState],
+) -> Vec<StackLayer<'a>> {
+    let picture0 = StackLayer::new(
+        &slots[0],
+        mosh_core::LayerKind::Visualizer,
+        mosh_core::BlendMode::Normal,
+        1.0,
+        &states[0],
+    );
+    let picture1 = StackLayer::new(
+        &slots[1],
+        mosh_core::LayerKind::Visualizer,
+        mosh_core::BlendMode::Add,
+        0.7,
+        &states[1],
+    );
+    match case {
+        "mask" => vec![
+            picture0,
+            StackLayer::new(
+                &slots[2],
+                mosh_core::LayerKind::Mask,
+                mosh_core::BlendMode::Normal,
+                1.0,
+                &states[2],
+            ),
+            picture1,
+        ],
+        "adjustment" => vec![
+            picture0,
+            picture1,
+            StackLayer::new(
+                &slots[2],
+                mosh_core::LayerKind::Adjustment,
+                mosh_core::BlendMode::Normal,
+                0.8,
+                &states[2],
+            ),
+        ],
+        _ => vec![picture0, picture1],
     }
 }
 
