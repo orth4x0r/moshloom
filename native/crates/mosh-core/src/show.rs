@@ -99,7 +99,9 @@ pub struct Clip {
     pub follow_after_bars: u16,
     /// Fire the follow action on LEVEL_UP / DROP at the next downbeat.
     pub react_to_events: bool,
-    /// Overlay clips: path to a video file.
+    /// The clip's media source, by visualizer: `overlay` -> a video file path; `camera` ->
+    /// `camera:<device name>` (or `camera:` for the default camera); `text` -> `text:<the words>`
+    /// (lines separated by a newline). Unused by other visualizers.
     pub video: Option<String>,
 }
 
@@ -115,9 +117,17 @@ pub enum BlendMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LayerKind {
+    /// Draws its clip's visualizer (a scene, fluid, particles, camera, text, ...).
     #[default]
     Visualizer,
+    /// Draws its clip's video file on top.
     Overlay,
+    /// Draws nothing of its own: its clip's effects are applied to the composite of every layer
+    /// below it (like an effect on a group in Ableton).
+    Adjustment,
+    /// Draws its clip's picture as a mask: its luminance is the opacity of the layer directly
+    /// above it, and it is not shown itself.
+    Mask,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

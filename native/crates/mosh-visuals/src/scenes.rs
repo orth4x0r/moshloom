@@ -155,6 +155,22 @@ impl Scenes {
                 .with_name(info.id);
             scene.push((info.id, pipeline));
         }
+        // Style packs (`styles`): native scenes on the scene prelude plus `P(i)`.
+        let style_prelude = crate::styles::prelude();
+        for style in crate::styles::all() {
+            let words = compile(
+                &format!(
+                    "{style_prelude}
+{}",
+                    style.body
+                ),
+                style.id,
+            );
+            let pipeline = Pipeline::fullscreen(gpu, &words, LAYER_UNIFORM_BYTES, INPUTS)
+                .unwrap_or_else(|error| panic!("style scene {} pipeline: {error}", style.id))
+                .with_name(style.id);
+            scene.push((style.id, pipeline));
+        }
         Ok(Scenes {
             scene,
             custom: Vec::new(),

@@ -4,11 +4,14 @@
 use mosh_core::{AnalysisFrame, EffectKind, LayerState};
 use mosh_render::{FlashLimiter, FrameRecorder, Gpu, LayerTarget, RenderError};
 
+use crate::camera::CameraLayer;
 use crate::effects::EffectChain;
 use crate::fluid::FluidVisualizer;
 use crate::mosh::MoshPass;
 use crate::overlay::OverlayLayer;
+use crate::particles::Particles;
 use crate::scenes::Scenes;
+use crate::text::TextLayer;
 use crate::transitions::TransitionPass;
 
 /// Which target holds a layer's current picture.
@@ -76,6 +79,9 @@ pub struct Visuals {
     pub scenes: Scenes,
     pub fluid: FluidVisualizer,
     pub overlay: OverlayLayer,
+    pub camera: CameraLayer,
+    pub text: TextLayer,
+    pub particles: Particles,
     pub mosh: MoshPass,
     pub effects: EffectChain,
     pub transitions: TransitionPass,
@@ -89,6 +95,9 @@ impl Visuals {
             scenes: Scenes::new(gpu)?,
             fluid: FluidVisualizer::new(gpu, width, height)?,
             overlay: OverlayLayer::new(gpu)?,
+            camera: CameraLayer::new(gpu)?,
+            text: TextLayer::new(gpu)?,
+            particles: Particles::new(gpu, width, height)?,
             mosh: MoshPass::new(gpu, width, height)?,
             effects: EffectChain::new(gpu)?,
             transitions: TransitionPass::new(gpu)?,
@@ -128,8 +137,18 @@ impl Visuals {
             self.fluid.draw(rec, &slot.scene, frame, &state.params, t)?;
         } else if visualizer == "overlay" {
             self.overlay.draw(rec, slot.layer, &slot.scene)?;
+        } else if visualizer == "camera" {
+            self.camera
+                .draw(rec, slot.layer, &slot.scene, &state.params)?;
+        } else if visualizer == "text" {
+            self.text
+                .draw(rec, slot.layer, &slot.scene, frame, &state.params, t)?;
+        } else if visualizer == "particles" {
+            self.particles
+                .draw(rec, slot.layer, &slot.scene, frame, &state.params, t)?;
         } else {
-            self.scenes.draw(rec, &slot.scene, visualizer, frame, &state.params, t)?;
+            self.scenes
+                .draw(rec, &slot.scene, visualizer, frame, &state.params, t)?;
         }
 
         let mosh = state

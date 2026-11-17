@@ -85,6 +85,15 @@ Native lanes are one crate each, one worker each.
 | **V-fx** | `native/crates/mosh-visuals/src/{effects.rs,transitions.rs}` (+ `src/effects/`, `src/transitions/`) | 2.3 |
 | **V-fluid** | `native/crates/mosh-visuals/src/fluid.rs` (+ `src/fluid/`) | 2.4 |
 | **V-overlay** | `native/crates/mosh-visuals/src/overlay.rs`, a new `mosh-render/src/upload.rs` | 2.8 |
+| **UI (Fable)** | `native/crates/mosh-app/**` (control window, editors, window placement) | UI wave |
+| **S-cyber** | `mosh-visuals/src/styles/cyber.rs` + `styles/cyber/**` | wave 3 |
+| **S-aero** | `mosh-visuals/src/styles/aero.rs` + `styles/aero/**` | wave 3 |
+| **L-camera** | `mosh-visuals/src/camera.rs` (+ `src/camera/`), camera capture in `mosh-video` (new files only) | wave 3 |
+| **L-text** | `mosh-visuals/src/text.rs` (+ `src/text/`), font assets under `native/assets/fonts/` | wave 3 |
+| **L-particles** | `mosh-visuals/src/particles.rs` (+ `src/particles/`) | wave 3 |
+| **L-stack** | Adjustment and Mask layers: `mosh-render/src/compositor.rs` (+ its shaders), a new `mosh-visuals/src/stack.rs` | wave 3 |
+| **A-sections** | `mosh-analysis/**` (sections, drops, stem inputs) | wave 3 |
+| **O-hap** | HAP video with alpha: `mosh-video` (new files), overlay alpha path in `mosh-visuals/src/overlay.rs` and `mosh-render/src/upload.rs` | wave 3 |
 
 Rules for native lanes:
 
