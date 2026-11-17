@@ -295,6 +295,7 @@ impl Compositor {
             self.device.reset_fences(&[self.fence])?;
             let command_buffers = [self.cmd];
             let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
+            crate::device::count_submission();
             self.device
                 .queue_submit(self.queue, &[submit], self.fence)?;
             self.device

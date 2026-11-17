@@ -1,4 +1,10 @@
-// The swarm's particle table: one texel per particle, `(head.xy, tail.xy)` in the scene's own
+// The swarm's particle table — first generation, kept for the perf test in `scenes.rs`.
+//
+// `scenes/swarm_pos_fast.wgsl` replaces it (three rows per particle: the streak's box, its ends,
+// and its finished width and colour). Nothing draws this file any more.
+//
+// The original note:
+// One texel per particle, `(head.xy, tail.xy)` in the scene's own
 // units. The web app gets this for free from instancing (`p.draw(6, 150 + 1300*dens)`); with one
 // 3-vertex draw per pass the swarm fragment shader would otherwise evaluate `ppos()` twice for
 // every particle in every pixel, which measured 12.7 ms at 960x540 on the integrated GPU. One

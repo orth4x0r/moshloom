@@ -1,4 +1,10 @@
-// Scene 15 (swarm), the one scene that cannot keep its web body.
+// Scene 15 (`swarm`) — first generation, kept for the perf test in `scenes.rs`.
+//
+// `scenes/swarm_fast.wgsl` replaces this body (and `scenes/swarm_pos_fast.wgsl` replaces its
+// particle table): same streaks, same widths, same colours, same falloff, but the per-particle
+// work moved into the table and each tile carries the list of particles a pixel has to look at,
+// which took the pass from 1.6-4.5 ms to 0.15-0.24 ms at 960x540. Nothing draws this file any
+// more; it is compiled only so `hand_written_scenes_keep_their_look` can compare the two.
 //
 // gpu.js draws the swarm as N instanced quads with additive blending: `p.draw(6, round(150 + 1300
 // * dens))`. `mosh-render` records exactly one 3-vertex, one-instance draw per pass and its

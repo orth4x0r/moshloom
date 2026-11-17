@@ -836,6 +836,7 @@ impl Stage {
             .command_buffers(&command_buffers)
             .signal_semaphores(&signal_semaphores);
         unsafe {
+            crate::device::count_submission();
             self.device
                 .queue_submit(self.queue, &[submit], vk::Fence::null())?;
         }

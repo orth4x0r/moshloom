@@ -51,6 +51,11 @@
 //! - `Pipeline::with_name` names a pipeline's pass in `GpuTimings::per_pass_ms`.
 //! - `Stage` adds `resize`, `extent`, `timings`, `last_error` and `monitor` for the app's window
 //!   management and stats overlay.
+//! - `FrameRecorder` adds `upload_video`, `draw_video` and `clear`: a video frame's staging copy,
+//!   an overlay cover pass and a transparent-black clear are recorded into the frame's own command
+//!   buffer instead of a one-shot submission the CPU waits on (V-perf, Task 2.8's follow-up).
+//! - `submission_count()` (device) counts `vkQueueSubmit` calls process-wide, so a test can prove
+//!   that a per-frame pass did not add one.
 
 use std::fmt;
 
@@ -66,6 +71,7 @@ pub mod upload;
 mod win;
 
 pub use compositor::Compositor;
+pub use device::submission_count;
 pub use device::{Gpu, GpuPreference};
 pub use flash::{FlashLimiter, FLASH_INTERVAL};
 pub use pipeline::{FrameRecorder, Pipeline};
