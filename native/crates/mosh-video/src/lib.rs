@@ -22,6 +22,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+pub mod camera;
 mod win;
 
 /// A decoded frame, packed BGRA, top row first, `w * h * 4` bytes.
