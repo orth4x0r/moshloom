@@ -462,6 +462,9 @@ Vulkan SDK (1.4.363.0 on the reference machine). `cargo test --workspace` is the
 | Tap + Control callback without the shared-memory write (release) | median 400 ns per 256-frame block, 0 allocations / 10 000 |
 | plugin -> shared memory -> app reader | one block + transport + MIDI note round-trip exact (test) |
 | `Analyzer::push`, 256 frames (release) | median 25.4 us, p95 33.1 us, 0 allocations after warm-up |
+| loopback tempo tracker, click tracks 93/120/140 BPM | locked within 8 s to +-0.5 BPM; worst beat 5.1 ms off (18.7 ms through the analyzer) |
+| loopback tempo tracker, tuning tracks (90 s each) | 93.01 (93), 139.98 (140), 136.90 (137), 174.06 (87: locked at double) |
+| `Analyzer::push` with the tracker on (release) | median 15.7 us, p95 23.2 us; max 2.1 ms once per 0.5 s (the tempo search) |
 | Vulkan device | "AMD Radeon(TM) Graphics" picked by default; 0 validation messages in every GPU test |
 | loopback capture | 185-187 blocks/s at 48 kHz, within one block of wall time |
 | overlay decode (160x90 fixture, debug) | 0.18 ms/frame |
