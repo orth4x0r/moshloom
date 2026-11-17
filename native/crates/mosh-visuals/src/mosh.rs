@@ -42,10 +42,8 @@
 //!   backwards, or a hitch left a hole. `decide()` refreshes after eight 30 fps frames for the
 //!   same reason; at 60 fps this is 15 frames.
 //!
-//! A *clip change* is not in that list: `apply` is never told the clip, and the frozen signature
-//! has no force-refresh flag, so the web app's `entered -> iframe` rule cannot be reproduced from
-//! this side. Reported to the coordinator; a `Datamosh` transition (Task 2.3) that needs the
-//! buffer refreshed on a clip change needs an addition to the contract, not a workaround here.
+//! A *clip change* refreshes too: `Visuals::draw_layer` calls [`MoshPass::invalidate`] when a
+//! layer's clip changes (the web app's `entered -> iframe` rule), so the next `apply` copies.
 //!
 //! # `extra_flow`
 //!
@@ -218,9 +216,10 @@ impl MoshPass {
         Ok(true)
     }
 
-    /// Forgets a layer's buffer, so the next `apply` refreshes it. Called when the clip has no
-    /// mosh to apply: the output target is then whatever the chain left there.
-    fn invalidate(&mut self, layer: usize) {
+    /// Forgets a layer's buffer, so the next `apply` refreshes it (an I-frame). Called when the
+    /// clip has no mosh to apply, and by `Visuals::draw_layer` when a layer's clip changes: the web
+    /// app's `entered -> iframe` rule.
+    pub fn invalidate(&mut self, layer: usize) {
         if let Some(Some(state)) = self.layers.get_mut(layer) {
             state.valid = false;
         }

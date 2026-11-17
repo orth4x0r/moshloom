@@ -602,3 +602,34 @@ fn apply_cost_per_frame() {
     assert!(total(small).is_finite() && total(large).is_finite());
     assert_no_validation_messages(&gpu);
 }
+
+/// `invalidate` (called by the facade on a clip change) makes the next frame an I-frame.
+#[test]
+fn invalidate_refreshes_the_buffer() {
+    let gpu = gpu();
+    let (width, height) = (64, 36);
+    let pattern = pipeline(&gpu, PATTERN_WGSL, 16, 0);
+    let mut mosh = MoshPass::new(&gpu, width, height).expect("mosh pass");
+    let src = LayerTarget::new(&gpu, width, height);
+    let dst = LayerTarget::new(&gpu, width, height);
+    let bar_a = vec4_uniform([8.0, 24.0, 0.0, 0.0]);
+    let bar_b = vec4_uniform([40.0, 56.0, 0.0, 0.0]);
+    let draw = |mosh: &mut MoshPass, bar: &[u8]| {
+        let mut rec = FrameRecorder::new(&gpu);
+        rec.draw(&pattern, &src, bar, &[]).expect("pattern");
+        mosh.apply(&mut rec, 0, &src, &dst, 0.9, &AnalysisFrame::default(), None)
+            .expect("mosh");
+        gpu.wait_frame(rec.submit());
+        red_row(&gpu.read_back(&dst), width, height / 2)
+    };
+    for _ in 0..3 {
+        draw(&mut mosh, &bar_a);
+    }
+    let stale = mean(&draw(&mut mosh, &bar_b), 40, 56);
+    mosh.invalidate(0);
+    let fresh = mean(&draw(&mut mosh, &bar_b), 40, 56);
+    println!("amount 0.9: stale {stale:.0}/255, after invalidate {fresh:.0}/255");
+    assert!(stale < 200.0, "a plain frame already shows the new bar ({stale:.0}/255)");
+    assert!(fresh > 200.0, "invalidate did not refresh the buffer ({fresh:.0}/255)");
+    assert_no_validation_messages(&gpu);
+}

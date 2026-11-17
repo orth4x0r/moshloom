@@ -107,10 +107,14 @@ impl Visuals {
             return Ok(());
         };
 
-        // A clip change hands the transition its "from" picture (last frame's output).
-        if state.clip != slot.last_clip && state.transition.is_some() {
-            let from = slot.target(slot.last_output_stage);
-            self.transitions.begin(rec, slot.layer, from)?;
+        // A clip change hands the transition its "from" picture (last frame's output) and starts
+        // the datamosh over from the new clip (an I-frame), as the web app does.
+        if state.clip != slot.last_clip {
+            self.mosh.invalidate(slot.layer);
+            if state.transition.is_some() {
+                let from = slot.target(slot.last_output_stage);
+                self.transitions.begin(rec, slot.layer, from)?;
+            }
         }
         slot.last_clip = state.clip;
 
