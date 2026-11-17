@@ -604,9 +604,12 @@ fn overlay_cpu_time_per_frame_1080p() {
          {frame_min:.3} / {frame_median:.3} ms",
         (width * height * 4) / (1024 * 1024)
     );
+    // The 0.2 ms budget is a release-build number; a debug build of the same recording measured
+    // 0.25-0.33 ms on the reference machine, so debug only guards against a gross regression.
+    let limit = if cfg!(debug_assertions) { 1.0 } else { 0.2 };
     assert!(
-        record_min < 0.2,
-        "the overlay's own CPU cost per frame must be under 0.2 ms, min {record_min:.3} ms \
+        record_min < limit,
+        "the overlay's own CPU cost per frame must be under {limit} ms, min {record_min:.3} ms \
          (median {record_median:.3} ms; the minimum is the pass's own cost, the median moves with \
          whatever else the machine is doing)"
     );
