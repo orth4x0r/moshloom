@@ -10,3 +10,7 @@ publish.workspace = true
 mosh-core = { path = "../mosh-core" }
 mosh-render = { path = "../mosh-render" }
 mosh-shaders = { path = "../mosh-shaders" }
+
+[dev-dependencies]
+# Test fixtures are WGSL too, compiled in the test (frozen patterns, solid colours).
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }

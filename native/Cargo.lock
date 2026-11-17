@@ -815,6 +815,7 @@ dependencies = [
  "mosh-core",
  "mosh-render",
  "mosh-shaders",
+ "naga",
 ]
 
 [[package]]
