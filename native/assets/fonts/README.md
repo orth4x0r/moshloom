@@ -26,3 +26,14 @@ There is no display face here: no Y2K bubble sans, no blackletter. The three loo
 dilation for the chrome bubble, noise-warped edges and thorns for the cyber look). Adding a real
 display face is a coordinator decision — it needs a licence file next to it, the same SHA-256
 note, and a look selection that actually uses it.
+
+## Display faces (added by the coordinator, 2026-11-17)
+
+Fetched from the google/fonts repository (`ofl/<family>/`), each under the SIL Open Font License
+1.1 (licence text next to the font). Variable fonts; the text layer uses their default instance.
+
+| family | file | use | sha256 |
+| --- | --- | --- | --- |
+| Grenze Gotisch | `grenzegotisch/GrenzeGotisch[wght].ttf` | blackletter, the thorny / sigil look | 701b299d8dc002a2… |
+| Unbounded | `unbounded/Unbounded[wght].ttf` | wide rounded display, the chrome look | 323b511be380c8d4… |
+| Space Grotesk | `spacegrotesk/SpaceGrotesk[wght].ttf` | clean grotesque | acad6de1fc93436f… |
