@@ -438,7 +438,7 @@ interfaces and tests: `docs/superpowers/plans/2026-11-17-native-port.md`.
 | `mosh-shaders` | the web app's WGSL (34 modules) compiled to SPIR-V; the layer uniform layout |
 | `mosh-render` | Vulkan core (ash): device on the integrated GPU, targets, pipelines, compositor, swapchain, flash limiter |
 | `mosh-visuals` | one layer = scene / fluid / video -> datamosh -> effects (one pass) -> transition; all five stages in |
-| `mosh-app` | the app (Phase 2, in progress) |
+| `mosh-app` | the app: input fallback (plugin -> loopback after 2 s), Autopilot by default, stage + control windows, budgets, self-recovery; `mosh-feed` streams a file into shared memory as the Tap plugin would |
 
 ### Build and test
 
@@ -450,6 +450,10 @@ cargo run --manifest-path crates/mosh-tap/xtask/Cargo.toml -- bundle mosh-tap --
 #   -> native/target/bundled/mosh-tap.vst3 (Live lists Moshloom Tap and Moshloom Control)
 ```
 
+Run it: `target/release/mosh-app.exe [project.ron]` (no project: Autopilot over the 16 scenes).
+Without Ableton, `target/release/mosh-feed.exe "<track>.wav" [--bpm 93] [--start-s 30]` plays a
+track into shared memory with a beat-accurate transport, silently, so the app runs in plugin mode.
+
 Needs Rust 1.99 (MSVC; `native/rust-toolchain.toml`) and, for GPU tests with validation, the
 Vulkan SDK (1.4.363.0 on the reference machine). `cargo test --workspace` is the native gate;
 `npm test` stays the web gate.
@@ -458,6 +462,8 @@ Vulkan SDK (1.4.363.0 on the reference machine). `cargo test --workspace` is the
 
 | what | number |
 | --- | --- |
+| **first app run**, loopback, nothing playing (release, integrated GPU, laptop screen only) | GPU 0.70-0.75 ms, render thread 0.05-0.11 ms per frame; process about 5.5% of one core; 322 MB |
+| **app + mosh-feed**, "reza pedia" (93 BPM) from 0:30 for 54 s | plugin mode, 93.0 BPM, bars advancing, Autopilot changed scenes; GPU 0.77-1.53 ms, render thread 0.08-0.19 ms; process about 5.6% of one core; 285 MB |
 | `IpcWriter::push_block`, 256 stereo frames | median 200 ns, p99 500 ns, 0 allocations / 10 000 |
 | Tap + Control callback without the shared-memory write (release) | median 400 ns per 256-frame block, 0 allocations / 10 000 |
 | plugin -> shared memory -> app reader | one block + transport + MIDI note round-trip exact (test) |
@@ -478,6 +484,10 @@ Vulkan SDK (1.4.363.0 on the reference machine). `cargo test --workspace` is the
 Known gap: Numogram alone can exceed the 6 ms GPU budget at 960x540 on the integrated GPU; it
 needs a cheaper version or a lower internal scale before it goes in a set.
 
+Known gap: in that 54 s run the intensity level reached 4 at bar 5 and stayed there; the rules
+need the hand-placed marks before they mean much. The first second after start logs one budget
+line (shader compilation, 6-14 ms on the render thread).
+
 Known gap: a clip change cannot force a datamosh refresh (I-frame) yet; the mosh refreshes on
 drops, every fourth bar and playback jumps. Adding a "clip changed" input is a contract change for
 after Phase 2.
@@ -486,7 +496,7 @@ Known gap: an overlay layer is drawn in its own submission that the CPU waits on
 layer in debug), because the frame recorder only samples render targets; it has to move into the
 frame before the CPU budget can hold with video on.
 
-Not measured yet: anything in Ableton, the app's frame times on battery, latency from audio to
+Not measured yet: anything in Ableton, a second monitor, the app on battery, latency from audio to
 picture. Those are coordinator runs on the reference machine once the app lands.
 
 ### Tuning audio
