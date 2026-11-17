@@ -2,11 +2,17 @@
 //!
 //! The design's shape, once:
 //!
-//! - the **stage** window is a borderless fullscreen window on the first non-primary monitor, or
-//!   a borderless window on the laptop screen when that monitor is missing. It never shows UI.
+//! - the **stage** window never shows UI. With a second monitor it is borderless fullscreen
+//!   there. On a single screen it is an ordinary window *beside* the control window, so the
+//!   controls are never covered; `F11` (in either window) takes it in and out of fullscreen, and
+//!   `Esc` on the stage leaves fullscreen and brings the control window to the front.
+//!   `crate::monitor::window_plan` decides both windows' places.
 //! - the **control** window is the editor: its own winit window on its own OpenGL context
 //!   (`crate::editor`), painted only when something changes and at most 30 times a second, so it
-//!   costs the stage nothing while the performer is not touching it.
+//!   costs the stage nothing while the performer is not touching it. Closing it quits the app.
+//! - the control window's two pictures of the show, the **stage preview** and the **clip
+//!   thumbnails**, are drawn on the render thread and sent over as bytes (`crate::preview`);
+//!   the preview only while the control window is on screen and showing it.
 //! - the **render thread** owns the analysis, the show and the GPU. It presents with a FIFO
 //!   swapchain, so the frame loop blocks on the display and never busy-waits.
 //!
@@ -19,15 +25,20 @@
 //! keeps ticking and tries again a second later. No dialog, no exit, no panic: a set must survive
 //! a monitor unplug, a device reset or a driver restart.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use mosh_core::{AnalysisFrame, Clip, ControlEvent, Layer, Project, RenderPlan, ShowMode};
-use mosh_render::{FramePacer, FrameRecorder, Gpu, GpuPreference, RenderError, Stage, WaitTimer};
+use mosh_core::{
+    AnalysisFrame, BlendMode, Clip, ControlEvent, Layer, Project, RenderPlan, ShowMode,
+};
+use mosh_render::{
+    FramePacer, FrameRecorder, Gpu, GpuPreference, LayerTarget, RenderError, Stage, WaitTimer,
+};
 use mosh_visuals::{LayerSlot, Visuals};
 use winit::application::ApplicationHandler;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
@@ -36,22 +47,26 @@ use winit::raw_window_handle::HasWindowHandle;
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::budget::BudgetWatch;
-use crate::core::{AppCore, SourceName, Status, default_project, stage_placement_label, title_for};
+use crate::core::{AppCore, Lamps, Status, default_project, window_title};
 use crate::editor::model::Command as EditorCommand;
+use crate::editor::ui::{StageInfo, UiAction};
 use crate::editor::{EditorModel, EditorUi, EditorWindow};
-use crate::monitor::{MonitorInfo, StagePlacement, monitor_choice};
+use crate::monitor::{MonitorInfo, StageWindow, WindowPlan, window_plan};
+use crate::preview::{
+    PREVIEW_FPS, Picture, PreviewClock, PreviewTap, ThumbRequest, ThumbTap,
+};
 use crate::win::WindowHandle;
 
 /// How often the monitor list is re-read, so an unplugged or replugged stage is noticed without
 /// the human touching anything.
 const MONITOR_CHECK: Duration = Duration::from_secs(2);
-/// Stats are sent to the window thread at this rate; the control window's title is set at most
-/// 30 times a second regardless.
+/// Stats are sent to the window thread at this rate.
 const STATUS_INTERVAL: Duration = Duration::from_millis(100);
-/// How often the control window repaints for a changed status line: the numbers are for a glance,
-/// not for the stage, so four times a second is plenty and keeps the editor's cost at nothing.
-const STATUS_PAINT: Duration = Duration::from_millis(250);
-const TITLE_INTERVAL: Duration = Duration::from_millis(33);
+/// How often the control window repaints for a changed status: ten times a second moves the
+/// playhead and the meters smoothly enough to read, and an unchanged status paints nothing.
+const STATUS_PAINT: Duration = Duration::from_millis(100);
+/// Thumbnail requests waiting for a frame, at most; older ones are dropped.
+const THUMB_QUEUE: usize = 64;
 /// Backoff after a failed rebuild.
 const RETRY_AFTER: Duration = Duration::from_millis(500);
 /// How often the same render error is logged again.
@@ -66,6 +81,9 @@ const IDLE_TICK: Duration = Duration::from_millis(16);
 struct Scene {
     stage: Option<Stage>,
     slots: Vec<LayerSlot>,
+    /// The control window's pictures (`crate::preview`), built on first use.
+    preview: Option<PreviewTap>,
+    thumbs: Option<ThumbTap>,
     visuals: Option<Visuals>,
     gpu: Option<Gpu>,
     out: (u32, u32),
@@ -95,6 +113,8 @@ impl Scene {
         let mut scene = Scene {
             stage: None,
             slots: Vec::with_capacity(layers.len()),
+            preview: None,
+            thumbs: None,
             visuals: Some(visuals),
             gpu: Some(gpu),
             out,
@@ -129,6 +149,8 @@ impl Scene {
         // still intact and the next frame can try again.
         let visuals = Visuals::new(gpu, w, h)?;
         self.visuals = Some(visuals);
+        // The preview is sized from the stage; it is rebuilt on its next capture.
+        self.preview = None;
         self.out = out;
         self.rebuild_slots(layers);
         if let Some(stage) = self.stage.as_mut() {
@@ -155,6 +177,45 @@ impl Scene {
 
     fn detach_stage(&mut self) {
         self.stage = None;
+    }
+
+    /// Composite the stack the stage just presented at preview size and read it back.
+    fn capture_preview(&mut self, plan: &RenderPlan) -> Result<Picture, RenderError> {
+        let Some(gpu) = self.gpu.as_ref() else {
+            return Err(RenderError::Stage("no device".into()));
+        };
+        if self.preview.as_ref().is_none_or(|tap| tap.stage() != self.out) {
+            // Drop the old tap before building one for the new stage size.
+            self.preview = None;
+            self.preview = Some(PreviewTap::new(gpu, self.out)?);
+        }
+        let layers: Vec<(&LayerTarget, BlendMode, f32)> = plan
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, state)| {
+                self.slots
+                    .get(index)
+                    .map(|slot| (slot.output(), state.blend, state.opacity))
+            })
+            .collect();
+        match self.preview.as_mut() {
+            Some(tap) => tap.capture(gpu, &layers),
+            None => Err(RenderError::Stage("no preview".into())),
+        }
+    }
+
+    /// Draw one clip thumbnail (`None`: that visualizer has no thumbnail).
+    fn render_thumb(&mut self, request: &ThumbRequest) -> Result<Option<Picture>, RenderError> {
+        let Some(gpu) = self.gpu.as_ref() else {
+            return Err(RenderError::Stage("no device".into()));
+        };
+        let Some(visuals) = self.visuals.as_mut() else {
+            return Err(RenderError::Stage("no visuals".into()));
+        };
+        self.thumbs
+            .get_or_insert_with(|| ThumbTap::new(gpu))
+            .render(gpu, visuals, request)
     }
 }
 
@@ -288,8 +349,12 @@ enum Command {
     SetMode(ShowMode),
     /// An edited project from the control window: applied on the next bar line.
     SetProject(Project),
-    /// A control event from the control window (a preview launch).
+    /// A control event from the control window (a launch, a stop, a live parameter).
     Control(ControlEvent),
+    /// Send preview frames of the stage, or stop sending them.
+    SetPreview(bool),
+    /// Draw one clip thumbnail.
+    Thumb(ThumbRequest),
     Quit,
 }
 
@@ -301,6 +366,10 @@ pub enum UserEvent {
     SurfaceLost,
     /// A line for the terminal (a recovered error, a missing device).
     Note(String),
+    /// One frame of the stage preview.
+    Preview(Picture),
+    /// A clip thumbnail, or `None` when that look has no picture.
+    Thumb { key: u64, picture: Option<Picture> },
 }
 
 struct RenderHandle {
@@ -327,6 +396,13 @@ struct RenderThread {
     /// tick would turn a 16.6 ms wait into 31 ms.
     timer: WaitTimer,
     paced_frames: u64,
+    /// The control window is showing the stage preview.
+    preview_on: bool,
+    preview_clock: PreviewClock,
+    /// Whether the first capture's cost has been logged.
+    preview_logged: bool,
+    thumb_queue: VecDeque<ThumbRequest>,
+    lamps: Lamps,
     started: Instant,
     last_status: Option<Instant>,
     last_error: Option<(Instant, String)>,
@@ -359,6 +435,11 @@ impl RenderThread {
             pacer: FramePacer::new(fps),
             timer: WaitTimer::new(),
             paced_frames: 0,
+            preview_on: false,
+            preview_clock: PreviewClock::new(PREVIEW_FPS),
+            preview_logged: false,
+            thumb_queue: VecDeque::new(),
+            lamps: Lamps::default(),
             started: Instant::now(),
             last_status: None,
             last_error: None,
@@ -412,20 +493,32 @@ impl RenderThread {
                     scene.detach_stage();
                 }
             }
-            Command::SetMode(mode) => self.core.show_mut().set_mode(mode),
+            Command::SetMode(mode) => self.core.set_mode(mode),
             Command::SetProject(project) => {
-                // A layer stack that changed shape needs its targets rebuilt; a clip edit does
-                // not, and must not touch the GPU at all.
-                if project.session.layers != self.project_layers {
-                    self.project_layers = project.session.layers.clone();
-                    let layers = self.project_layers.clone();
+                // A layer stack that changed shape (how many layers, how large each renders)
+                // needs its targets rebuilt. A clip edit does not, and neither does an opacity,
+                // a blend mode or a layer kind: those must not touch the GPU at all, or dragging
+                // an opacity would reallocate every target on every tick.
+                let shape = |layers: &[Layer]| -> Vec<f32> {
+                    layers.iter().map(|layer| layer.internal_scale).collect()
+                };
+                if shape(&project.session.layers) != shape(&self.project_layers) {
+                    let layers = project.session.layers.clone();
                     if let Some(scene) = self.scene.as_mut() {
                         scene.rebuild_slots(&layers);
                     }
                 }
+                self.project_layers = project.session.layers.clone();
                 self.core.queue_project(project);
             }
             Command::Control(event) => self.core.queue_control(event),
+            Command::SetPreview(on) => self.preview_on = on,
+            Command::Thumb(request) => {
+                if self.thumb_queue.len() >= THUMB_QUEUE {
+                    self.thumb_queue.pop_front();
+                }
+                self.thumb_queue.push_back(request);
+            }
             Command::Quit => {}
         }
     }
@@ -447,6 +540,7 @@ impl RenderThread {
         }
         let frame_start = Instant::now();
         let frame = self.core.step(frame_start);
+        self.lamps.note(frame.analysis.events, frame_start);
 
         if self.scene.is_none() && self.retry_at.is_none_or(|at| frame_start >= at) {
             self.build();
@@ -483,6 +577,7 @@ impl RenderThread {
                     Err(error) => self.recover(&error),
                 }
             }
+            self.control_pictures(&frame.plan);
         } else {
             // Nothing to present: the show keeps its clock, and the loop sleeps instead of
             // spinning on an acquire that can never succeed.
@@ -498,17 +593,65 @@ impl RenderThread {
             .is_none_or(|at| frame_start.saturating_duration_since(at) >= STATUS_INTERVAL)
         {
             self.last_status = Some(frame_start);
-            let status = Status {
-                mode: frame.mode.into(),
-                source: SourceName(frame.source),
-                tempo_bpm: frame.analysis.tempo_bpm,
-                bar: frame.analysis.bar_index,
-                bar_phase: frame.analysis.bar_phase,
-                level: frame.analysis.level,
-                gpu_ms,
-                cpu_ms,
-            };
+            let status =
+                Status::from_frame(&frame, gpu_ms, cpu_ms, self.lamps.levels(frame_start));
             let _ = self.proxy.send_event(UserEvent::Status(status));
+        }
+    }
+
+    /// The control window's pictures, after the stage frame has been presented: a preview frame
+    /// when one is due and wanted, and at most one clip thumbnail.
+    ///
+    /// Both wait for a small submission of their own, so they are done after the present (never
+    /// between a frame's passes) and neither is counted in the frame's `cpu_ms`. A failure here
+    /// is the control window's problem, not the stage's: it is logged and the stage goes on.
+    fn control_pictures(&mut self, plan: &RenderPlan) {
+        let now = Instant::now();
+        if self.preview_on && self.preview_clock.due(now) {
+            let captured = match self.scene.as_mut() {
+                Some(scene) => scene.capture_preview(plan),
+                None => return,
+            };
+            match captured {
+                Ok(picture) => {
+                    if !self.preview_logged {
+                        self.preview_logged = true;
+                        self.note(format!(
+                            "stage preview on: {}x{} at {PREVIEW_FPS} fps, first capture {:.2} ms on the render thread",
+                            picture.width,
+                            picture.height,
+                            now.elapsed().as_secs_f32() * 1_000.0
+                        ));
+                    }
+                    let _ = self.proxy.send_event(UserEvent::Preview(picture));
+                }
+                Err(error) => {
+                    self.preview_on = false;
+                    self.note_once(format!("stage preview stopped: {error}"));
+                }
+            }
+        }
+        // At most one picture per frame: a thumbnail waits for a frame without a preview capture.
+        let captured = now.elapsed() > Duration::from_micros(200);
+        if !captured && let Some(request) = self.thumb_queue.pop_front() {
+            let picture = match self.scene.as_mut() {
+                Some(scene) => scene.render_thumb(&request),
+                None => Ok(None),
+            };
+            let picture = match picture {
+                Ok(picture) => picture,
+                Err(error) => {
+                    self.note_once(format!(
+                        "thumbnail of {} could not be drawn: {error}",
+                        request.visualizer
+                    ));
+                    None
+                }
+            };
+            let _ = self.proxy.send_event(UserEvent::Thumb {
+                key: request.key,
+                picture,
+            });
         }
     }
 
@@ -635,46 +778,64 @@ struct Shell {
     note: Option<String>,
     proxy: EventLoopProxy<UserEvent>,
     stage_window: Option<Window>,
-    /// The control window and its OpenGL context (Task 2.7). Absent when it could not be built:
-    /// the show keeps running, because a set does not end because an editor window failed.
+    /// The control window and its OpenGL context. Absent when it could not be built: the show
+    /// keeps running, because a set does not end because an editor window failed.
     editor: Option<EditorWindow>,
     monitors: Vec<MonitorHandle>,
     monitor_list: Vec<MonitorInfo>,
-    placement: Option<StagePlacement>,
+    /// Where the two windows are, as last applied.
+    plan: Option<WindowPlan>,
+    /// The performer's `F11` choice; `None` until they make one (fullscreen on a second
+    /// monitor, a window beside the controls on a single one).
+    fullscreen: Option<bool>,
     render: Option<RenderHandle>,
     /// The stage's frame rate cap (`--fps`, default 60): a 120 Hz panel would otherwise draw
     /// twice the frames the budget is written for.
     fps: u32,
     title: Option<String>,
-    last_title_at: Option<Instant>,
     last_status_paint: Option<Instant>,
     next_monitor_check: Option<Instant>,
+    /// Whether the render thread was last told to send preview frames.
+    preview_sent: bool,
     started: bool,
 }
 
 impl Shell {
     fn new(
         project: Project,
+        path: Option<String>,
         note: Option<String>,
         proxy: EventLoopProxy<UserEvent>,
         fps: u32,
     ) -> Shell {
+        let mut editor_ui = EditorUi {
+            recent: read_recent(),
+            ..EditorUi::default()
+        };
+        if let Some(path) = path.as_deref() {
+            editor_ui.project_path = path.to_string();
+        }
+        let mut model = EditorModel::new(project).with_path(path);
+        if let Some(note) = note.as_deref() {
+            model.note(note);
+        }
         Shell {
-            model: EditorModel::new(project),
-            editor_ui: EditorUi::default(),
+            model,
+            editor_ui,
             note,
             proxy,
             stage_window: None,
             editor: None,
             monitors: Vec::new(),
             monitor_list: Vec::new(),
-            placement: None,
+            plan: None,
+            fullscreen: None,
             render: None,
             fps,
             title: None,
-            last_title_at: None,
             last_status_paint: None,
             next_monitor_check: None,
+            preview_sent: false,
             started: false,
         }
     }
@@ -712,16 +873,16 @@ impl Shell {
     }
 
     fn create_control_window(&mut self, event_loop: &ActiveEventLoop) {
-        let title = self
-            .note
-            .as_deref()
-            .unwrap_or("ilanaVisual · control")
-            .to_string();
+        let title = window_title(self.model.path(), self.model.modified());
+        let place = self.plan.and_then(|plan| plan.control).and_then(|(index, area)| {
+            self.monitor(index)
+                .map(|monitor| (monitor.position(), area))
+        });
         // Building a GL context is the one place the window thread talks to a driver that may be
         // absent or broken. A panic there must not take the show with it: the stage keeps running
         // on the render thread and the app logs one line.
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            EditorWindow::new(event_loop, &title)
+            EditorWindow::new(event_loop, &title, place)
         }));
         match built {
             Ok(Ok(editor)) => {
@@ -730,6 +891,7 @@ impl Shell {
                     editor.window().inner_size().width,
                     editor.window().inner_size().height
                 ));
+                self.title = Some(title);
                 self.editor = Some(editor);
             }
             Ok(Err(error)) => self.log(format!("control window could not be created: {error}")),
@@ -748,6 +910,10 @@ impl Shell {
         if !editor.wants_paint(now) {
             return;
         }
+        self.editor_ui.stage = StageInfo {
+            fullscreen: self.plan.is_some_and(|plan| plan.stage.is_fullscreen()),
+            shared_monitor: self.plan.is_some_and(|plan| plan.shared_monitor),
+        };
         // A panic in the UI (or in the driver, on the paint path) must not take the show with it:
         // the stage is on the render thread, and the editor is the part that can be given up.
         let painted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -760,9 +926,11 @@ impl Shell {
                     self.log(error);
                 }
                 self.run_editor_commands(commands);
+                self.run_ui_requests();
             }
             Err(_) => {
                 self.editor = None;
+                self.send(Command::SetPreview(false));
                 self.log(
                     "control window failed while painting; the editor is gone, the show is not"
                         .to_string(),
@@ -775,59 +943,148 @@ impl Shell {
     fn run_editor_commands(&mut self, commands: Vec<EditorCommand>) {
         let mut applied = false;
         for command in commands {
-            match self.model.apply(command) {
-                Ok(outcome) => {
-                    applied = true;
-                    // The mode is a show-level action: the stage hears it now, not at the next bar.
-                    if let Some(mode) = outcome.set_mode {
-                        self.send(Command::SetMode(mode));
-                    }
-                    if let Some(event) = outcome.launch {
-                        self.send(Command::Control(event));
-                    }
+            // The file a command opens or saves, for the recent list.
+            let file = match &command {
+                EditorCommand::OpenProject { path } | EditorCommand::SaveProject { path } => {
+                    Some(path.clone())
                 }
-                // The model already put the reason in the status strip.
-                Err(_) => applied = true,
+                EditorCommand::Save => self.model.path().map(str::to_string),
+                _ => None,
+            };
+            applied = true;
+            // An error is already in the status strip: the model put it there.
+            let Ok(outcome) = self.model.apply(command) else {
+                continue;
+            };
+            // The mode is a show-level action: the stage hears it now, not at the next bar.
+            if let Some(mode) = outcome.set_mode {
+                self.send(Command::SetMode(mode));
+            }
+            if let Some(event) = outcome.launch {
+                self.send(Command::Control(event));
+            }
+            for event in outcome.live {
+                self.send(Command::Control(event));
+            }
+            if let Some(path) = file {
+                self.editor_ui.note_recent(&path);
+                self.editor_ui.project_path = path;
+                write_recent(&self.editor_ui.recent);
             }
         }
         if let Some(project) = self.model.handoff() {
             self.send(Command::SetProject(project));
         }
-        if applied
-            && let Some(editor) = self.editor.as_mut()
-        {
-            // An applied edit changes what the screens show: paint it, at the 30 fps ceiling.
+        if applied {
+            self.update_title();
+            if let Some(editor) = self.editor.as_mut() {
+                // An applied edit changes what the views show: paint it, at the 30 fps ceiling.
+                editor.request_paint(Instant::now());
+            }
+        }
+    }
+
+    /// What the widgets asked of the shell this frame: the stage window, thumbnails, the preview.
+    fn run_ui_requests(&mut self) {
+        for action in std::mem::take(&mut self.editor_ui.actions) {
+            match action {
+                UiAction::ToggleStageFullscreen => self.toggle_fullscreen(),
+            }
+        }
+        for request in self.editor_ui.thumbs.take_requests() {
+            self.send(Command::Thumb(request));
+        }
+        self.sync_preview();
+    }
+
+    /// Tell the render thread whether anyone is looking at the preview: it is drawn only while
+    /// the control window is on screen and showing it.
+    fn sync_preview(&mut self) {
+        let visible = self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| !editor.is_hidden());
+        let wanted = visible && self.editor_ui.wants_preview();
+        if wanted != self.preview_sent {
+            self.preview_sent = wanted;
+            self.send(Command::SetPreview(wanted));
+        }
+    }
+
+    /// The control window's title: the show's file, and a star while it has unsaved edits.
+    fn update_title(&mut self) {
+        let title = window_title(self.model.path(), self.model.modified());
+        if self.title.as_deref() == Some(title.as_str()) {
+            return;
+        }
+        if let Some(editor) = self.editor.as_ref() {
+            editor.window().set_title(&title);
+        }
+        self.title = Some(title);
+    }
+
+    /// `F11`: the stage in and out of fullscreen. Leaving fullscreen on a shared screen brings
+    /// the control window back in front, which is the whole point of the key.
+    fn toggle_fullscreen(&mut self) {
+        let now = self.plan.is_some_and(|plan| plan.stage.is_fullscreen());
+        self.fullscreen = Some(!now);
+        self.apply_plan();
+        if now {
+            if let Some(editor) = self.editor.as_ref() {
+                editor.bring_to_front();
+            }
+        } else if let Some(stage) = self.stage_window.as_ref() {
+            // Going fullscreen: the stage comes to the front and takes the keyboard, so that
+            // `Esc` and `F11` reach it when it covers the controls.
+            stage.focus_window();
+        }
+        if let Some(editor) = self.editor.as_mut() {
             editor.request_paint(Instant::now());
         }
     }
 
-    /// Create the stage window for the current monitor list, if there is anything to present on.
+    /// Leave fullscreen (if the stage is in it) and bring the control window to the front.
+    fn back_to_controls(&mut self) {
+        if self.plan.is_some_and(|plan| plan.stage.is_fullscreen())
+            && self.plan.is_some_and(|plan| plan.shared_monitor)
+        {
+            self.fullscreen = Some(false);
+            self.apply_plan();
+        }
+        if let Some(editor) = self.editor.as_mut() {
+            editor.bring_to_front();
+            editor.request_paint(Instant::now());
+        }
+    }
+
+    /// Create the stage window for the current plan, if there is anything to present on.
     fn create_stage(&mut self, event_loop: &ActiveEventLoop) {
-        self.refresh_monitors(event_loop);
-        let placement = monitor_choice(&self.monitor_list);
-        self.placement = Some(placement);
-        self.log(stage_placement_label(placement, &self.monitor_list));
-        let Some(index) = placement.monitor() else {
+        let Some(plan) = self.plan else {
+            self.send(Command::DetachSurface);
+            return;
+        };
+        self.log(stage_label(plan.stage, &self.monitor_list));
+        let Some(monitor) = plan.stage.monitor().and_then(|index| self.monitor(index)) else {
             // No monitor at all: leave the stage absent and keep the show running.
             self.send(Command::DetachSurface);
             return;
         };
-        let Some(monitor) = self.monitor(index) else {
-            self.send(Command::DetachSurface);
-            return;
-        };
-        let size = monitor.size();
-        let mut attributes = Window::default_attributes()
-            .with_title("ilanaVisual stage")
-            .with_decorations(false)
+        let attributes = Window::default_attributes()
+            .with_title("ilanaVisual - stage (F11 fullscreen, Esc back to the controls)")
             .with_visible(true);
-        if placement.is_fullscreen() {
-            attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
-        } else {
-            attributes = attributes
-                .with_inner_size(size)
-                .with_position(monitor.position());
-        }
+        let attributes = match plan.stage {
+            StageWindow::Fullscreen { .. } => attributes
+                .with_decorations(false)
+                .with_fullscreen(Some(Fullscreen::Borderless(Some(monitor)))),
+            StageWindow::Windowed { area, .. } => {
+                let origin = monitor.position();
+                attributes
+                    .with_decorations(true)
+                    .with_inner_size(PhysicalSize::new(area.width, area.height))
+                    .with_position(PhysicalPosition::new(origin.x + area.x, origin.y + area.y))
+            }
+            StageWindow::Hidden => attributes,
+        };
         match event_loop.create_window(attributes) {
             Ok(window) => {
                 self.stage_window = Some(window);
@@ -858,7 +1115,7 @@ impl Shell {
         self.send(Command::ReplaceSurface {
             handle,
             size: (size.width.max(1), size.height.max(1)),
-            monitor: self.placement.and_then(StagePlacement::monitor),
+            monitor: self.plan.and_then(|plan| plan.stage.monitor()),
         });
     }
 
@@ -879,7 +1136,7 @@ impl Shell {
         };
         let (tx, rx) = channel();
         let project = self.model.project().clone();
-        let monitor = self.placement.and_then(StagePlacement::monitor);
+        let monitor = self.plan.and_then(|plan| plan.stage.monitor());
         let proxy = self.proxy.clone();
         let fps = self.fps;
         match std::thread::Builder::new()
@@ -897,34 +1154,45 @@ impl Shell {
         }
     }
 
-    /// Move the stage window to wherever `monitor_choice` now says it goes.
-    fn update_stage_placement(&mut self, event_loop: &ActiveEventLoop) {
-        let placement = monitor_choice(&self.monitor_list);
-        if Some(placement) == self.placement {
+    /// Work out where the windows go now and move the stage there if that changed.
+    fn apply_plan(&mut self) {
+        let plan = window_plan(&self.monitor_list, self.fullscreen);
+        let previous = self.plan.replace(plan);
+        if previous.map(|plan| plan.stage) == Some(plan.stage) {
             return;
         }
-        self.placement = Some(placement);
-
-        if placement.is_hidden() {
-            if let Some(window) = self.stage_window.as_ref() {
+        let Some(window) = self.stage_window.as_ref() else {
+            return;
+        };
+        self.log(stage_label(plan.stage, &self.monitor_list));
+        match plan.stage {
+            StageWindow::Hidden => {
                 window.set_visible(false);
+                self.send(Command::DetachSurface);
+                return;
             }
-            self.send(Command::DetachSurface);
-            return;
-        }
-        if self.stage_window.is_none() {
-            self.create_stage(event_loop);
-            return;
-        }
-        let Some(index) = placement.monitor() else {
-            return;
-        };
-        let Some(monitor) = self.monitor(index) else {
-            return;
-        };
-        self.log(stage_placement_label(placement, &self.monitor_list));
-        if let Some(window) = self.stage_window.as_ref() {
-            apply_stage_placement(window, placement, &monitor);
+            StageWindow::Fullscreen { monitor } => {
+                let Some(monitor) = self.monitor(monitor) else {
+                    return;
+                };
+                window.set_visible(true);
+                window.set_decorations(false);
+                window.set_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
+            }
+            StageWindow::Windowed { monitor, area } => {
+                let Some(monitor) = self.monitor(monitor) else {
+                    return;
+                };
+                let origin = monitor.position();
+                window.set_visible(true);
+                window.set_fullscreen(None);
+                window.set_decorations(true);
+                window.set_outer_position(PhysicalPosition::new(
+                    origin.x + area.x,
+                    origin.y + area.y,
+                ));
+                let _ = window.request_inner_size(PhysicalSize::new(area.width, area.height));
+            }
         }
         self.send_replace_surface();
     }
@@ -943,21 +1211,25 @@ impl Shell {
     }
 }
 
-/// Put the stage window where `placement` says it belongs.
-fn apply_stage_placement(window: &Window, placement: StagePlacement, monitor: &MonitorHandle) {
-    match placement {
-        StagePlacement::Fullscreen(_) => {
-            window.set_visible(true);
-            window.set_fullscreen(Some(Fullscreen::Borderless(Some(monitor.clone()))));
+/// Where the stage is, for the log.
+fn stage_label(stage: StageWindow, monitors: &[MonitorInfo]) -> String {
+    let name_of = |index: u32| {
+        monitors
+            .iter()
+            .find(|monitor| monitor.index == index)
+            .map_or_else(|| "monitor".to_string(), |monitor| monitor.name.clone())
+    };
+    match stage {
+        StageWindow::Fullscreen { monitor } => {
+            format!("stage on {} (fullscreen; F11 or Esc leaves it)", name_of(monitor))
         }
-        StagePlacement::Laptop(_) => {
-            window.set_visible(true);
-            window.set_fullscreen(None);
-            window.set_decorations(false);
-            window.set_outer_position(monitor.position());
-            let _ = window.request_inner_size(monitor.size());
-        }
-        StagePlacement::Hidden => window.set_visible(false),
+        StageWindow::Windowed { monitor, area } => format!(
+            "stage on {} (window {}x{} beside the controls; F11 for fullscreen)",
+            name_of(monitor),
+            area.width,
+            area.height
+        ),
+        StageWindow::Hidden => "stage hidden (no monitor)".to_string(),
     }
 }
 
@@ -965,6 +1237,38 @@ fn apply_stage_placement(window: &Window, placement: StagePlacement, monitor: &M
 /// agree on the name, size and position (all the OS tells us).
 fn same_monitor(a: &MonitorHandle, b: &MonitorHandle) -> bool {
     a.name() == b.name() && a.size() == b.size() && a.position() == b.position()
+}
+
+/// Where the recent-projects list is kept: `%APPDATA%\ilanaVisual\recent.txt`, one path a line.
+fn recent_file() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(std::path::PathBuf::from(base).join("ilanaVisual").join("recent.txt"))
+}
+
+fn read_recent() -> Vec<String> {
+    let Some(path) = recent_file() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut recent = Vec::new();
+    // The file is newest first; `push_recent` puts each path first, so feed it oldest first.
+    for line in text.lines().rev() {
+        crate::editor::ui::push_recent(&mut recent, line);
+    }
+    recent
+}
+
+/// Best effort: a list that cannot be written is not worth a line during a rehearsal.
+fn write_recent(recent: &[String]) {
+    let Some(path) = recent_file() else {
+        return;
+    };
+    if let Some(folder) = path.parent() {
+        let _ = std::fs::create_dir_all(folder);
+    }
+    let _ = std::fs::write(path, recent.join("\n"));
 }
 
 impl ApplicationHandler<UserEvent> for Shell {
@@ -986,9 +1290,14 @@ impl ApplicationHandler<UserEvent> for Shell {
             )
         });
         self.refresh_monitors(event_loop);
+        self.plan = Some(window_plan(&self.monitor_list, self.fullscreen));
         self.create_control_window(event_loop);
         self.create_stage(event_loop);
         self.start_render();
+        // The stage was created last and took the focus: the performer works in the controls.
+        if let Some(editor) = self.editor.as_ref() {
+            editor.bring_to_front();
+        }
         self.next_monitor_check = Some(Instant::now() + MONITOR_CHECK);
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + MONITOR_CHECK));
     }
@@ -1006,13 +1315,12 @@ impl ApplicationHandler<UserEvent> for Shell {
             == Some(window_id);
         let is_stage = self.stage_window.as_ref().map(Window::id) == Some(window_id);
 
-        // The editor sees its own events first: a keystroke it used (a path, a name) must not also
-        // be read as a mode shortcut.
-        let mut consumed = false;
+        // The control window's keys, clicks and scrolls all go to egui: every shortcut is handled
+        // in `editor::ui`, where a key typed into a text field is known not to be one.
         if is_control
             && let Some(editor) = self.editor.as_mut()
         {
-            consumed = editor.on_window_event(&event);
+            editor.on_window_event(&event);
         }
 
         match event {
@@ -1028,26 +1336,16 @@ impl ApplicationHandler<UserEvent> for Shell {
                     KeyEvent {
                         logical_key,
                         state: ElementState::Pressed,
+                        repeat: false,
                         ..
                     },
                 ..
-            } => {
-                if !is_control || consumed {
-                    return;
-                }
+            } if is_stage => {
+                // The stage has the keyboard when it is fullscreen over the controls: these two
+                // keys are the way back.
                 match logical_key {
-                    Key::Named(NamedKey::Escape) => event_loop.exit(),
-                    // Mode keys, for rehearsing with the editor window closed. The Project screen
-                    // is the real control; these stay because they work with the window hidden.
-                    Key::Character(key) if key.as_str() == "1" => {
-                        self.send(Command::SetMode(ShowMode::Arrangement))
-                    }
-                    Key::Character(key) if key.as_str() == "2" => {
-                        self.send(Command::SetMode(ShowMode::Session))
-                    }
-                    Key::Character(key) if key.as_str() == "3" => {
-                        self.send(Command::SetMode(ShowMode::Autopilot))
-                    }
+                    Key::Named(NamedKey::Escape) => self.back_to_controls(),
+                    Key::Named(NamedKey::F11) => self.toggle_fullscreen(),
                     _ => {}
                 }
             }
@@ -1055,14 +1353,18 @@ impl ApplicationHandler<UserEvent> for Shell {
                 if is_stage && size.width > 0 && size.height > 0 {
                     self.send(Command::Resize(size.width, size.height));
                 }
+                if is_control {
+                    // Minimised or restored: the preview follows the window.
+                    self.sync_preview();
+                }
             }
             WindowEvent::Destroyed => {
                 if is_stage {
                     self.stage_window = None;
-                    self.placement = None;
                     self.send(Command::DetachSurface);
                 } else if is_control {
                     self.editor = None;
+                    self.send(Command::SetPreview(false));
                 }
             }
             _ => {}
@@ -1072,9 +1374,9 @@ impl ApplicationHandler<UserEvent> for Shell {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Status(status) => {
-                // The status strip is part of the control window: a changed number is a reason to
-                // paint it, an unchanged one is not, and it is throttled to four times a second so
-                // a running show does not repaint the editor ten times a second for a bar phase.
+                // The top bar is part of the control window: a changed number is a reason to
+                // paint it, an unchanged one is not, and it is throttled so a running show paints
+                // the window ten times a second for its playhead, not sixty.
                 let changed = self.model.set_status(status);
                 let due = self
                     .last_status_paint
@@ -1086,26 +1388,24 @@ impl ApplicationHandler<UserEvent> for Shell {
                     editor.request_paint(Instant::now());
                     self.last_status_paint = Some(Instant::now());
                 }
-                let Some(title) = title_for(self.title.as_deref(), &status) else {
-                    return;
-                };
-                let due = self
-                    .last_title_at
-                    .is_none_or(|at| at.elapsed() >= TITLE_INTERVAL);
-                if !due {
-                    return;
+            }
+            UserEvent::Preview(picture) => {
+                if let Some(editor) = self.editor.as_mut() {
+                    self.editor_ui.set_preview(editor.ctx(), picture);
+                    editor.request_paint(Instant::now());
                 }
-                if let Some(editor) = self.editor.as_ref() {
-                    editor.window().set_title(&title);
+            }
+            UserEvent::Thumb { key, picture } => {
+                if let Some(editor) = self.editor.as_mut() {
+                    self.editor_ui.thumbs.deliver(editor.ctx(), key, picture);
+                    editor.request_paint(Instant::now());
                 }
-                self.title = Some(title);
-                self.last_title_at = Some(Instant::now());
             }
             UserEvent::SurfaceLost => {
                 // The stage's surface went away (a monitor was unplugged): re-place the window
                 // where the monitors now say it goes, and rebuild the surface on its handle.
                 self.refresh_monitors(event_loop);
-                self.update_stage_placement(event_loop);
+                self.apply_plan();
                 self.send_replace_surface();
             }
             UserEvent::Note(text) => self.log(text),
@@ -1117,12 +1417,16 @@ impl ApplicationHandler<UserEvent> for Shell {
         if self.next_monitor_check.is_none_or(|at| now >= at) {
             self.next_monitor_check = Some(now + MONITOR_CHECK);
             self.refresh_monitors(event_loop);
-            self.update_stage_placement(event_loop);
-            if self.stage_window.is_none() && !self.placement.is_some_and(StagePlacement::is_hidden) {
+            self.apply_plan();
+            let hidden = self
+                .plan
+                .is_some_and(|plan| plan.stage == StageWindow::Hidden);
+            if self.stage_window.is_none() && !hidden {
                 // A monitor came back after the stage had no window at all.
                 self.create_stage(event_loop);
                 self.send_replace_surface();
             }
+            self.sync_preview();
         }
         // The control window paints on change only, so an idle app sleeps until the next monitor
         // check (or the next frame the editor asked for).
@@ -1141,12 +1445,13 @@ impl ApplicationHandler<UserEvent> for Shell {
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (path, fps) = parse_args(&args);
-    let (project, note) = match path.as_deref() {
-        None => (default_project(), None),
-        Some(path) => match mosh_show::io::load(path) {
-            Ok(project) => (project, None),
+    let (project, path, note) = match path {
+        None => (default_project(), None, None),
+        Some(path) => match mosh_show::io::load(&path) {
+            Ok(project) => (project, Some(path), None),
             Err(error) => (
                 default_project(),
+                None,
                 Some(format!(
                     "project {path} could not be read ({error}); running the default show"
                 )),
@@ -1157,7 +1462,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
-    let mut shell = Shell::new(project, note, proxy, fps);
+    let mut shell = Shell::new(project, path, note, proxy, fps);
     event_loop.run_app(&mut shell)?;
     shell.shutdown();
     Ok(())
