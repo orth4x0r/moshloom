@@ -8,3 +8,16 @@ publish.workspace = true
 
 [dependencies]
 mosh-core = { path = "../mosh-core" }
+ash = "0.38"
+raw-window-handle = "0.6"
+
+[build-dependencies]
+# The crate's own shaders (fullscreen vertex, compositor) stay WGSL, like the web app and
+# mosh-shaders: build.rs turns them into SPIR-V words at build time.
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
+
+[dev-dependencies]
+# Test shaders are WGSL too, compiled in the test.
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
+# Test files drive `SwapchainPolicy` with real `vk::Result` values.
+ash = "0.38"
