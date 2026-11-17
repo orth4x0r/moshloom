@@ -10,6 +10,7 @@ publish.workspace = true
 mosh-core = { path = "../mosh-core" }
 mosh-render = { path = "../mosh-render" }
 mosh-shaders = { path = "../mosh-shaders" }
+mosh-video = { path = "../mosh-video" }
 
 [dev-dependencies]
 # Test fixtures are WGSL too, compiled in the test (frozen patterns, solid colours).

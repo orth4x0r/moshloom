@@ -1486,6 +1486,7 @@ dependencies = [
  "mosh-core",
  "mosh-render",
  "mosh-shaders",
+ "mosh-video",
  "naga",
 ]
 
