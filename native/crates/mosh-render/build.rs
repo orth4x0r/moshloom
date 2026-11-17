@@ -19,6 +19,8 @@ const SHADERS: &[(&str, &str)] = &[
         "compositor_stack_masked.frag.wgsl",
         "COMPOSITOR_STACK_MASKED_FRAG",
     ),
+    // HAP (block-compressed) overlay video: YCoCg, straight or separate alpha (O-hap).
+    ("overlay_hap.frag.wgsl", "OVERLAY_HAP_FRAG"),
 ];
 
 fn compile(path: &Path) -> Vec<u32> {

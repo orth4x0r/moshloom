@@ -8,6 +8,13 @@ publish.workspace = true
 
 [dependencies]
 mosh-core = { path = "../mosh-core" }
+# HAP sections are Snappy-compressed (the VJ standard's second-stage compressor).
+snap = "1.1.2"
+
+# The tests build their own HAP samples and `.mov` files, so they need an encoder too: there is
+# no HAP encoder on the reference machine and media is never downloaded.
+[dev-dependencies]
+snap = "1.1.2"
 
 # Media Foundation source reader (Task 1.11). Every call lives in `src/win.rs`.
 [target.'cfg(windows)'.dependencies]

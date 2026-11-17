@@ -40,6 +40,18 @@ impl DescriptorLayouts {
         uniform_size: usize,
         textures: u32,
     ) -> Result<DescriptorLayouts, RenderError> {
+        DescriptorLayouts::with_sampler(gpu, uniform_size, textures, gpu.sampler)
+    }
+
+    /// The same layout with a specific immutable sampler. Block-compressed textures are not
+    /// required to support linear filtering, so a HAP pipeline asks for the one the device can
+    /// actually use (`Gpu::supports_linear_filter`).
+    pub(crate) fn with_sampler(
+        gpu: &Gpu,
+        uniform_size: usize,
+        textures: u32,
+        sampler: vk::Sampler,
+    ) -> Result<DescriptorLayouts, RenderError> {
         let uniform_range = (uniform_size as u64).max(16);
         if uniform_range > MAX_UNIFORM_BYTES {
             return Err(RenderError::UniformTooLarge {
@@ -56,7 +68,7 @@ impl DescriptorLayouts {
                 .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
         );
         // The layer sampler is immutable, so a descriptor write only carries the image.
-        let immutable_samplers = [gpu.sampler];
+        let immutable_samplers = [sampler];
         for index in 0..textures {
             bindings.push(
                 vk::DescriptorSetLayoutBinding::default()
@@ -179,6 +191,36 @@ impl Pipeline {
     ) -> Result<Pipeline, RenderError> {
         let layouts = Arc::new(DescriptorLayouts::new(gpu, uniform_size, textures)?);
         Pipeline::with_layouts(gpu, &layouts, frag_spirv, color_format, None, "pipeline")
+    }
+
+    /// A pipeline whose sampled inputs are read with `filter`: `LINEAR` for ordinary formats,
+    /// `NEAREST` for a block-compressed one on a device that does not report
+    /// `SAMPLED_IMAGE_FILTER_LINEAR` for it (HAP video: `mosh_render::upload::HapCoverPass`).
+    pub fn fullscreen_with_filter(
+        gpu: &Gpu,
+        frag_spirv: &[u32],
+        uniform_size: usize,
+        textures: u32,
+        filter: vk::Filter,
+    ) -> Result<Pipeline, RenderError> {
+        let sampler = match filter {
+            vk::Filter::NEAREST => gpu.nearest_sampler,
+            _ => gpu.sampler,
+        };
+        let layouts = Arc::new(DescriptorLayouts::with_sampler(
+            gpu,
+            uniform_size,
+            textures,
+            sampler,
+        )?);
+        Pipeline::with_layouts(
+            gpu,
+            &layouts,
+            frag_spirv,
+            OFFSCREEN_FORMAT,
+            None,
+            "pipeline",
+        )
     }
 
     /// Builds a pipeline whose colour attachment has `color_format` (the stage's swapchain
@@ -460,6 +502,25 @@ impl<'a> FrameRecorder<'a> {
             });
         }
         self.pass(pipeline, target, uniforms, &[video.view()])
+    }
+
+    /// A pass that samples two [`VideoTexture`]s: HAP Alpha's colour plane plus its separate BC4
+    /// alpha plane (`upload::HapCoverPass`). `pipeline` declares exactly two sampled inputs.
+    pub fn draw_video_pair(
+        &mut self,
+        pipeline: &Pipeline,
+        target: &LayerTarget,
+        uniforms: &[u8],
+        color: &VideoTexture,
+        alpha: &VideoTexture,
+    ) -> Result<(), RenderError> {
+        if pipeline.layouts.textures != 2 {
+            return Err(RenderError::InputCountMismatch {
+                expected: pipeline.layouts.textures,
+                got: 2,
+            });
+        }
+        self.pass(pipeline, target, uniforms, &[color.view(), alpha.view()])
     }
 
     /// Records `video`'s pending CPU frame into this frame: its staging buffer to its image, left
