@@ -14,10 +14,12 @@ use std::sync::Arc;
 use ash::vk;
 use mosh_core::show::BlendMode;
 
-use crate::device::{Gpu, FRAMES_IN_FLIGHT, MAX_DRAWS_PER_FRAME, MAX_UNIFORM_BYTES};
-use crate::target::{cmd_barrier, to_color_attachment, to_shader_read, LayerTarget, OFFSCREEN_FORMAT};
-use crate::timing::{FrameTicket, GpuTimings};
 use crate::RenderError;
+use crate::device::{FRAMES_IN_FLIGHT, Gpu, MAX_DRAWS_PER_FRAME, MAX_UNIFORM_BYTES};
+use crate::target::{
+    LayerTarget, OFFSCREEN_FORMAT, cmd_barrier, to_color_attachment, to_shader_read,
+};
+use crate::timing::{FrameTicket, GpuTimings};
 
 /// The descriptor set layout and pipeline layout a family of pipelines shares. Sharing one
 /// object (instead of creating five identical ones for the compositor) keeps the descriptor
@@ -162,13 +164,7 @@ impl Pipeline {
         uniform_size: usize,
         textures: u32,
     ) -> Result<Pipeline, RenderError> {
-        Pipeline::fullscreen_with_format(
-            gpu,
-            frag_spirv,
-            uniform_size,
-            textures,
-            OFFSCREEN_FORMAT,
-        )
+        Pipeline::fullscreen_with_format(gpu, frag_spirv, uniform_size, textures, OFFSCREEN_FORMAT)
     }
 
     /// `Pipeline::fullscreen` for a specific colour attachment format (a swapchain's).
@@ -180,14 +176,7 @@ impl Pipeline {
         color_format: vk::Format,
     ) -> Result<Pipeline, RenderError> {
         let layouts = Arc::new(DescriptorLayouts::new(gpu, uniform_size, textures)?);
-        Pipeline::with_layouts(
-            gpu,
-            &layouts,
-            frag_spirv,
-            color_format,
-            None,
-            "pipeline",
-        )
+        Pipeline::with_layouts(gpu, &layouts, frag_spirv, color_format, None, "pipeline")
     }
 
     /// Builds a pipeline whose colour attachment has `color_format` (the stage's swapchain
@@ -208,6 +197,10 @@ impl Pipeline {
                 return Err(error);
             }
         };
+        // The fragment entry point is whatever the module declares: the crate's own shaders say
+        // `fs_main`, the web app's extracted modules say `fs`.
+        let fragment_entry =
+            fragment_entry_point(frag_spirv).unwrap_or_else(|| std::ffi::CString::from(c"fs_main"));
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -216,7 +209,7 @@ impl Pipeline {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(fragment)
-                .name(c"fs_main"),
+                .name(&fragment_entry),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
@@ -229,8 +222,8 @@ impl Pipeline {
             .cull_mode(vk::CullModeFlags::NONE)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
-        let multisample =
-            vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
         let attachment = match blend {
             Some(blend) => vk::PipelineColorBlendAttachmentState::default()
@@ -279,7 +272,9 @@ impl Pipeline {
             gpu.dev.destroy_shader_module(fragment, None);
         }
         let handle = match created {
-            Ok(mut pipelines) => pipelines.pop().ok_or(RenderError::MissingFeature("pipeline"))?,
+            Ok(mut pipelines) => pipelines
+                .pop()
+                .ok_or(RenderError::MissingFeature("pipeline"))?,
             Err((_, error)) => return Err(RenderError::Vulkan(error)),
         };
         Ok(Pipeline {
@@ -360,7 +355,13 @@ impl<'a> FrameRecorder<'a> {
             let slot = frames.next_slot;
             frames.next_slot = (slot + 1) % FRAMES_IN_FLIGHT;
             let frame = &frames.slots[slot];
-            (slot, frame.pool, frame.cmd, frame.query_pool, frame.last_value)
+            (
+                slot,
+                frame.pool,
+                frame.cmd,
+                frame.query_pool,
+                frame.last_value,
+            )
         };
         if last_value > 0 {
             crate::timing::wait_timeline(gpu, last_value).expect("wait for frame slot");
@@ -375,7 +376,8 @@ impl<'a> FrameRecorder<'a> {
                     vk::DescriptorPoolResetFlags::empty(),
                 )
                 .expect("reset frame descriptor pool");
-            gpu.dev.reset_query_pool(query_pool, 0, 2 * MAX_DRAWS_PER_FRAME as u32);
+            gpu.dev
+                .reset_query_pool(query_pool, 0, 2 * MAX_DRAWS_PER_FRAME as u32);
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             gpu.dev
@@ -442,7 +444,8 @@ impl<'a> FrameRecorder<'a> {
 
         // Uniform ring: this frame's slot, this draw's slice of it.
         let stride = self.gpu.uniform_stride;
-        let offset = (self.slot as u64 * MAX_DRAWS_PER_FRAME as u64 + u64::from(self.draws)) * stride;
+        let offset =
+            (self.slot as u64 * MAX_DRAWS_PER_FRAME as u64 + u64::from(self.draws)) * stride;
         unsafe {
             let ring = &self.gpu.uniform_ring;
             ring.zero(offset, range);
@@ -546,9 +549,7 @@ impl<'a> FrameRecorder<'a> {
                 .render_area(extent)
                 .layer_count(1)
                 .color_attachments(&attachments);
-            self.gpu
-                .dev
-                .cmd_begin_rendering(self.cmd, &rendering);
+            self.gpu.dev.cmd_begin_rendering(self.cmd, &rendering);
             self.gpu.dev.cmd_bind_pipeline(
                 self.cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -649,5 +650,62 @@ impl Gpu {
             return GpuTimings::default();
         }
         crate::timing::read(self, &ticket)
+    }
+}
+
+/// The name of the first fragment-stage `OpEntryPoint` in a SPIR-V module, if any.
+pub(crate) fn fragment_entry_point(words: &[u32]) -> Option<std::ffi::CString> {
+    const OP_ENTRY_POINT: u32 = 15;
+    const EXECUTION_MODEL_FRAGMENT: u32 = 4;
+    let mut at = 5; // the SPIR-V header is five words
+    while at < words.len() {
+        let count = (words[at] >> 16) as usize;
+        let opcode = words[at] & 0xffff;
+        if count == 0 || at + count > words.len() {
+            return None;
+        }
+        if opcode == OP_ENTRY_POINT && count >= 4 && words[at + 1] == EXECUTION_MODEL_FRAGMENT {
+            let mut bytes = Vec::new();
+            'name: for word in &words[at + 3..at + count] {
+                for byte in word.to_le_bytes() {
+                    if byte == 0 {
+                        break 'name;
+                    }
+                    bytes.push(byte);
+                }
+            }
+            return std::ffi::CString::new(bytes).ok();
+        }
+        at += count;
+    }
+    None
+}
+
+#[cfg(test)]
+mod entry_point_tests {
+    use super::fragment_entry_point;
+
+    fn spirv(src: &str) -> Vec<u32> {
+        let module = naga::front::wgsl::parse_str(src).unwrap();
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        naga::back::spv::write_vec(&module, &info, &naga::back::spv::Options::default(), None)
+            .unwrap()
+    }
+
+    #[test]
+    fn reads_fs_and_fs_main() {
+        let fs = spirv("@fragment fn fs() -> @location(0) vec4f { return vec4f(1.0); }");
+        let fs_main = spirv("@fragment fn fs_main() -> @location(0) vec4f { return vec4f(1.0); }");
+        assert_eq!(fragment_entry_point(&fs).unwrap().to_str().unwrap(), "fs");
+        assert_eq!(
+            fragment_entry_point(&fs_main).unwrap().to_str().unwrap(),
+            "fs_main"
+        );
+        assert_eq!(fragment_entry_point(&[]), None);
     }
 }
