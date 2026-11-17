@@ -8,3 +8,5 @@ publish.workspace = true
 
 [dependencies]
 mosh-core = { path = "../mosh-core" }
+rand_pcg = "0.10.2"
+ron = "0.12.3"
