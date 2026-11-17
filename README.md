@@ -424,7 +424,7 @@ interfaces and tests: `docs/superpowers/plans/2026-11-17-native-port.md`.
 | `mosh-shaders` | the web app's WGSL (34 modules) compiled to SPIR-V; the layer uniform layout |
 | `mosh-render` | Vulkan core (ash): device on the integrated GPU, targets, pipelines, compositor, swapchain, flash limiter |
 | `mosh-visuals` | one layer = scene / fluid / video -> datamosh -> effects (one pass) -> transition; all five stages in |
-| `mosh-app` | the app, `ilanaVisual.exe`: control window with editors (Session grid, Arrangement timeline with Live-set import, Clip editor with ranges per intensity level, Presets, Project open/save) on its own OpenGL context with egui, painted only on change at <= 30 fps; edits reach the running show at the next bar; input fallback (plugin -> loopback after 2 s), Autopilot by default, stage + control windows, budgets, self-recovery; `mosh-feed` streams a file into shared memory as the Tap plugin would |
+| `mosh-app` | the app, `ilanaVisual.exe`. Control window (UI by Fable, #52, design notes and pictures in `docs/ui/README.md`): Ableton-style, `Tab` switches Arrangement (timeline, song markers, lanes, clip blocks with thumbnails, playhead following Live) and Session (clip grid, scene launch, stop); top bar (source, BPM, bar.beat, show mode Follow/Manual/Autopilot with `M`, intensity meter, event lamps, stage preview `P`); browser (every visualizer from the catalog, presets); clip detail panel (`Shift+Tab`); layer kind/blend/opacity per lane; undo/redo; `?` shortcuts; APC mini LEDs. On one screen the stage opens beside the controls (`F11` fullscreen, `Esc` back); with a second monitor it goes fullscreen there. Own OpenGL context with egui, painted only on change at <= 30 fps; edits reach the running show at the next bar; input fallback (plugin -> loopback after 2 s), Autopilot by default, stage + control windows, budgets, self-recovery; `mosh-feed` streams a file into shared memory as the Tap plugin would |
 
 ### Build and test
 
@@ -462,7 +462,8 @@ number — it is the same work minus presentation.
 | what | number |
 | --- | --- |
 | **Ableton -> app** (Live 12, Tap on the master, by the performer) | works: the app switches to plugin mode and follows the set |
-| control window idle frame (egui layout + tessellation, release, no paint) | Session 0.047 ms, Clip editor 0.338 ms |
+| control window frame (Fable's UI, release, 1280x800, browser + detail open) | 1.0-1.4 ms best of 5 (1.6-3.2 ms on a busy machine), only on change; idle: no repaint |
+| **first windowed run of Fable's UI** (stress project, one screen) | works: both views, browser, detail panel, stage beside the controls; to fix (sent back): control window taller than the screen, opacity controls cut off with 4 layers, a 176 ms render-thread hitch at start (all thumbnails at once), preview readback 5-7 ms per capture |
 | **stress project**, `mosh-budget`, offscreen release, **1920x1080 output, 960x540 layers**, 300 frames | **GPU median 4.82 ms, p95 6.05 ms** (steady frames: median 4.79, p95 4.99; 2-beat 4-layer crossfade frames: median 6.02, max 6.23) against a 6 ms budget; render-thread CPU (recording + overlay upload) median 0.82 ms; 132 MB of targets and textures |
 | **stress project**, same bench at **2560x1600** (the laptop panel, 1280x800 layers) | GPU median 9.15 ms, p95 11.57 ms (steady 8.84 / 9.99; crossfade 10.56); CPU median 1.30 ms; 232 MB |
 | **stress project windowed on the laptop panel after V-budget** (2560x1600, 60 fps cap, release, on AC at 100%, display on) | GPU 7.2-8.5 ms per frame (one 11.8 ms sample), render thread 0.34-0.74 ms, process 8.7% of one core, 460-463 MB working set |
