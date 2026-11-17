@@ -17,9 +17,11 @@ use mosh_core::show::BlendMode;
 use crate::RenderError;
 use crate::device::{FRAMES_IN_FLIGHT, Gpu, MAX_DRAWS_PER_FRAME, MAX_UNIFORM_BYTES};
 use crate::target::{
-    LayerTarget, OFFSCREEN_FORMAT, cmd_barrier, to_color_attachment, to_shader_read,
+    Barrier, LayerTarget, OFFSCREEN_FORMAT, cmd_barrier, from_transfer_write, to_color_attachment,
+    to_shader_read, to_transfer_dst,
 };
 use crate::timing::{FrameTicket, GpuTimings};
+use crate::upload::VideoTexture;
 
 /// The descriptor set layout and pipeline layout a family of pipelines shares. Sharing one
 /// object (instead of creating five identical ones for the compositor) keeps the descriptor
@@ -422,17 +424,197 @@ impl<'a> FrameRecorder<'a> {
         uniforms: &[u8],
         inputs: &[&LayerTarget],
     ) -> Result<(), RenderError> {
-        if self.finished {
-            return Err(RenderError::FrameFinished);
-        }
-        if self.draws as usize >= MAX_DRAWS_PER_FRAME {
-            return Err(RenderError::TooManyDraws);
-        }
         if inputs.len() != pipeline.layouts.textures as usize {
             return Err(RenderError::InputCountMismatch {
                 expected: pipeline.layouts.textures,
                 got: inputs.len() as u32,
             });
+        }
+        // Inputs must be readable; the invariant is that they already are, but a target that was
+        // written earlier in this frame is explicitly moved back by its own pass.
+        for input in inputs {
+            debug_assert_eq!(
+                input.front_layout(),
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                "layer target must be readable when sampled"
+            );
+        }
+        let views: Vec<vk::ImageView> = inputs.iter().map(|input| input.front_view()).collect();
+        self.pass(pipeline, target, uniforms, &views)
+    }
+
+    /// One pass that samples a [`VideoTexture`] instead of layer targets: this is how an overlay
+    /// layer's cover pass joins the frame (`upload::CoverPass::record`). `pipeline` declares
+    /// exactly one sampled input.
+    pub fn draw_video(
+        &mut self,
+        pipeline: &Pipeline,
+        target: &LayerTarget,
+        uniforms: &[u8],
+        video: &VideoTexture,
+    ) -> Result<(), RenderError> {
+        if pipeline.layouts.textures != 1 {
+            return Err(RenderError::InputCountMismatch {
+                expected: pipeline.layouts.textures,
+                got: 1,
+            });
+        }
+        self.pass(pipeline, target, uniforms, &[video.view()])
+    }
+
+    /// Records `video`'s pending CPU frame into this frame: its staging buffer to its image, left
+    /// readable for [`Self::draw_video`].
+    ///
+    /// No submission and no fence wait: the copy is part of the frame's command buffer, which is
+    /// what the staging buffer per frame in flight is for (`upload::VideoTexture`). Does nothing
+    /// when no frame is pending; timed as the `overlay.upload` pass.
+    pub fn upload_video(&mut self, video: &mut VideoTexture) -> Result<(), RenderError> {
+        if self.finished {
+            return Err(RenderError::FrameFinished);
+        }
+        let Some(staging) = video.pending_staging() else {
+            return Ok(());
+        };
+        if self.draws as usize >= MAX_DRAWS_PER_FRAME {
+            return Err(RenderError::TooManyDraws);
+        }
+        if staging != self.slot {
+            // The pending bytes went into another frame slot's staging buffer (a recorder was
+            // created and dropped between `upload` and this call). Wait for whatever that slot
+            // last submitted before a copy reads those bytes.
+            crate::timing::wait_timeline(self.gpu, self.gpu.slot_last_value(staging))?;
+        }
+        let (width, height) = (video.width(), video.height());
+        let image = video.image();
+        let old_layout = video.image_layout();
+        let staging_buffer = video.staging_buffer(staging);
+        let query = self.draws * 2;
+        self.draws += 1;
+        self.names.push("overlay.upload".to_string());
+        unsafe {
+            self.write_timestamp(query, vk::PipelineStageFlags::TOP_OF_PIPE);
+            // Staging buffer -> video image, then readable by the cover pass below.
+            cmd_barrier(
+                &self.gpu.dev,
+                self.cmd,
+                image,
+                Barrier {
+                    old_layout,
+                    new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    src_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    src_access: vk::AccessFlags::SHADER_READ,
+                    dst_stage: vk::PipelineStageFlags::TRANSFER,
+                    dst_access: vk::AccessFlags::TRANSFER_WRITE,
+                },
+            );
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+            self.gpu.dev.cmd_copy_buffer_to_image(
+                self.cmd,
+                staging_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+            cmd_barrier(
+                &self.gpu.dev,
+                self.cmd,
+                image,
+                Barrier {
+                    old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    src_stage: vk::PipelineStageFlags::TRANSFER,
+                    src_access: vk::AccessFlags::TRANSFER_WRITE,
+                    dst_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    dst_access: vk::AccessFlags::SHADER_READ,
+                },
+            );
+            self.write_timestamp(query + 1, vk::PipelineStageFlags::BOTTOM_OF_PIPE);
+        }
+        video.mark_copied();
+        Ok(())
+    }
+
+    /// Records a clear of `target`'s back image to transparent black and swaps it, inside this
+    /// frame and with no submission: a layer with no picture this frame is black instead of last
+    /// frame's picture.
+    pub fn clear(&mut self, target: &LayerTarget) -> Result<(), RenderError> {
+        if self.finished {
+            return Err(RenderError::FrameFinished);
+        }
+        unsafe {
+            cmd_barrier(
+                &self.gpu.dev,
+                self.cmd,
+                target.back_image(),
+                to_transfer_dst(),
+            );
+            let clear = vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 0.0],
+            };
+            let range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1);
+            self.gpu.dev.cmd_clear_color_image(
+                self.cmd,
+                target.back_image(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &clear,
+                &[range],
+            );
+            cmd_barrier(
+                &self.gpu.dev,
+                self.cmd,
+                target.back_image(),
+                from_transfer_write(),
+            );
+        }
+        target.set_back_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        target.swap();
+        Ok(())
+    }
+
+    /// Writes one timestamp of this frame's query pair for pass `draws`.
+    fn write_timestamp(&self, query: u32, stage: vk::PipelineStageFlags) {
+        let query_pool = self.gpu.frames.borrow().slots[self.slot].query_pool;
+        unsafe {
+            self.gpu
+                .dev
+                .cmd_write_timestamp(self.cmd, stage, query_pool, query);
+        }
+    }
+
+    /// The shared body of `draw` and `draw_video`: one pass from resolved image views.
+    fn pass(
+        &mut self,
+        pipeline: &Pipeline,
+        target: &LayerTarget,
+        uniforms: &[u8],
+        views: &[vk::ImageView],
+    ) -> Result<(), RenderError> {
+        if self.finished {
+            return Err(RenderError::FrameFinished);
+        }
+        if self.draws as usize >= MAX_DRAWS_PER_FRAME {
+            return Err(RenderError::TooManyDraws);
         }
         let range = pipeline.layouts.uniform_range;
         if uniforms.len() as u64 > range {
@@ -465,11 +647,11 @@ impl<'a> FrameRecorder<'a> {
             .buffer(self.gpu.uniform_ring.buffer)
             .offset(0)
             .range(range)];
-        let image_infos: Vec<vk::DescriptorImageInfo> = inputs
+        let image_infos: Vec<vk::DescriptorImageInfo> = views
             .iter()
-            .map(|input| {
+            .map(|view| {
                 vk::DescriptorImageInfo::default()
-                    .image_view(input.front_view())
+                    .image_view(*view)
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             })
             .collect();
@@ -494,16 +676,6 @@ impl<'a> FrameRecorder<'a> {
             self.gpu.dev.update_descriptor_sets(&writes, &[]);
         }
 
-        // Inputs must be readable; the invariant is that they already are, but a target that was
-        // written earlier in this frame is explicitly moved back by its own pass.
-        for input in inputs {
-            debug_assert_eq!(
-                input.front_layout(),
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                "layer target must be readable when sampled"
-            );
-        }
-
         let extent = vk::Rect2D::default().extent(vk::Extent2D {
             width: target.width(),
             height: target.height(),
@@ -523,15 +695,7 @@ impl<'a> FrameRecorder<'a> {
             );
 
             let query = self.draws * 2;
-            self.gpu.dev.cmd_write_timestamp(
-                self.cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                {
-                    let frames = self.gpu.frames.borrow();
-                    frames.slots[self.slot].query_pool
-                },
-                query,
-            );
+            self.write_timestamp(query, vk::PipelineStageFlags::TOP_OF_PIPE);
 
             let clear = vk::ClearValue {
                 color: vk::ClearColorValue {
@@ -568,15 +732,7 @@ impl<'a> FrameRecorder<'a> {
             self.gpu.dev.cmd_draw(self.cmd, 3, 1, 0, 0);
             self.gpu.dev.cmd_end_rendering(self.cmd);
 
-            self.gpu.dev.cmd_write_timestamp(
-                self.cmd,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                {
-                    let frames = self.gpu.frames.borrow();
-                    frames.slots[self.slot].query_pool
-                },
-                query + 1,
-            );
+            self.write_timestamp(query + 1, vk::PipelineStageFlags::BOTTOM_OF_PIPE);
 
             cmd_barrier(
                 &self.gpu.dev,
@@ -619,6 +775,7 @@ impl<'a> FrameRecorder<'a> {
             .signal_semaphores(&signal)
             .push_next(&mut timeline_info);
         unsafe {
+            crate::device::count_submission();
             self.gpu
                 .dev
                 .queue_submit(self.gpu.queue, &[submit], vk::Fence::null())

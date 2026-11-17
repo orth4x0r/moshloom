@@ -370,8 +370,8 @@ fn no_new_allocations_after_first() {
     assert_no_validation_messages(&gpu);
 }
 
-/// A size change reallocates the image and the staging buffer once, and nothing after that: a
-/// clip that switches from a small file to a larger one costs one allocation pair, not one per
+/// A size change reallocates the image and the staging buffers once, and nothing after that: a
+/// clip that switches from a small file to a larger one costs one allocation set, not one per
 /// frame. The draw after the change also exercises the new image's `UNDEFINED` starting layout.
 #[test]
 fn size_change_reallocates_once() {
@@ -402,8 +402,9 @@ fn size_change_reallocates_once() {
     let allocations_at_320x180 = mosh_render::upload::allocation_count();
     assert_eq!(
         allocations_at_320x180 - allocations_at_160x90,
-        2,
-        "one image and one staging buffer for the new size, not one pair per frame"
+        // One image and one staging buffer per frame in flight, for the new size.
+        3,
+        "one image plus the staging ring for the new size, not a set per frame"
     );
 
     let pixels = gpu.read_back(&dst);
@@ -461,17 +462,91 @@ fn missing_frame_draws_black() {
     assert_no_validation_messages(&gpu);
 }
 
-/// Time per 1920x1080 upload plus draw, printed for the PR body. Not a budget assertion: the
-/// design's 6 ms/frame covers the whole stage, and this is one overlay layer of it.
+/// An overlay layer is drawn *inside* the frame: one upload and one cover pass add no submission
+/// of their own, and both show up as passes of the frame's own timings. This is the fix for the
+/// 1.7-2.6 ms of CPU wait per overlay layer per frame the one-shot submission used to cost.
 #[test]
-fn upload_and_draw_1080p_time() {
+fn overlay_draws_inside_the_frame() {
+    let gpu = gpu();
+    let mut overlay = OverlayLayer::new(&gpu).expect("overlay");
+    let dst = LayerTarget::new(&gpu, 64, 36);
+    let frame = checkerboard(160, 90);
+
+    // A warm-up frame allocates and builds descriptors, so the measured frame is steady state.
+    overlay
+        .set_frame(&gpu, 0, 160, 90, &frame)
+        .expect("warm-up upload");
+    {
+        let mut recorder = FrameRecorder::new(&gpu);
+        overlay.draw(&mut recorder, 0, &dst).expect("warm-up draw");
+        gpu.wait_frame(recorder.submit());
+    }
+
+    overlay
+        .set_frame(&gpu, 0, 160, 90, &frame)
+        .expect("second upload");
+    let before = mosh_render::submission_count();
+    let mut recorder = FrameRecorder::new(&gpu);
+    overlay.draw(&mut recorder, 0, &dst).expect("draw");
+    let timings = gpu.wait_frame(recorder.submit());
+    let submissions = mosh_render::submission_count() - before;
+    assert_eq!(
+        submissions, 1,
+        "the overlay copy and cover pass belong to the frame's single submit, got {submissions}"
+    );
+    let names: Vec<&str> = timings
+        .per_pass_ms
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["overlay.upload", "overlay.video"],
+        "the frame times the copy and the cover pass"
+    );
+
+    // No frame to draw: a clear, also inside the frame, and no upload pass.
+    let before = mosh_render::submission_count();
+    let mut recorder = FrameRecorder::new(&gpu);
+    overlay
+        .draw(&mut recorder, 7, &dst)
+        .expect("draw with no frame");
+    gpu.wait_frame(recorder.submit());
+    assert_eq!(
+        mosh_render::submission_count() - before,
+        1,
+        "clearing a layer with no video is inside the frame too"
+    );
+
+    println!(
+        "overlay frame path: 1 submission per frame (copy + cover pass + clear inside it), \
+         passes {:?}",
+        timings
+            .per_pass_ms
+            .iter()
+            .map(|(name, ms)| format!("{name} {ms:.3} ms"))
+            .collect::<Vec<_>>()
+    );
+    assert_no_validation_messages(&gpu);
+}
+
+/// Time per 1920x1080 frame of an overlay layer, split the way the budget is:
+///
+/// * `record`: what the layer adds to the frame's CPU work — the copy and the cover pass recorded
+///   into the frame, no fence wait. This is what the one-shot submission used to cost 1.7-2.6 ms
+///   of wait; the target here is < 0.2 ms.
+/// * `staging`: the decoder handover, one memcpy of the frame into mapped memory. Not part of the
+///   fix and not counted against the 0.2 ms.
+/// * `frame`: the frame's own submit and timeline wait, which covers the overlay as well.
+#[test]
+fn overlay_cpu_time_per_frame_1080p() {
     let gpu = gpu();
     let (width, height) = (1920u32, 1080u32);
     let mut overlay = OverlayLayer::new(&gpu).expect("overlay");
     let dst = LayerTarget::new(&gpu, width, height);
     let frame = checkerboard(width, height);
 
-    // Two warm-up frames: the first upload allocates and the first draw builds descriptors.
+    // Two warm-up frames: the first upload allocates, the first draw builds the set.
     for _ in 0..2 {
         overlay
             .set_frame(&gpu, 0, width, height, &frame)
@@ -481,36 +556,39 @@ fn upload_and_draw_1080p_time() {
         gpu.wait_frame(recorder.submit());
     }
 
-    let frames = 20;
-    let mut upload_ms = 0.0;
-    let mut draw_ms = 0.0;
-    let mut redraw_ms = 0.0;
+    let frames = 30;
+    let mut staging_samples = Vec::with_capacity(frames);
+    let mut record_samples = Vec::with_capacity(frames);
+    let mut frame_samples = Vec::with_capacity(frames);
+    let mut submit_samples = Vec::with_capacity(frames);
     for _ in 0..frames {
         let start = Instant::now();
         overlay
             .set_frame(&gpu, 0, width, height, &frame)
             .expect("upload");
-        upload_ms += start.elapsed().as_secs_f64() * 1000.0;
+        staging_samples.push(start.elapsed().as_secs_f64() * 1000.0);
 
         let start = Instant::now();
         let mut recorder = FrameRecorder::new(&gpu);
+        let claim = start.elapsed().as_secs_f64() * 1000.0;
         overlay.draw(&mut recorder, 0, &dst).expect("draw");
-        gpu.wait_frame(recorder.submit());
-        draw_ms += start.elapsed().as_secs_f64() * 1000.0;
+        record_samples.push(start.elapsed().as_secs_f64() * 1000.0 - claim);
 
-        // The same picture again, with no new frame: the transfer is skipped and only the cover
-        // pass and the one-shot's fence wait remain, which is what this split is here to show.
         let start = Instant::now();
-        let mut recorder = FrameRecorder::new(&gpu);
-        overlay.draw(&mut recorder, 0, &dst).expect("redraw");
-        gpu.wait_frame(recorder.submit());
-        redraw_ms += start.elapsed().as_secs_f64() * 1000.0;
+        let ticket = recorder.submit();
+        submit_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        gpu.wait_frame(ticket);
+        frame_samples.push(start.elapsed().as_secs_f64() * 1000.0);
     }
-    let upload_ms = upload_ms / frames as f64;
-    let draw_ms = draw_ms / frames as f64;
-    let redraw_ms = redraw_ms / frames as f64;
+    let stats = |samples: &mut Vec<f64>| {
+        samples.sort_by(f64::total_cmp);
+        (samples[0], samples[samples.len() / 2])
+    };
+    let (record_min, record_median) = stats(&mut record_samples);
+    let (staging_min, staging_median) = stats(&mut staging_samples);
+    let (frame_min, frame_median) = stats(&mut frame_samples);
+    let (submit_min, submit_median) = stats(&mut submit_samples);
 
-    assert!(upload_ms.is_finite() && draw_ms.is_finite() && redraw_ms.is_finite());
     let pixels = gpu.read_back(&dst);
     assert_pixel(
         pixel_at(&pixels, width, 10, 10),
@@ -520,11 +598,17 @@ fn upload_and_draw_1080p_time() {
     );
 
     println!(
-        "1920x1080 overlay, {} frames, {} MB per frame: upload (CPU -> mapped staging) {upload_ms:.3} \
-         ms, draw (transfer + cover pass + fence) {draw_ms:.3} ms, redraw (cover pass + fence, no \
-         transfer) {redraw_ms:.3} ms",
-        frames,
+        "1920x1080 overlay, {frames} frames, {} MB per frame: record (copy + cover pass, no fence) \
+         {record_min:.3} / {record_median:.3} ms min/median, set_frame memcpy {staging_min:.3} / \
+         {staging_median:.3} ms, submit {submit_min:.3} / {submit_median:.3} ms, submit + wait \
+         {frame_min:.3} / {frame_median:.3} ms",
         (width * height * 4) / (1024 * 1024)
+    );
+    assert!(
+        record_min < 0.2,
+        "the overlay's own CPU cost per frame must be under 0.2 ms, min {record_min:.3} ms \
+         (median {record_median:.3} ms; the minimum is the pass's own cost, the median moves with \
+         whatever else the machine is doing)"
     );
     assert_no_validation_messages(&gpu);
 }

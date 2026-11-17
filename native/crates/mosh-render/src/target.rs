@@ -85,6 +85,32 @@ pub(crate) fn to_shader_read() -> Barrier {
     }
 }
 
+/// A readable image about to be written by a transfer (`vkCmdClearColorImage` recorded in the
+/// frame, instead of a one-shot submission that the CPU waits on).
+pub(crate) fn to_transfer_dst() -> Barrier {
+    Barrier {
+        old_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        src_stage: vk::PipelineStageFlags::FRAGMENT_SHADER
+            | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        src_access: vk::AccessFlags::SHADER_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        dst_stage: vk::PipelineStageFlags::TRANSFER,
+        dst_access: vk::AccessFlags::TRANSFER_WRITE,
+    }
+}
+
+/// The same transfer, back to readable.
+pub(crate) fn from_transfer_write() -> Barrier {
+    Barrier {
+        old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        src_stage: vk::PipelineStageFlags::TRANSFER,
+        src_access: vk::AccessFlags::TRANSFER_WRITE,
+        dst_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+        dst_access: vk::AccessFlags::SHADER_READ,
+    }
+}
+
 struct ImagePair {
     images: [vk::Image; 2],
     memories: [vk::DeviceMemory; 2],

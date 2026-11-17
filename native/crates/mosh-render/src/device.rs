@@ -12,6 +12,7 @@
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
@@ -53,6 +54,22 @@ impl GpuPreference {
             GpuPreference::ByName(name) => format!("name containing {name:?}"),
         }
     }
+}
+
+/// How many `vkQueueSubmit` calls this crate has made (frames, one-shot uploads, clears,
+/// readbacks, presents). A test can prove that a per-frame pass is *inside* the frame's submit
+/// instead of in a submission of its own (`mosh-visuals`' `tests/overlay.rs`: an overlay copy plus
+/// its cover pass are one submission). A wait on a fence or a timeline semaphore is what those
+/// extra submissions cost, so the count is the thing worth pinning.
+static QUEUE_SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
+
+/// `vkQueueSubmit` calls this crate has made so far, process-wide.
+pub fn submission_count() -> u64 {
+    QUEUE_SUBMISSIONS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn count_submission() {
+    QUEUE_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// A mapped, host-visible buffer. Used for the per-frame uniform ring.
@@ -524,6 +541,18 @@ impl Gpu {
         self.uniform_alignment
     }
 
+    /// The frame slot the next [`crate::FrameRecorder::new`] will claim. A staging buffer this
+    /// slot owns is the one the next frame's copy reads, so `upload::VideoTexture::upload` writes
+    /// that buffer and waits for the slot's previous submission first.
+    pub(crate) fn next_frame_slot(&self) -> usize {
+        self.frames.borrow().next_slot
+    }
+
+    /// The timeline value `slot` last signalled, or 0 if it never submitted.
+    pub(crate) fn slot_last_value(&self, slot: usize) -> u64 {
+        self.frames.borrow().slots[slot].last_value
+    }
+
     /// Records one short command buffer and waits for it. Used for clears, readbacks and the
     /// present blit, never for a per-frame layer pass (those go through `FrameRecorder`).
     pub(crate) fn one_shot(
@@ -542,6 +571,7 @@ impl Gpu {
             self.dev.reset_fences(&[one_shot.fence])?;
             let command_buffers = [one_shot.cmd];
             let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
+            count_submission();
             self.dev.queue_submit(self.queue, &[submit], one_shot.fence)?;
             self.dev
                 .wait_for_fences(&[one_shot.fence], true, u64::MAX)?;

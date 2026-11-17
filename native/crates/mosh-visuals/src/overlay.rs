@@ -6,11 +6,17 @@
 //! the layer's target with aspect-preserving cover scaling when the facade reaches it. The GPU
 //! half lives in `mosh_render::upload`, next to the device it needs.
 //!
+//! Both halves of the overlay — the staging copy and the cover draw — are recorded into the
+//! `FrameRecorder`'s command buffer, so an overlay layer adds no submission and no fence wait to
+//! the frame (it used to be 1.7-2.6 ms of CPU wait per layer per frame in debug builds). The
+//! staging buffer it writes belongs to the frame slot the recorder will claim, so the CPU never
+//! overwrites bytes a queued copy is still reading.
+//!
 //! One texture per layer index, reused for every frame of that size; a clip change or a resize
 //! reallocates once. A layer with no frame draws transparent black, so a stopped overlay never
 //! shows a stale picture.
 
-use mosh_render::upload::{CoverPass, VideoTexture, clear_target};
+use mosh_render::upload::{CoverPass, VideoTexture};
 use mosh_render::{FrameRecorder, Gpu, LayerTarget, RenderError};
 
 /// The shader module this pass needs (`mosh-shaders/wgsl/overlay_video.wgsl`).
@@ -21,8 +27,8 @@ const SHADER: &str = "overlay_video";
 const MAX_LAYERS: usize = 32;
 
 pub struct OverlayLayer {
-    /// One cover pass for every layer: it only holds the pipeline, the descriptor set and the
-    /// uniform buffer, all of which are per-draw state, not per-layer state.
+    /// One cover pass for every layer: it only holds the pipeline, which is per-draw state, not
+    /// per-layer state.
     cover: CoverPass,
     /// One video texture per layer index, created by that layer's first `set_frame`.
     layers: Vec<Option<VideoTexture>>,
@@ -41,7 +47,7 @@ impl OverlayLayer {
     /// rows tightly packed). Called by the app before `Visuals::draw_layer`.
     ///
     /// Nothing is submitted here: the copy to the GPU is recorded into the next [`Self::draw`],
-    /// and a frame of the same size reuses the image, the staging buffer and the pipeline.
+    /// and a frame of the same size reuses the image, the staging buffers and the pipeline.
     pub fn set_frame(
         &mut self,
         gpu: &Gpu,
@@ -68,19 +74,19 @@ impl OverlayLayer {
         video.upload(gpu, width, height, bgra)
     }
 
-    /// Draw `layer`'s latest picture into `dst`, scaled to cover it (aspect kept, centred).
+    /// Draw `layer`'s latest picture into `dst`, scaled to cover it (aspect kept, centred), inside
+    /// `rec`'s frame: one recorded copy, one recorded pass, no submission and no CPU wait.
     ///
-    /// A layer that never received a frame is filled with transparent black.
+    /// A layer that never received a frame is filled with transparent black, also inside the frame.
     pub fn draw(
         &mut self,
         rec: &mut FrameRecorder<'_>,
         layer: usize,
         dst: &LayerTarget,
     ) -> Result<(), RenderError> {
-        let gpu = rec.gpu();
         match self.layers.get_mut(layer).and_then(Option::as_mut) {
-            Some(video) => self.cover.draw(gpu, video, dst),
-            None => clear_target(gpu, dst),
+            Some(video) => self.cover.record(rec, video, dst),
+            None => rec.clear(dst),
         }
     }
 }
