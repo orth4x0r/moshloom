@@ -1,4 +1,4 @@
-//! mosh-analysis: see docs/superpowers/plans/2026-11-17-native-port.md, Task 1.3, 1.4, 1.5.
+//! mosh-analysis: see docs/superpowers/plans/2026-11-17-native-port.md, Task 1.3, 1.4, 1.5, 2.5.
 //!
 //! Task 1.3 (this module, `features`, `grid`, `loudness`): causal live features on Ableton's beat
 //! grid. One [`Analyzer`] per show; push audio blocks as they arrive and take one
@@ -8,19 +8,27 @@
 //! The intensity model (Task 1.4, `intensity.rs`) runs inside the analyzer: every closed bar is
 //! pushed to it, and the frame carries its `intensity`, `level` and events (PHRASE, BUILD_START,
 //! DROP, BREAKDOWN, LEVEL_UP, LEVEL_DOWN). Call [`Analyzer::song_start`] at a song marker.
+//!
+//! Loopback mode (Task 2.5, `tempo.rs`) has audio but no transport. A block whose
+//! [`AudioBlock::transport`] is `None` feeds the [`tempo::TempoTracker`], and once it locks the
+//! analyzer synthesises a 4/4 transport from it: the frame's `source` becomes
+//! [`TransportSource::Tracked`], `playing` turns true, and beats, bars and phrases keep firing on
+//! the tracked grid. With a transport present nothing about the tracker runs.
 
 pub mod features;
 pub mod grid;
 pub mod intensity;
 pub mod loudness;
 pub mod offline;
+pub mod tempo;
 
 use mosh_core::analysis::{AnalysisFrame, BarStats, EventFlags, TransportSource};
-use mosh_core::transport::AudioBlock;
+use mosh_core::transport::{AudioBlock, Transport};
 
 use features::{FeatureExtractor, FeatureValues, ONSET_PEAK_FLOOR};
 use grid::{BeatGrid, CompletedBar};
 use loudness::LoudnessMeter;
+use tempo::TempoTracker;
 
 /// A hanning-windowed 2048-point FFT is 43 ms of history at 48 kHz: enough for 43 Hz resolution
 /// without smoothing away the transients the visuals react to.
@@ -60,6 +68,13 @@ const DEFAULT_LOW_DB: (f32, f32) = (-60.0, -18.0);
 const DEFAULT_BRIGHTNESS: (f32, f32) = (0.02, 0.45);
 /// `BarStats::onset_density` counts onset peaks per beat, saturating at four (16th notes).
 const ONSETS_PER_BEAT_MAX: f32 = 4.0;
+/// Loopback mode has no transport, so the tracker's grid is synthesised as 4/4, the time signature
+/// the web engine assumes. A transport from the plugin always wins when one is present.
+const TRACKED_SIG_NUM: u16 = 4;
+const TRACKED_SIG_DEN: u16 = 4;
+/// The tracked playhead follows the tracker's beat phase with this gain per block: a phase-locked
+/// loop, so a re-estimate never jumps the playhead and drops a partial bar every half second.
+const TRACKED_PHASE_GAIN: f64 = 0.05;
 
 /// A causal percentile range over the last `history_bars` bars.
 ///
@@ -213,6 +228,12 @@ pub struct Analyzer {
     frame: AnalysisFrame,
     sample_rate: u32,
     sample_pos: i64,
+    /// Loopback mode: the causal tempo and beat-phase tracker. Fed only when a block arrives
+    /// without a transport; with the plugin nothing here runs.
+    tempo: TempoTracker,
+    /// The synthesised musical position (ppq) of the tracked grid, and whether it is anchored.
+    tracked_ppq: f64,
+    tracked_started: bool,
 }
 
 impl Analyzer {
@@ -238,6 +259,9 @@ impl Analyzer {
             frame: AnalysisFrame::default(),
             sample_rate: 48_000,
             sample_pos: 0,
+            tempo: TempoTracker::new(48_000),
+            tracked_ppq: 0.0,
+            tracked_started: false,
         }
     }
 
@@ -245,9 +269,9 @@ impl Analyzer {
         &self.config
     }
 
-    /// Analyse one block. Allocates nothing: the FFT plan, the block buffer, the loudness window
-    /// and the normalisation rings are all created in [`Analyzer::new`] or on the first push
-    /// (when the sample rate is first known).
+    /// Analyse one block. Allocates nothing in the steady state: the FFT plan, the block buffer,
+    /// the loudness window, the normalisation rings and (loopback mode) the tempo tracker's window
+    /// are created in [`Analyzer::new`] or on the first push that needs them.
     pub fn push(&mut self, b: &AudioBlock) {
         let frames = b.frames();
         if frames == 0 || b.sample_rate == 0 {
@@ -259,42 +283,89 @@ impl Analyzer {
         let loudness_db = self.loudness.push(&self.mono, b.sample_rate);
 
         if let Some(t) = b.transport {
-            let tick = self.grid.update(&t);
-            self.frame.ppq = t.ppq;
-            self.frame.tempo_bpm = tick.bpm;
-            self.frame.playing = t.playing;
-            self.frame.source = TransportSource::Plugin;
-            self.frame.beat_phase = tick.beat_phase;
-            self.frame.bar_phase = tick.bar_phase;
-            self.frame.beat_index = tick.beat_index;
-            self.frame.bar_index = tick.bar_index;
-
-            if tick.jumped {
-                // The playhead moved: the partial bar and the onset run belong to audio that is
-                // no longer before us, so they are dropped instead of being reported.
-                self.acc.reset();
-            }
-            if let Some(completed) = tick.completed {
-                self.close_bar(completed);
-            }
-            if tick.beat_started {
-                self.events |= EventFlags::BEAT;
-            }
-            if tick.bar_started {
-                self.events |= EventFlags::BAR;
-                if self.grid.is_phrase_boundary(tick.bar_index) {
-                    self.events |= EventFlags::PHRASE;
+            self.tracked_started = false;
+            self.advance(&t, TransportSource::Plugin);
+        } else {
+            // No transport (loopback capture, or the plugin is not running): the tracker estimates
+            // the tempo and beat phase from the onset envelope it was just given. Until it locks,
+            // the frame says the position is unknown; the last grid keeps the visuals running.
+            self.tempo.set_sample_rate(b.sample_rate);
+            self.tempo.push_onset(fv.onset, frames as u32);
+            let dt = frames as f64 / b.sample_rate as f64;
+            match self.tracked_transport(dt, frames) {
+                Some(t) => self.advance(&t, TransportSource::Tracked),
+                None => {
+                    self.frame.source = TransportSource::None;
+                    self.frame.playing = false;
                 }
             }
-        } else {
-            // No transport (loopback, or the plugin is not running): keep the last grid so the
-            // visuals hold their tempo, but say where the position came from.
-            self.frame.source = TransportSource::None;
-            self.frame.playing = false;
         }
 
         self.acc.add_block(&fv, loudness_db);
         self.update_frame(&fv, loudness_db, frames);
+    }
+
+    /// The grid part of a block: phase, indices, and the beat/bar events a transport implies.
+    fn advance(&mut self, t: &Transport, source: TransportSource) {
+        let tick = self.grid.update(t);
+        self.frame.ppq = t.ppq;
+        self.frame.tempo_bpm = tick.bpm;
+        self.frame.playing = t.playing;
+        self.frame.source = source;
+        self.frame.beat_phase = tick.beat_phase;
+        self.frame.bar_phase = tick.bar_phase;
+        self.frame.beat_index = tick.beat_index;
+        self.frame.bar_index = tick.bar_index;
+
+        if tick.jumped {
+            // The playhead moved: the partial bar and the onset run belong to audio that is no
+            // longer before us, so they are dropped instead of being reported.
+            self.acc.reset();
+        }
+        if let Some(completed) = tick.completed {
+            self.close_bar(completed);
+        }
+        if tick.beat_started {
+            self.events |= EventFlags::BEAT;
+        }
+        if tick.bar_started {
+            self.events |= EventFlags::BAR;
+            if self.grid.is_phrase_boundary(tick.bar_index) {
+                self.events |= EventFlags::PHRASE;
+            }
+        }
+    }
+
+    /// Synthesise a transport from the tempo tracker: 4/4, `playing` once locked, and a ppq that
+    /// follows the tracker's phase through a phase-locked loop. `None` until the tracker locks.
+    fn tracked_transport(&mut self, dt: f64, frames: usize) -> Option<Transport> {
+        let est = self.tempo.estimate()?;
+        if self.tracked_started {
+            self.tracked_ppq += dt * est.bpm / 60.0;
+            let phase = self.tracked_ppq.rem_euclid(1.0);
+            let mut error = est.beat_phase - phase;
+            if error > 0.5 {
+                error -= 1.0;
+            } else if error < -0.5 {
+                error += 1.0;
+            }
+            self.tracked_ppq += error * TRACKED_PHASE_GAIN;
+        } else {
+            // First locked block: start on the tracker's phase, so beats land on the clicks.
+            self.tracked_ppq = est.beat_phase;
+            self.tracked_started = true;
+        }
+        let ppq = self.tracked_ppq.max(0.0);
+        let bar_start_ppq = (ppq / f64::from(TRACKED_SIG_NUM)).floor() * f64::from(TRACKED_SIG_NUM);
+        Some(Transport {
+            tempo_bpm: est.bpm,
+            ppq,
+            bar_start_ppq,
+            sig_num: TRACKED_SIG_NUM,
+            sig_den: TRACKED_SIG_DEN,
+            playing: true,
+            sample_pos: self.sample_pos + frames as i64,
+        })
     }
 
     /// The latest frame. `events` carries everything OR-ed since the previous take.
