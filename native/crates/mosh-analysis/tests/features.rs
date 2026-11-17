@@ -105,7 +105,9 @@ fn sine(frames: usize, hz: f32, amp: f32) -> Vec<f32> {
 /// A decaying 50 Hz thump: the low end of a kick drum.
 fn kick(frames: usize, amp: f32) -> Vec<f32> {
     (0..frames)
-        .map(|i| amp * (-(i as f32) / 1000.0).exp() * (2.0 * PI * 50.0 * i as f32 / SR as f32).sin())
+        .map(|i| {
+            amp * (-(i as f32) / 1000.0).exp() * (2.0 * PI * 50.0 * i as f32 / SR as f32).sin()
+        })
         .collect()
 }
 
@@ -153,13 +155,13 @@ fn sine_1khz_lands_in_mid_band() {
     }
 
     // The log-spaced 30 Hz .. 16 kHz mel axis puts 1 kHz around band 13.
-    let (peak, value) = f
-        .mel
-        .iter()
-        .enumerate()
-        .fold((0usize, f32::MIN), |acc, (i, v)| {
-            if *v > acc.1 { (i, *v) } else { acc }
-        });
+    let (peak, value) =
+        f.mel.iter().enumerate().fold(
+            (0usize, f32::MIN),
+            |acc, (i, v)| {
+                if *v > acc.1 { (i, *v) } else { acc }
+            },
+        );
     assert!(
         (11..=15).contains(&peak),
         "mel peak at band {peak} (value {value}), expected 1 kHz near band 13"
@@ -185,11 +187,7 @@ fn kick_train_120bpm_onsets_on_beats() {
     let beats = 4usize;
     let total = lead as usize + beats * FRAMES_PER_BEAT as usize;
     let mut audio = vec![0.0f32; total];
-    audio[lead as usize..].copy_from_slice(&kick_train(
-        total - lead as usize,
-        beats,
-        0.8,
-    ));
+    audio[lead as usize..].copy_from_slice(&kick_train(total - lead as usize, beats, 0.8));
 
     let mut onsets = Vec::new();
     for (n, chunk) in audio.chunks(HOP).enumerate() {
@@ -216,7 +214,10 @@ fn kick_train_120bpm_onsets_on_beats() {
                     ((lead + b as i64 * FRAMES_PER_BEAT) as f64 / HOP as f64).round() as i64;
                 (b, (*i as i64 - beat_block).abs())
             })
-            .fold((0usize, i64::MAX), |acc, x| if x.1 < acc.1 { x } else { acc });
+            .fold(
+                (0usize, i64::MAX),
+                |acc, x| if x.1 < acc.1 { x } else { acc },
+            );
         assert!(
             dist <= 1,
             "onset peak {value} in block {i} is {dist} hops from beat {best}"
@@ -265,7 +266,11 @@ fn bar_stats_aggregate_one_bar() {
         let _ = a.take_frame();
     }
     let bars = a.drain_bars();
-    assert_eq!(bars.len(), 1, "expected exactly one closed bar, got {bars:?}");
+    assert_eq!(
+        bars.len(),
+        1,
+        "expected exactly one closed bar, got {bars:?}"
+    );
     let bar = bars[0];
     assert_eq!(bar.start_ppq, 0.0);
     assert_eq!(bar.bar_index, 0);
@@ -280,7 +285,11 @@ fn bar_stats_aggregate_one_bar() {
         "onset density {} out of range",
         bar.onset_density
     );
-    assert!((0.0..=1.0).contains(&bar.low), "low {} out of 0..1", bar.low);
+    assert!(
+        (0.0..=1.0).contains(&bar.low),
+        "low {} out of 0..1",
+        bar.low
+    );
     assert!(
         (0.0..=1.0).contains(&bar.loudness),
         "loudness {} out of 0..1",
@@ -335,7 +344,11 @@ fn ppq_jump_resets_bar_accumulator() {
 
     // Half a bar more, still loud: no bar line, then Live jumps back to ppq 16 (bar 4).
     for k in 0..(blocks_per_bar / 2) {
-        push_at_ppq(&mut a, chunk(blocks_per_bar + 1 + k), 64.0 + k as f64 * step);
+        push_at_ppq(
+            &mut a,
+            chunk(blocks_per_bar + 1 + k),
+            64.0 + k as f64 * step,
+        );
     }
     assert!(
         a.drain_bars().is_empty(),
@@ -437,7 +450,11 @@ fn push_256_frames_under_200us() {
     // costs ~216 us against ~2.1 us in release, so a debug run enforces a loose ceiling that still
     // catches a per-block allocation or a second transform. The gate runs both:
     // `cargo test -p mosh-analysis` (debug ceiling) and the release number quoted in the PR.
-    let budget_us = if cfg!(debug_assertions) { 2000.0 } else { 200.0 };
+    let budget_us = if cfg!(debug_assertions) {
+        2000.0
+    } else {
+        200.0
+    };
     assert!(
         median < budget_us,
         "push median {median:.1} us exceeds the {budget_us:.0} us budget"

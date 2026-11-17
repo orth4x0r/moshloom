@@ -37,10 +37,7 @@ fn bar_length_follows_signature_denominator() {
         (tick.beat_phase - 0.5).abs() < 1e-6,
         "1.25 ppq is the middle of the second eighth note: {tick:?}"
     );
-    assert!(
-        (tick.bar_phase - 1.25 / 3.0).abs() < 1e-6,
-        "{tick:?}"
-    );
+    assert!((tick.bar_phase - 1.25 / 3.0).abs() < 1e-6, "{tick:?}");
     assert_eq!(tick.beat_index, 2);
 }
 
@@ -68,13 +65,13 @@ fn bar_index_follows_time_signature_change() {
     for (i, bar) in closed.iter().enumerate() {
         assert_eq!(bar.bar_index, i as i64);
         assert_eq!(
-            bar.start_ppq,
-            edges[i].0,
+            bar.start_ppq, edges[i].0,
             "bar {i} must start where Live says it does"
         );
         let expected_beats = if i < 8 { 4 } else { 3 };
         assert_eq!(
-            bar.beats, expected_beats,
+            bar.beats,
+            expected_beats,
             "bar {i} is in {} ({expected_beats} beats)",
             if i < 8 { "4/4" } else { "3/4" }
         );
@@ -102,7 +99,10 @@ fn ppq_jump_backward_is_not_a_bar() {
 fn phrase_boundaries_count_bars() {
     let mut g = BeatGrid::new(8);
     g.update(&transport(0.0, 0.0, 4, 4));
-    assert!(!g.is_phrase_boundary(0), "bar 0 is the start, not a phrase end");
+    assert!(
+        !g.is_phrase_boundary(0),
+        "bar 0 is the start, not a phrase end"
+    );
     for b in 1..8 {
         assert!(!g.is_phrase_boundary(b), "bar {b} is mid-phrase");
     }

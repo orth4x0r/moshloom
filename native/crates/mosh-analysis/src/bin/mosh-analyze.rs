@@ -63,7 +63,11 @@ fn main() -> ExitCode {
             failures += 1;
         }
     }
-    if failures == 0 { ExitCode::SUCCESS } else { ExitCode::from(1) }
+    if failures == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -141,18 +145,34 @@ fn take_value(
         return Ok(value.to_string());
     }
     *index += 1;
-    argv.get(*index).cloned().ok_or_else(|| format!("{flag} needs a value"))
+    argv.get(*index)
+        .cloned()
+        .ok_or_else(|| format!("{flag} needs a value"))
 }
 
 fn parse_number(flag: &str, value: &str) -> Result<f64, String> {
-    value.parse::<f64>().map_err(|_| format!("{flag} expects a number, got {value:?}"))
+    value
+        .parse::<f64>()
+        .map_err(|_| format!("{flag} expects a number, got {value:?}"))
 }
 
 fn run_one(args: &Args, path: &Path) -> Result<(), String> {
     let (samples, rate, channels) = offline::read_audio(path).map_err(|e| e.to_string())?;
-    let frames = if channels == 0 { 0 } else { samples.len() / usize::from(channels) };
-    let duration_s = if rate == 0 { 0.0 } else { frames as f64 / f64::from(rate) };
-    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("?").to_string();
+    let frames = if channels == 0 {
+        0
+    } else {
+        samples.len() / usize::from(channels)
+    };
+    let duration_s = if rate == 0 {
+        0.0
+    } else {
+        frames as f64 / f64::from(rate)
+    };
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("?")
+        .to_string();
     let hint = offline::tempo_from_name(&name);
 
     match hint {

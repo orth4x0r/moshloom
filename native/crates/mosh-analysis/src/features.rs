@@ -220,7 +220,8 @@ impl FeatureExtractor {
             let idx = (self.ring_pos + i) % n;
             self.buf[i] = Complex::new(self.ring[idx] * self.window[i], 0.0);
         }
-        self.fft.process_with_scratch(&mut self.buf, &mut self.scratch);
+        self.fft
+            .process_with_scratch(&mut self.buf, &mut self.scratch);
 
         let scale = 1.0 / n as f32;
         let bin_hz = sample_rate as f32 / n as f32;

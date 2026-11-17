@@ -21,7 +21,10 @@ struct TempDir {
 
 impl TempDir {
     fn new(tag: &str) -> TempDir {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
         let path = std::env::temp_dir().join(format!(
             "moshloom-offline-{tag}-{}-{nanos}",
             std::process::id()
@@ -45,13 +48,7 @@ const WAVE_FORMAT_PCM: u16 = 1;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 
 /// A complete RIFF/WAVE file: canonical 16-byte `fmt ` chunk, one `data` chunk.
-fn wav_bytes(
-    rate: u32,
-    channels: u16,
-    bits: u16,
-    format_tag: u16,
-    data: &[u8],
-) -> Vec<u8> {
+fn wav_bytes(rate: u32, channels: u16, bits: u16, format_tag: u16, data: &[u8]) -> Vec<u8> {
     let block_align = channels * (bits / 8);
     let mut out = Vec::with_capacity(44 + data.len());
     out.extend_from_slice(b"RIFF");
@@ -94,8 +91,11 @@ fn write_float32_fixture(dir: &TempDir) -> PathBuf {
         }
     }
     let path = dir.file("float32.wav");
-    fs::write(&path, wav_bytes(48_000, 4, 32, WAVE_FORMAT_IEEE_FLOAT, &data))
-        .expect("write fixture");
+    fs::write(
+        &path,
+        wav_bytes(48_000, 4, 32, WAVE_FORMAT_IEEE_FLOAT, &data),
+    )
+    .expect("write fixture");
     path
 }
 
@@ -112,7 +112,11 @@ fn reads_wav_16bit() {
 
     assert_eq!(rate, 44_100);
     assert_eq!(channels, 2);
-    assert_eq!(samples.len(), 512 * 2, "every frame, both channels, interleaved");
+    assert_eq!(
+        samples.len(),
+        512 * 2,
+        "every frame, both channels, interleaved"
+    );
     for frame in [0usize, 1, 17, 511] {
         let left = samples[frame * 2];
         let right = samples[frame * 2 + 1];
@@ -159,7 +163,10 @@ fn missing_file_is_a_clean_error() {
     let error = offline::read_audio(&path).expect_err("a missing file is an error");
 
     assert!(matches!(error, OfflineError::Open { .. }), "got {error:?}");
-    assert!(error.to_string().contains("nothing-here.wav"), "message names the file: {error}");
+    assert!(
+        error.to_string().contains("nothing-here.wav"),
+        "message names the file: {error}"
+    );
 }
 
 #[test]
@@ -169,16 +176,25 @@ fn garbage_is_a_clean_error() {
     fs::write(&path, b"this is not audio, not even slightly an MP3 frame").expect("write");
     let error = offline::read_audio(&path).expect_err("garbage is an error");
     assert!(
-        matches!(error, OfflineError::Unsupported(_) | OfflineError::Decode(_)),
+        matches!(
+            error,
+            OfflineError::Unsupported(_) | OfflineError::Decode(_)
+        ),
         "got {error:?}"
     );
-    assert!(error.to_string().contains("broken.mp3"), "message names the file: {error}");
+    assert!(
+        error.to_string().contains("broken.mp3"),
+        "message names the file: {error}"
+    );
 
     let empty = dir.file("empty.wav");
     fs::write(&empty, b"").expect("write");
     let error = offline::read_audio(&empty).expect_err("an empty file is an error");
     assert!(
-        matches!(error, OfflineError::Unsupported(_) | OfflineError::Decode(_)),
+        matches!(
+            error,
+            OfflineError::Unsupported(_) | OfflineError::Decode(_)
+        ),
         "got {error:?}"
     );
 }
@@ -188,7 +204,9 @@ fn garbage_is_a_clean_error() {
 // ---------------------------------------------------------------------------------------------
 
 fn ramp(frames: usize, channels: u16) -> Vec<f32> {
-    (0..frames * usize::from(channels)).map(|i| i as f32).collect()
+    (0..frames * usize::from(channels))
+        .map(|i| i as f32)
+        .collect()
 }
 
 #[test]
@@ -201,7 +219,10 @@ fn blocks_carry_a_constant_tempo_transport() {
     assert_eq!(blocks[0].channels, 2);
     assert_eq!(blocks[0].samples.len(), 512, "256 frames * 2 channels");
     assert_eq!(blocks[0].samples[0], 0.0);
-    assert_eq!(blocks[1].samples[0], 512.0, "the second block starts 512 samples in");
+    assert_eq!(
+        blocks[1].samples[0], 512.0,
+        "the second block starts 512 samples in"
+    );
 
     // 256 frames at 48 kHz is 1/187.5 s, which at 120 bpm is 2/187.5 beats.
     let expected_step = 256.0 / 48_000.0 * 2.0;
@@ -235,12 +256,20 @@ fn blocks_follow_the_bar_grid_and_the_offset() {
         .iter()
         .map(|block| block.transport.expect("transport").bar_start_ppq)
         .collect();
-    assert_eq!(bars, vec![0.0, 4.0, 8.0, 12.0], "one bar per block at 120 bpm");
+    assert_eq!(
+        bars,
+        vec![0.0, 4.0, 8.0, 12.0],
+        "one bar per block at 120 bpm"
+    );
 
     // A one-second offset puts the first block before the downbeat.
     let offset: Vec<_> = offline::blocks(&samples, 48_000, 1, 96_000, 120.0, 1.0).collect();
     let first = offset[0].transport.expect("transport");
-    assert!((first.ppq - -2.0).abs() < 1e-12, "ppq {} at t=0 with offset 1 s", first.ppq);
+    assert!(
+        (first.ppq - -2.0).abs() < 1e-12,
+        "ppq {} at t=0 with offset 1 s",
+        first.ppq
+    );
     assert_eq!(first.bar_start_ppq, -4.0, "the bar before bar 0 is -4..0");
 }
 
@@ -251,9 +280,15 @@ fn blocks_drop_the_partial_tail_and_refuse_nonsense() {
     assert_eq!(blocks.len(), 3, "1000 frames keep 3 whole 256-frame blocks");
     assert!(blocks.iter().all(|block| block.samples.len() == 512));
 
-    assert_eq!(offline::blocks(&samples, 44_100, 0, 256, 93.0, 0.0).count(), 0);
+    assert_eq!(
+        offline::blocks(&samples, 44_100, 0, 256, 93.0, 0.0).count(),
+        0
+    );
     assert_eq!(offline::blocks(&samples, 0, 2, 256, 93.0, 0.0).count(), 0);
-    assert_eq!(offline::blocks(&samples, 44_100, 2, 0, 93.0, 0.0).count(), 0);
+    assert_eq!(
+        offline::blocks(&samples, 44_100, 2, 0, 93.0, 0.0).count(),
+        0
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -262,10 +297,22 @@ fn blocks_drop_the_partial_tail_and_refuse_nonsense() {
 
 fn four_marks() -> Vec<Mark> {
     vec![
-        Mark { bar: 16, kind: MarkKind::Build },
-        Mark { bar: 32, kind: MarkKind::Drop },
-        Mark { bar: 48, kind: MarkKind::Breakdown },
-        Mark { bar: 64, kind: MarkKind::Section },
+        Mark {
+            bar: 16,
+            kind: MarkKind::Build,
+        },
+        Mark {
+            bar: 32,
+            kind: MarkKind::Drop,
+        },
+        Mark {
+            bar: 48,
+            kind: MarkKind::Breakdown,
+        },
+        Mark {
+            bar: 64,
+            kind: MarkKind::Section,
+        },
     ]
 }
 
@@ -273,13 +320,20 @@ fn four_marks() -> Vec<Mark> {
 fn labels_round_trip_through_toml() {
     let dir = TempDir::new("labels");
     let path = dir.file("track.labels.toml");
-    let labels = Labels { bpm: Some(93.0), offset_s: Some(0.25), marks: four_marks() };
+    let labels = Labels {
+        bpm: Some(93.0),
+        offset_s: Some(0.25),
+        marks: four_marks(),
+    };
 
     labels.save(&path).expect("save labels");
     let text = fs::read_to_string(&path).expect("read back");
 
     assert!(text.contains("[[mark]]"), "the documented shape:\n{text}");
-    assert!(text.contains("kind = \"build\""), "kinds are lower-case names:\n{text}");
+    assert!(
+        text.contains("kind = \"build\""),
+        "kinds are lower-case names:\n{text}"
+    );
     assert!(text.contains("bar = 16"), "bars are integers:\n{text}");
     assert_eq!(Labels::load(&path).expect("load labels"), labels);
 
@@ -298,7 +352,10 @@ fn bad_label_file_names_the_problem() {
     assert!(matches!(error, LabelError::Parse(_)), "got {error:?}");
     let message = error.to_string();
     assert!(message.contains("wrong.toml"), "{message}");
-    assert!(message.contains("chorus"), "the message names the bad value: {message}");
+    assert!(
+        message.contains("chorus"),
+        "the message names the bad value: {message}"
+    );
 
     let missing = Labels::load(dir.file("absent.toml")).expect_err("missing file is an error");
     assert!(matches!(missing, LabelError::Io { .. }), "got {missing:?}");
@@ -332,19 +389,34 @@ fn propose_maps_events_to_marks_once_per_bar() {
     assert_eq!(
         labels.marks,
         vec![
-            Mark { bar: 0, kind: MarkKind::Section },
-            Mark { bar: 8, kind: MarkKind::Build },
-            Mark { bar: 16, kind: MarkKind::Drop },
-            Mark { bar: 24, kind: MarkKind::Breakdown },
+            Mark {
+                bar: 0,
+                kind: MarkKind::Section
+            },
+            Mark {
+                bar: 8,
+                kind: MarkKind::Build
+            },
+            Mark {
+                bar: 16,
+                kind: MarkKind::Drop
+            },
+            Mark {
+                bar: 24,
+                kind: MarkKind::Breakdown
+            },
         ]
     );
     assert_eq!(labels.bpm, None, "a proposal does not invent a tempo");
-    assert_eq!(labels.counts(), vec![
-        (MarkKind::Build, 1),
-        (MarkKind::Drop, 1),
-        (MarkKind::Breakdown, 1),
-        (MarkKind::Section, 1),
-    ]);
+    assert_eq!(
+        labels.counts(),
+        vec![
+            (MarkKind::Build, 1),
+            (MarkKind::Drop, 1),
+            (MarkKind::Breakdown, 1),
+            (MarkKind::Section, 1),
+        ]
+    );
 }
 
 #[test]
@@ -359,7 +431,10 @@ fn propose_writes_labels_file() {
         (48, EventFlags::DROP),
     ]);
     let out = Labels::path_for(&audio);
-    assert_eq!(out.file_name().and_then(|n| n.to_str()), Some("vampira v2_edit 137bpm - metamor.labels.toml"));
+    assert_eq!(
+        out.file_name().and_then(|n| n.to_str()),
+        Some("vampira v2_edit 137bpm - metamor.labels.toml")
+    );
 
     proposed.save(&out).expect("write proposal");
     let reread = Labels::load(&out).expect("read proposal back");
@@ -378,40 +453,90 @@ fn kind_of(score: &offline::Score, kind: MarkKind) -> KindScore {
 #[test]
 fn score_counts_hits_within_one_bar() {
     let labels = Labels::new(vec![
-        Mark { bar: 8, kind: MarkKind::Build },
-        Mark { bar: 16, kind: MarkKind::Drop },
-        Mark { bar: 32, kind: MarkKind::Breakdown },
+        Mark {
+            bar: 8,
+            kind: MarkKind::Build,
+        },
+        Mark {
+            bar: 16,
+            kind: MarkKind::Drop,
+        },
+        Mark {
+            bar: 32,
+            kind: MarkKind::Breakdown,
+        },
     ]);
     let detected = Labels::new(vec![
-        Mark { bar: 9, kind: MarkKind::Build },
-        Mark { bar: 18, kind: MarkKind::Drop },
-        Mark { bar: 40, kind: MarkKind::Breakdown },
-        Mark { bar: 56, kind: MarkKind::Section },
+        Mark {
+            bar: 9,
+            kind: MarkKind::Build,
+        },
+        Mark {
+            bar: 18,
+            kind: MarkKind::Drop,
+        },
+        Mark {
+            bar: 40,
+            kind: MarkKind::Breakdown,
+        },
+        Mark {
+            bar: 56,
+            kind: MarkKind::Section,
+        },
     ]);
 
     let score = offline::score(&labels, &detected);
 
     let build = kind_of(&score, MarkKind::Build);
-    assert_eq!((build.labelled, build.detected, build.hits, build.misses), (1, 1, 1, 0));
-    assert_eq!(build.mean_error_bars, Some(1.0), "one bar late is still a hit");
+    assert_eq!(
+        (build.labelled, build.detected, build.hits, build.misses),
+        (1, 1, 1, 0)
+    );
+    assert_eq!(
+        build.mean_error_bars,
+        Some(1.0),
+        "one bar late is still a hit"
+    );
     assert_eq!(build.mean_abs_error_bars, Some(1.0));
 
     let drop = kind_of(&score, MarkKind::Drop);
     assert_eq!(
-        (drop.labelled, drop.detected, drop.hits, drop.misses, drop.false_positives),
+        (
+            drop.labelled,
+            drop.detected,
+            drop.hits,
+            drop.misses,
+            drop.false_positives
+        ),
         (1, 1, 0, 1, 1),
         "two bars late is a miss and a false positive"
     );
-    assert_eq!(drop.mean_error_bars, None, "no hits, no timing error to report");
+    assert_eq!(
+        drop.mean_error_bars, None,
+        "no hits, no timing error to report"
+    );
 
     let breakdown = kind_of(&score, MarkKind::Breakdown);
-    assert_eq!((breakdown.hits, breakdown.misses), (0, 1), "eight bars late is a miss");
+    assert_eq!(
+        (breakdown.hits, breakdown.misses),
+        (0, 1),
+        "eight bars late is a miss"
+    );
 
     let section = kind_of(&score, MarkKind::Section);
-    assert_eq!((section.labelled, section.detected, section.false_positives), (0, 1, 1));
+    assert_eq!(
+        (section.labelled, section.detected, section.false_positives),
+        (0, 1, 1)
+    );
 
     assert_eq!(
-        (score.labelled, score.detected, score.hits, score.misses, score.false_positives),
+        (
+            score.labelled,
+            score.detected,
+            score.hits,
+            score.misses,
+            score.false_positives
+        ),
         (3, 4, 1, 2, 3)
     );
 }
@@ -419,24 +544,46 @@ fn score_counts_hits_within_one_bar() {
 #[test]
 fn scoring_never_uses_one_detection_for_two_labels() {
     let labels = Labels::new(vec![
-        Mark { bar: 16, kind: MarkKind::Drop },
-        Mark { bar: 17, kind: MarkKind::Drop },
+        Mark {
+            bar: 16,
+            kind: MarkKind::Drop,
+        },
+        Mark {
+            bar: 17,
+            kind: MarkKind::Drop,
+        },
     ]);
-    let detected = Labels::new(vec![Mark { bar: 16, kind: MarkKind::Drop }]);
+    let detected = Labels::new(vec![Mark {
+        bar: 16,
+        kind: MarkKind::Drop,
+    }]);
 
     let score = offline::score(&labels, &detected);
     let drop = kind_of(&score, MarkKind::Drop);
 
-    assert_eq!((drop.hits, drop.misses), (1, 1), "one detection answers one label only");
+    assert_eq!(
+        (drop.hits, drop.misses),
+        (1, 1),
+        "one detection answers one label only"
+    );
     assert_eq!(drop.false_positives, 0);
 }
 
 #[test]
 fn report_has_numbers_per_kind() {
-    let labels = Labels::new(vec![Mark { bar: 16, kind: MarkKind::Drop }]);
+    let labels = Labels::new(vec![Mark {
+        bar: 16,
+        kind: MarkKind::Drop,
+    }]);
     let detected = Labels::new(vec![
-        Mark { bar: 16, kind: MarkKind::Drop },
-        Mark { bar: 33, kind: MarkKind::Breakdown },
+        Mark {
+            bar: 16,
+            kind: MarkKind::Drop,
+        },
+        Mark {
+            bar: 33,
+            kind: MarkKind::Breakdown,
+        },
     ]);
 
     let report = offline::score(&labels, &detected).report();
@@ -464,7 +611,10 @@ fn tempo_from_the_file_name() {
         ("biolsong 140ebmaj.wav", Some(140.0)),
         ("la suerte v3 live 87 amin.wav", Some(87.0)),
         ("vampira v2_edit 137bpm - metamor.wav", Some(137.0)),
-        ("C:/Users/ilanf/moshloom-tracks/reza pedia dmin 93.wav", Some(93.0)),
+        (
+            "C:/Users/ilanf/moshloom-tracks/reza pedia dmin 93.wav",
+            Some(93.0),
+        ),
         ("track 128 bpm.wav", Some(128.0)),
         ("track 128_bpm.wav", Some(128.0)),
         ("slow thing 72.5.wav", Some(72.5)),
@@ -483,7 +633,11 @@ fn tempo_from_the_file_name() {
     ];
 
     for (name, want) in cases {
-        assert_eq!(offline::tempo_from_name(name), *want, "tempo_from_name({name:?})");
+        assert_eq!(
+            offline::tempo_from_name(name),
+            *want,
+            "tempo_from_name({name:?})"
+        );
     }
 }
 
@@ -508,5 +662,8 @@ fn decoded_audio_feeds_the_block_iterator() {
     assert_eq!(blocks.len(), 2, "512 frames give two whole blocks");
     let first = blocks[0].transport.expect("transport");
     assert_eq!(first.tempo_bpm, 93.0);
-    assert!(blocks[1].transport.expect("transport").ppq > first.ppq, "the grid advances");
+    assert!(
+        blocks[1].transport.expect("transport").ppq > first.ppq,
+        "the grid advances"
+    );
 }

@@ -85,8 +85,10 @@ impl std::error::Error for OfflineError {
 pub fn read_audio(path: impl AsRef<Path>) -> Result<(Vec<f32>, u32, u16), OfflineError> {
     let path = path.as_ref();
     let name = path.display().to_string();
-    let file = fs::File::open(path)
-        .map_err(|source| OfflineError::Open { path: name.clone(), source })?;
+    let file = fs::File::open(path).map_err(|source| OfflineError::Open {
+        path: name.clone(),
+        source,
+    })?;
     let stream = MediaSourceStream::new(Box::new(file), Default::default());
 
     let mut hint = Hint::new();
@@ -95,7 +97,12 @@ pub fn read_audio(path: impl AsRef<Path>) -> Result<(Vec<f32>, u32, u16), Offlin
     }
 
     let mut format = symphonia::default::get_probe()
-        .format(&hint, stream, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            stream,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .map_err(|e| OfflineError::Unsupported(format!("{name}: {e}")))?
         .format;
 
@@ -192,8 +199,16 @@ pub fn blocks<'a>(
     bpm: f64,
     offset_s: f64,
 ) -> impl Iterator<Item = AudioBlock> + 'a {
-    let frames = if channels == 0 { 0 } else { samples.len() / usize::from(channels) };
-    let usable = if block_frames == 0 || rate == 0 { 0 } else { frames / block_frames };
+    let frames = if channels == 0 {
+        0
+    } else {
+        samples.len() / usize::from(channels)
+    };
+    let usable = if block_frames == 0 || rate == 0 {
+        0
+    } else {
+        frames / block_frames
+    };
     let stride = usize::from(channels);
     (0..usable).map(move |index| {
         let start = index * block_frames;
@@ -234,8 +249,12 @@ pub enum MarkKind {
 
 impl MarkKind {
     /// Every kind, in reporting order.
-    pub const ALL: [MarkKind; 4] =
-        [MarkKind::Build, MarkKind::Drop, MarkKind::Breakdown, MarkKind::Section];
+    pub const ALL: [MarkKind; 4] = [
+        MarkKind::Build,
+        MarkKind::Drop,
+        MarkKind::Breakdown,
+        MarkKind::Section,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -283,7 +302,11 @@ pub struct Labels {
 impl Labels {
     /// Labels with no tempo metadata.
     pub fn new(marks: Vec<Mark>) -> Labels {
-        Labels { bpm: None, offset_s: None, marks }
+        Labels {
+            bpm: None,
+            offset_s: None,
+            marks,
+        }
     }
 
     pub fn parse(text: &str) -> Result<Labels, LabelError> {
@@ -296,16 +319,20 @@ impl Labels {
 
     pub fn load(path: impl AsRef<Path>) -> Result<Labels, LabelError> {
         let path = path.as_ref();
-        let text = fs::read_to_string(path)
-            .map_err(|source| LabelError::Io { path: path.display().to_string(), source })?;
+        let text = fs::read_to_string(path).map_err(|source| LabelError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
         Labels::parse(&text).map_err(|e| e.with_path(path))
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), LabelError> {
         let path = path.as_ref();
         let text = self.to_toml()?;
-        fs::write(path, text)
-            .map_err(|source| LabelError::Io { path: path.display().to_string(), source })
+        fs::write(path, text).map_err(|source| LabelError::Io {
+            path: path.display().to_string(),
+            source,
+        })
     }
 
     /// Bars carrying `kind`, ascending.
@@ -322,7 +349,10 @@ impl Labels {
 
     /// How many marks of each kind, in [`MarkKind::ALL`] order.
     pub fn counts(&self) -> Vec<(MarkKind, usize)> {
-        MarkKind::ALL.into_iter().map(|kind| (kind, self.bars_of(kind).len())).collect()
+        MarkKind::ALL
+            .into_iter()
+            .map(|kind| (kind, self.bars_of(kind).len()))
+            .collect()
     }
 
     /// `"<audio stem>.labels.toml"` next to the audio file: where `--propose` writes.
@@ -460,8 +490,10 @@ impl Score {
 /// A label takes the nearest still-unused detection of the same kind within
 /// [`MATCH_WINDOW_BARS`], so one detection can only answer for one label.
 pub fn score(labels: &Labels, detected: &Labels) -> Score {
-    let kinds: Vec<KindScore> =
-        MarkKind::ALL.into_iter().map(|kind| score_kind(labels, detected, kind)).collect();
+    let kinds: Vec<KindScore> = MarkKind::ALL
+        .into_iter()
+        .map(|kind| score_kind(labels, detected, kind))
+        .collect();
     Score {
         labelled: kinds.iter().map(|k| k.labelled).sum(),
         detected: kinds.iter().map(|k| k.detected).sum(),
@@ -526,7 +558,11 @@ fn score_kind(labels: &Labels, detected: &Labels, kind: MarkKind) -> KindScore {
 /// `bpm` wins; otherwise the first number in [`TEMPO_RANGE`] is taken, and numbers outside it
 /// (`v3`, `v4`, a year) are never a tempo.
 pub fn tempo_from_name(name: &str) -> Option<f64> {
-    let stem = name.rsplit(['/', '\\']).next().unwrap_or(name).to_ascii_lowercase();
+    let stem = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase();
     let bytes = stem.as_bytes();
     let mut marked: Option<f64> = None;
     let mut plain: Option<f64> = None;
@@ -542,10 +578,7 @@ pub fn tempo_from_name(name: &str) -> Option<f64> {
             index += 1;
         }
         // One decimal point, and only when a digit follows it: "72.5.wav" is 72.5, "93.wav" is 93.
-        if index + 1 < bytes.len()
-            && bytes[index] == b'.'
-            && bytes[index + 1].is_ascii_digit()
-        {
+        if index + 1 < bytes.len() && bytes[index] == b'.' && bytes[index + 1].is_ascii_digit() {
             index += 1;
             while index < bytes.len() && bytes[index].is_ascii_digit() {
                 index += 1;
@@ -627,7 +660,11 @@ mod live {
         AnalysisRun {
             labels: Labels::new(propose_from_events(events).marks),
             bars,
-            duration_s: if rate == 0 { 0.0 } else { played as f64 / f64::from(rate) },
+            duration_s: if rate == 0 {
+                0.0
+            } else {
+                played as f64 / f64::from(rate)
+            },
         }
     }
 }

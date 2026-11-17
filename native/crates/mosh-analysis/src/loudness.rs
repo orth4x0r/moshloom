@@ -210,6 +210,9 @@ mod tests {
             dq = quiet.push(&q, 48_000);
             dl = loud.push(&l, 48_000);
         }
-        assert!(dl > dq + 10.0, "5x amplitude should be >14 dB: {dq} vs {dl}");
+        assert!(
+            dl > dq + 10.0,
+            "5x amplitude should be >14 dB: {dq} vs {dl}"
+        );
     }
 }

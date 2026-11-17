@@ -5,9 +5,9 @@
 //! [`AnalysisFrame`](mosh_core::AnalysisFrame) per video frame. Nothing here looks ahead:
 //! every value is computed from audio that has already been pushed.
 //!
-//! The intensity model (Task 1.4, `intensity.rs`) turns the per-bar [`BarStats`] this stage
-//! produces into `intensity`, `level` and level/section events; until it is wired in the frame
-//! carries the neutral `intensity = 0.0, level = 1`.
+//! The intensity model (Task 1.4, `intensity.rs`) runs inside the analyzer: every closed bar is
+//! pushed to it, and the frame carries its `intensity`, `level` and events (PHRASE, BUILD_START,
+//! DROP, BREAKDOWN, LEVEL_UP, LEVEL_DOWN). Call [`Analyzer::song_start`] at a song marker.
 
 pub mod features;
 pub mod grid;
@@ -18,7 +18,7 @@ pub mod offline;
 use mosh_core::analysis::{AnalysisFrame, BarStats, EventFlags, TransportSource};
 use mosh_core::transport::AudioBlock;
 
-use features::{FeatureValues, FeatureExtractor, ONSET_PEAK_FLOOR};
+use features::{FeatureExtractor, FeatureValues, ONSET_PEAK_FLOOR};
 use grid::{BeatGrid, CompletedBar};
 use loudness::LoudnessMeter;
 
@@ -207,6 +207,9 @@ pub struct Analyzer {
     acc: BarAccumulator,
     bars: Vec<BarStats>,
     events: EventFlags,
+    intensity: intensity::IntensityModel,
+    level: u8,
+    intensity_value: f32,
     frame: AnalysisFrame,
     sample_rate: u32,
     sample_pos: i64,
@@ -229,6 +232,9 @@ impl Analyzer {
             acc: BarAccumulator::default(),
             bars: Vec::with_capacity(BAR_CAPACITY),
             events: EventFlags::empty(),
+            intensity: intensity::IntensityModel::new(config.phrase_bars, config.history_bars),
+            level: 1,
+            intensity_value: 0.0,
             frame: AnalysisFrame::default(),
             sample_rate: 48_000,
             sample_pos: 0,
@@ -299,7 +305,19 @@ impl Analyzer {
         f
     }
 
-    /// Bars that closed since the previous call. Consumed by the intensity model (Task 1.4).
+    /// A song marker was crossed: the intensity history restarts and the next frame carries
+    /// SONG_START, so a quiet intro is judged against itself, not the previous song's drop.
+    pub fn song_start(&mut self) {
+        self.intensity.reset();
+        self.level = 1;
+        self.intensity_value = 0.0;
+        self.frame.level = 1;
+        self.frame.intensity = 0.0;
+        self.events |= EventFlags::SONG_START;
+    }
+
+    /// Bars that closed since the previous call (for the offline harness and the stats overlay;
+    /// the analyzer already feeds them to its own intensity model).
     pub fn drain_bars(&mut self) -> Vec<BarStats> {
         let mut out = Vec::with_capacity(self.bars.len().max(BAR_CAPACITY));
         out.extend_from_slice(&self.bars);
@@ -358,10 +376,9 @@ impl Analyzer {
         f.loudness_db = loudness_db;
         f.loudness = loudness;
         f.brightness = brightness;
-        // Task 1.4 owns the intensity model; until the app wires it in, the frame says "level 1,
-        // no intensity", which every visual interprets as the neutral state.
-        f.intensity = 0.0;
-        f.level = 1;
+        // Intensity and level change only when a bar closes (see `close_bar`).
+        f.intensity = self.intensity_value;
+        f.level = self.level;
     }
 
     /// Turn the bar that just finished into [`BarStats`], normalised against the bars before it.
@@ -374,8 +391,7 @@ impl Analyzer {
         let loudness_db = (self.acc.loud_db * inv) as f32;
         let brightness = (self.acc.brightness * inv) as f32;
         let beats = completed.beats.max(1) as f32;
-        let onset_density =
-            (self.acc.onsets as f32 / beats / ONSETS_PER_BEAT_MAX).clamp(0.0, 1.0);
+        let onset_density = (self.acc.onsets as f32 / beats / ONSETS_PER_BEAT_MAX).clamp(0.0, 1.0);
 
         // Normalise against the bars before this one, then let this bar into the window.
         let bar = BarStats {
@@ -395,6 +411,15 @@ impl Analyzer {
         self.loud.push(loudness_db);
         self.bright.push(brightness);
         self.acc.reset();
+
+        // The intensity model sees every bar. It fires PHRASE itself; the grid's PHRASE is the
+        // same boundary, so OR-ing both is harmless.
+        let update = self.intensity.push_bar(&bar);
+        self.intensity_value = update.intensity;
+        self.level = update.level;
+        self.events |= update.events;
+        self.frame.intensity = update.intensity;
+        self.frame.level = update.level;
 
         if self.bars.len() < self.bars.capacity() {
             self.bars.push(bar);
