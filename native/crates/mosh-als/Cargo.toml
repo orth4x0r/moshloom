@@ -8,3 +8,10 @@ publish.workspace = true
 
 [dependencies]
 mosh-core = { path = "../mosh-core" }
+flate2 = "1.1"
+quick-xml = "0.42"
+
+[dev-dependencies]
+# The tests generate minimal gzipped `.als` fixtures at run time, so the encoder
+# has to be available to the integration tests too.
+flate2 = "1.1"
