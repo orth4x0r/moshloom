@@ -240,6 +240,11 @@ Threads: ipc/capture reader -> analysis (audio-rate) -> show + render (vsync); c
 ### Task 2.7: control window and editors (needs 2.6)
 Session grid, arrangement timeline (lanes per layer, song markers, `.als` import button), clip editor (visualizer, params, ranges per level, effects, transition, follow action), preset save from a seed. Tests are UI-model tests (no pixels): editing a clip updates the project; importing an `.als` adds markers.
 
+### Task 2.8: overlay video layers (needs 1.7, 1.11)
+Upload `mosh-video` BGRA frames into a GPU texture each frame (one staging buffer per layer, reused) and draw them into a layer with aspect-correct cover scaling, through `mosh_visuals::overlay::OverlayLayer`. Tests: a 160x90 checkerboard uploaded and drawn into a 64x36 target reads back with the expected cover crop; 600 uploads allocate no new GPU memory after the first; upload time per 1080p frame in the PR body.
+
+**Phase 2 contract:** the coordinator froze the public signatures of `native/crates/mosh-visuals` (the facade `Visuals::draw_layer` and one stub module per lane) before Phase 2 started; see that crate's `lib.rs` for the chain and the owners.
+
 ## Phase 3: coordinator integration on the reference machine
 - Load both plugins in Live 12 with the long arrangement; measure plugin callback time, app CPU and GPU on battery, latency; tune the intensity rules against the corrected labels of the 15 tracks; record every number in `native/README.md`.
 

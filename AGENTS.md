@@ -79,10 +79,20 @@ Native lanes are one crate each, one worker each.
 | **N-video** | `native/crates/mosh-video/**` | 1.11 |
 | **N-shaders** | `native/crates/mosh-shaders/**`, `scripts/extract_wgsl.mjs` | 1.12 |
 | **N-app** | `native/crates/mosh-app/**` | 2.6, 2.7 |
+| **N-tempo** | `mosh-analysis`: `src/tempo.rs`, `tests/tempo.rs` (+ the loopback hook in `Analyzer::push`) | 2.5 |
+| **V-scenes** | `native/crates/mosh-visuals/src/{visuals.rs,scenes.rs}`, `wgsl/scene_*` additions in mosh-shaders | 2.1 |
+| **V-mosh** | `native/crates/mosh-visuals/src/mosh.rs` (+ `src/mosh/`) | 2.2 |
+| **V-fx** | `native/crates/mosh-visuals/src/{effects.rs,transitions.rs}` (+ `src/effects/`, `src/transitions/`) | 2.3 |
+| **V-fluid** | `native/crates/mosh-visuals/src/fluid.rs` (+ `src/fluid/`) | 2.4 |
+| **V-overlay** | `native/crates/mosh-visuals/src/overlay.rs`, a new `mosh-render/src/upload.rs` | 2.8 |
 
 Rules for native lanes:
 
 - `mosh-core` is the contract. A lane that needs a change to it stops and reports; it never edits it.
+- The public signatures in `native/crates/mosh-visuals/src/*.rs` are a second contract (Phase 2):
+  a V-lane fills in bodies and private items, never changes a public signature.
+- Shader files a V-lane adds to `mosh-shaders/wgsl/` use its own prefix (`scene_`, `mosh_`, `fx_`,
+  `tr_`, `fluidvis_`, `overlay_`); only V-scenes edits `mosh-shaders/src/lib.rs`.
 - **`native/Cargo.lock` is generated.** On a merge conflict, take either side and run
   `cargo generate-lockfile` then `cargo test --workspace`; never hand-merge it.
 - The gate for a native lane is `cargo test -p <crate>` and `cargo clippy -p <crate> -- -D warnings`

@@ -12,6 +12,7 @@ members = [
   "crates/mosh-video",
   "crates/mosh-midi",
   "crates/mosh-als",
+  "crates/mosh-visuals",
   "crates/mosh-app",
 ]
 
