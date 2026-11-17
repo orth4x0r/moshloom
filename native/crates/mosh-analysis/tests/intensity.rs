@@ -310,8 +310,8 @@ fn build_then_drop_detected() {
 
     assert_eq!(
         build_bars,
-        vec![11],
-        "BUILD_START on the fourth rising bar, and once only"
+        vec![9],
+        "BUILD_START once the sweep has risen for two bars, and once only"
     );
     assert_eq!(drop_bars, vec![12], "DROP when the low end returns");
     assert_eq!(level_at_drop, 4, "the drop bar is a loud bar");

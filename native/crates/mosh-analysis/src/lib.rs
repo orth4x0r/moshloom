@@ -15,25 +15,41 @@
 //! because onset density is per beat and the model is the only place that knows the window it
 //! should be read against.
 //!
+//! Sections (wave 3, `sections.rs`) run inside the analyzer too: every closed bar also carries
+//! its raw features (mel, low band, fast level) to a [`sections::SectionTracker`], which decides
+//! where sections start, how loud each one is and where the level should read. That is what tells
+//! two loud sections 7 dB apart apart, which a 32-bar window cannot. A section change is reported
+//! as PHRASE on the bar it starts, together with the level events: mosh-core has no dedicated
+//! section flag.
+//!
+//! Stems are optional. [`Analyzer::push_stem`] takes a drums or bass block next to the master and
+//! uses its onsets (builds) and low band (a drop's low-end return); without stems every cue comes
+//! from the master, which is the default path.
+//!
 //! Loopback mode (Task 2.5, `tempo.rs`) has audio but no transport. A block whose
 //! [`AudioBlock::transport`] is `None` feeds the [`tempo::TempoTracker`], and once it locks the
 //! analyzer synthesises a 4/4 transport from it: the frame's `source` becomes
 //! [`TransportSource::Tracked`], `playing` turns true, and beats, bars and phrases keep firing on
 //! the tracked grid. With a transport present nothing about the tracker runs.
 
+pub mod eval;
 pub mod features;
 pub mod grid;
 pub mod intensity;
 pub mod loudness;
 pub mod offline;
+pub mod sections;
 pub mod tempo;
 
 use mosh_core::analysis::{AnalysisFrame, BarStats, EventFlags, TransportSource};
 use mosh_core::transport::{AudioBlock, Transport};
+use mosh_core::ShowRole;
 
-use features::{FeatureExtractor, FeatureValues, ONSET_PEAK_FLOOR};
+use features::{FeatureExtractor, FeatureValues, ONSET_PEAK_FLOOR, MEL_BANDS};
 use grid::{BeatGrid, CompletedBar};
+use intensity::IntensityUpdate;
 use loudness::LoudnessMeter;
+use sections::{BarFeatures, SectionState, SectionTracker};
 use tempo::TempoTracker;
 
 /// A hanning-windowed 2048-point FFT is 43 ms of history at 48 kHz: enough for 43 Hz resolution
@@ -88,6 +104,13 @@ const RANK_WARMUP_BARS: usize = 8;
 /// `BarStats::onset_density` counts onset peaks per beat. The clamp only stops a broken
 /// detector from handing the model an absurd number; typical material is 0.5-4.
 const ONSETS_PER_BEAT_MAX: f32 = 8.0;
+/// The mid-bar drop pass runs once the bar is this far in. Half a bar is late enough not to
+/// mistake a kick on the downbeat for a drop (the first beat of a bar is the loudest part of it),
+/// and early enough that the show reacts inside the bar the drop lands in, not a bar later.
+const DROP_PEEK_PHASE: f32 = 0.45;
+/// ... and needs at least this many blocks of it, so a 512-frame plugin buffer still measures
+/// something rather than one block.
+const DROP_PEEK_BLOCKS: u32 = 20;
 /// Loopback mode has no transport, so the tracker's grid is synthesised as 4/4, the time signature
 /// the web engine assumes. A transport from the plugin always wins when one is present.
 const TRACKED_SIG_NUM: u16 = 4;
@@ -271,6 +294,13 @@ struct BarAccumulator {
     /// Summed dB and brightness, averaged when the bar closes.
     loud_db: f64,
     brightness: f64,
+    /// Summed mel bands, averaged when the bar closes: the section model's spectral shape.
+    mel: [f64; MEL_BANDS],
+    /// Summed block RMS (linear): the fast level, which does not wait for the 3 s meter ...
+    rms: f64,
+    /// ... and the same over the first half of the bar, where a drop's downbeat lands.
+    early_rms: f64,
+    early_blocks: u32,
     onsets: u32,
     prev_onset: f32,
     prev_prev_onset: f32,
@@ -281,24 +311,103 @@ impl BarAccumulator {
         *self = Self::default();
     }
 
-    fn add_block(&mut self, fv: &FeatureValues, loudness_db: f32) {
+    /// Fold one block in. `onset_signal` is the master's onset, or the drums stem's when one is
+    /// tapped; `low_power` is the master's low band, or the bass stem's.
+    fn add_block(
+        &mut self,
+        fv: &FeatureValues,
+        loudness_db: f32,
+        onset_signal: f32,
+        low_power: f32,
+        early: bool,
+    ) {
         self.blocks += 1;
-        for b in 0..3 {
-            self.power[b] += fv.power[b] as f64;
-        }
+        self.power[0] += low_power as f64;
+        self.power[1] += fv.power[1] as f64;
+        self.power[2] += fv.power[2] as f64;
         self.loud_db += loudness_db as f64;
         self.brightness += fv.brightness as f64;
+        for (sum, value) in self.mel.iter_mut().zip(fv.mel.iter()) {
+            *sum += *value as f64;
+        }
+        self.rms += fv.rms as f64;
+        if early {
+            self.early_rms += fv.rms as f64;
+            self.early_blocks += 1;
+        }
         // A peak is a local maximum of the onset envelope above the detection floor. One block
         // of look-ahead, which is why the count for a bar is final one block after its end.
         if self.prev_onset > ONSET_PEAK_FLOOR
             && self.prev_onset > self.prev_prev_onset
-            && self.prev_onset >= fv.onset
+            && self.prev_onset >= onset_signal
         {
             self.onsets += 1;
         }
         self.prev_prev_onset = self.prev_onset;
-        self.prev_onset = fv.onset;
+        self.prev_onset = onset_signal;
     }
+
+    fn blocks(&self) -> u32 {
+        self.blocks
+    }
+
+    fn inv(&self) -> f64 {
+        1.0 / self.blocks.max(1) as f64
+    }
+
+    /// Mean block RMS of the bar so far, dBFS: the drop detector's level, on the bar it moves.
+    fn rms_db(&self) -> f32 {
+        if self.blocks == 0 {
+            return -120.0;
+        }
+        let mean = (self.rms * self.inv()).max(1e-12);
+        20.0 * (mean as f32).log10()
+    }
+
+    /// Mean block RMS of the first half of the bar so far, dBFS: the drop detector compares like
+    /// with like across a bar line, where the downbeat is always the loudest part.
+    fn early_db(&self) -> f32 {
+        if self.early_blocks == 0 {
+            return self.rms_db();
+        }
+        let mean = (self.early_rms / f64::from(self.early_blocks)).max(1e-12);
+        20.0 * (mean as f32).log10()
+    }
+
+    fn mel_mean(&self) -> [f32; MEL_BANDS] {
+        let inv = self.inv();
+        let mut out = [0.0f32; MEL_BANDS];
+        for (slot, sum) in out.iter_mut().zip(self.mel.iter()) {
+            *slot = (*sum * inv) as f32;
+        }
+        out
+    }
+}
+
+/// One closed bar, with what the model and the section detector made of it: the offline harness
+/// and the stats overlay read this, the live path only needs the frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BarDetail {
+    pub stats: BarStats,
+    /// Raw measures of the same bar: the section model's inputs and the drop detector's fast
+    /// level, kept so `mosh-analyze --dump` can show what the rules saw.
+    pub raw: BarFeatures,
+    pub section: SectionState,
+    pub update: IntensityUpdate,
+    /// A DROP fired for this bar, either from the mid-bar pass (on the downbeat) or at the bar
+    /// close.
+    pub drop: bool,
+}
+
+/// One tapped stem's per-block features. Allocated on the first stem block of that role; nothing
+/// allocates afterwards.
+struct StemTap {
+    features: FeatureExtractor,
+    mono: Vec<f32>,
+    fv: FeatureValues,
+    /// The master's block counter when this stem was last seen: a stem is used for the master
+    /// block with the same counter, or the next one (the plugin may push either order).
+    seq: u64,
 }
 
 /// The causal feature stage: one audio block in, one frame (and sometimes a bar) out.
@@ -315,7 +424,7 @@ pub struct Analyzer {
     loud: RollingRange,
     bright: RollingRange,
     acc: BarAccumulator,
-    bars: Vec<BarStats>,
+    bars: Vec<BarDetail>,
     events: EventFlags,
     intensity: intensity::IntensityModel,
     level: u8,
@@ -323,6 +432,16 @@ pub struct Analyzer {
     frame: AnalysisFrame,
     sample_rate: u32,
     sample_pos: i64,
+    /// Sections: boundaries, their energy and the level target they give the model.
+    sections: SectionTracker,
+    /// Optional stem taps. Taps change what a bar's onsets and low end come from; with no stem
+    /// pushed, everything comes from the master.
+    drums: Option<StemTap>,
+    bass: Option<StemTap>,
+    /// Master blocks pushed since the analyzer was built: stems are matched on it.
+    block_seq: u64,
+    /// The bar the mid-bar drop pass has already run on, so it runs once per bar.
+    peeked_bar: Option<i64>,
     /// Loopback mode: the causal tempo and beat-phase tracker. Fed only when a block arrives
     /// without a transport; with the plugin nothing here runs.
     tempo: TempoTracker,
@@ -359,6 +478,11 @@ impl Analyzer {
             },
             sample_rate: 48_000,
             sample_pos: 0,
+            sections: SectionTracker::new(),
+            drums: None,
+            bass: None,
+            block_seq: 0,
+            peeked_bar: None,
             tempo: TempoTracker::new(48_000),
             tracked_ppq: 0.0,
             tracked_started: false,
@@ -381,6 +505,17 @@ impl Analyzer {
         self.downmix(b, frames);
         let fv = self.features.process(&self.mono, b.sample_rate);
         let loudness_db = self.loudness.push(&self.mono, b.sample_rate);
+        let seq = self.block_seq;
+        self.block_seq += 1;
+
+        // Stems: the drums carry the onsets a build is made of, the bass carries the low end a
+        // drop returns with. Without a stem (or with a stale one) the master's own features do.
+        let onset_signal = self
+            .stem_features(&self.drums, seq)
+            .map_or(fv.onset, |stem| stem.onset);
+        let low_power = self
+            .stem_features(&self.bass, seq)
+            .map_or(fv.power[0], |stem| stem.power[0]);
 
         if let Some(t) = b.transport {
             self.tracked_started = false;
@@ -401,8 +536,54 @@ impl Analyzer {
             }
         }
 
-        self.acc.add_block(&fv, loudness_db);
+        self.acc
+            .add_block(&fv, loudness_db, onset_signal, low_power, self.frame.bar_phase < 0.5);
+        self.peek_drop();
         self.update_frame(&fv, loudness_db, frames);
+    }
+
+    /// Feed an optional stem block, matched to the master block it belongs to.
+    ///
+    /// The Tap plugin can be run on stems as well as on the master; the roles that change the
+    /// analysis are [`ShowRole::Drums`] (onsets, and therefore builds) and [`ShowRole::Bass`] (the
+    /// low end, and therefore the low-end return in a drop). Any other role is accepted and
+    /// ignored: the master path is the default and needs no stems. Pushing stems is optional and
+    /// per block, so a show can start without them and add them later.
+    pub fn push_stem(&mut self, role: ShowRole, b: &AudioBlock) {
+        let frames = b.frames();
+        if frames == 0 || b.sample_rate == 0 {
+            return;
+        }
+        let fft = self.config.fft_size;
+        let tap = match role {
+            ShowRole::Drums => &mut self.drums,
+            ShowRole::Bass => &mut self.bass,
+            _ => return,
+        };
+        if tap.is_none() {
+            *tap = Some(StemTap {
+                features: FeatureExtractor::new(fft),
+                mono: Vec::with_capacity(fft.max(1024)),
+                fv: FeatureValues::default(),
+                seq: self.block_seq,
+            });
+        }
+        let tapped = tap.as_mut().expect("just created");
+        tapped.mono.clear();
+        if tapped.mono.capacity() < frames {
+            tapped.mono.reserve(frames - tapped.mono.len());
+        }
+        downmix_into(b, frames, &mut tapped.mono);
+        tapped.fv = tapped.features.process(&tapped.mono, b.sample_rate);
+        tapped.seq = self.block_seq;
+    }
+
+    /// The features of a stem tapped for this master block or the one before it. A stem that
+    /// stopped arriving is dropped from the analysis instead of being reused for ever.
+    fn stem_features<'a>(&self, tap: &'a Option<StemTap>, seq: u64) -> Option<&'a FeatureValues> {
+        tap.as_ref()
+            .filter(|tap| seq.saturating_sub(tap.seq) <= 1)
+            .map(|tap| &tap.fv)
     }
 
     /// The grid part of a block: phase, indices, and the beat/bar events a transport implies.
@@ -480,16 +661,27 @@ impl Analyzer {
     /// SONG_START, so a quiet intro is judged against itself, not the previous song's drop.
     pub fn song_start(&mut self) {
         self.intensity.reset();
+        self.sections.reset();
         self.level = 1;
         self.intensity_value = 0.0;
         self.frame.level = 1;
         self.frame.intensity = 0.0;
+        self.peeked_bar = None;
         self.events |= EventFlags::SONG_START;
     }
 
     /// Bars that closed since the previous call (for the offline harness and the stats overlay;
     /// the analyzer already feeds them to its own intensity model).
     pub fn drain_bars(&mut self) -> Vec<BarStats> {
+        self.drain_bar_details()
+            .into_iter()
+            .map(|detail| detail.stats)
+            .collect()
+    }
+
+    /// The closed bars with everything the model and the section detector made of them: for
+    /// `mosh-analyze --dump` and the stats overlay.
+    pub fn drain_bar_details(&mut self) -> Vec<BarDetail> {
         let mut out = Vec::with_capacity(self.bars.len().max(BAR_CAPACITY));
         out.extend_from_slice(&self.bars);
         self.bars.clear();
@@ -505,6 +697,62 @@ impl Analyzer {
         self.high.clear();
         self.loud.clear();
         self.bright.clear();
+        self.sections.reset();
+        self.peeked_bar = None;
+    }
+
+    /// The mid-bar drop pass: once per bar, a beat into it, a DROP is emitted as soon as the bar's
+    /// first beat has the jump, so the show reacts on the downbeat instead of at the next bar
+    /// line. The bar close then skips its own DROP for the same bar (`IntensityModel::note_drop`).
+    fn peek_drop(&mut self) {
+        let bar = self.frame.bar_index;
+        if !self.frame.playing
+            || self.frame.source == TransportSource::None
+            || self.frame.bar_phase < DROP_PEEK_PHASE
+            || self.peeked_bar == Some(bar)
+            || self.acc.blocks() < DROP_PEEK_BLOCKS
+        {
+            return;
+        }
+        self.peeked_bar = Some(bar);
+        let (stats, raw) = self.bar_preview();
+        if self.intensity.is_drop(&stats, &raw) {
+            self.events |= EventFlags::DROP;
+            self.intensity.note_drop(bar);
+        }
+    }
+
+    /// The bar in progress as it looks after its first beat: the same normalisation the closing
+    /// bar will get, over the blocks heard so far.
+    fn bar_preview(&self) -> (BarStats, BarFeatures) {
+        let inv = self.acc.inv();
+        let low_db = power_db((self.acc.power[0] * inv) as f32);
+        let loudness_db = (self.acc.loud_db * inv) as f32;
+        let brightness = (self.acc.brightness * inv) as f32;
+        let beats = (self.frame.bar_phase * 4.0).max(0.25);
+        let onset_density =
+            (self.acc.onsets as f32 / beats).clamp(0.0, ONSETS_PER_BEAT_MAX);
+        let raw = BarFeatures {
+            bar_index: self.frame.bar_index,
+            loudness_db,
+            low_db,
+            level_db: self.acc.rms_db(),
+            early_db: self.acc.early_db(),
+            onset_density,
+            brightness,
+            mel: self.acc.mel_mean(),
+        };
+        let stats = BarStats {
+            bar_index: self.frame.bar_index,
+            start_ppq: self.frame.ppq - f64::from(self.frame.bar_phase) * 4.0,
+            beats: 4,
+            loudness_db,
+            loudness: self.loud.normalize(loudness_db),
+            low: self.low.normalize(low_db),
+            onset_density,
+            brightness: self.bright.normalize(brightness),
+        };
+        (stats, raw)
     }
 
     fn downmix(&mut self, b: &AudioBlock, frames: usize) {
@@ -512,19 +760,7 @@ impl Analyzer {
         if self.mono.capacity() < frames {
             self.mono.reserve(frames - self.mono.len());
         }
-        let channels = b.channels.max(1) as usize;
-        if channels == 1 {
-            self.mono.extend_from_slice(&b.samples[..frames]);
-        } else {
-            let scale = 1.0 / channels as f32;
-            for f in 0..frames {
-                let mut sum = 0.0;
-                for c in 0..channels {
-                    sum += b.samples[f * channels + c];
-                }
-                self.mono.push(sum * scale);
-            }
-        }
+        downmix_into(b, frames, &mut self.mono);
     }
 
     fn update_frame(&mut self, fv: &FeatureValues, loudness_db: f32, frames: usize) {
@@ -552,7 +788,8 @@ impl Analyzer {
         f.level = self.level;
     }
 
-    /// Turn the bar that just finished into [`BarStats`], normalised against the bars before it.
+    /// Turn the bar that just finished into [`BarStats`], normalised against the bars before it,
+    /// and hand the same bar to the section detector and the intensity model.
     fn close_bar(&mut self, completed: CompletedBar) {
         let blocks = self.acc.blocks.max(1);
         let inv = 1.0 / blocks as f64;
@@ -566,6 +803,16 @@ impl Analyzer {
         // and dividing by four here would cap the term at 1.0 for 16th-note material and make
         // that normalisation dead code.
         let onset_density = (self.acc.onsets as f32 / beats).clamp(0.0, ONSETS_PER_BEAT_MAX);
+        let raw = BarFeatures {
+            bar_index: completed.bar_index,
+            loudness_db,
+            low_db,
+            level_db: self.acc.rms_db(),
+            early_db: self.acc.early_db(),
+            onset_density,
+            brightness,
+            mel: self.acc.mel_mean(),
+        };
 
         // Normalise against the bars before this one, then let this bar into the window.
         let bar = BarStats {
@@ -585,25 +832,55 @@ impl Analyzer {
         self.loud.push(loudness_db);
         self.bright.push(brightness);
         self.acc.reset();
+        self.peeked_bar = None;
 
+        // The section detector looks back further than the bar window: it says where this bar
+        // sits among the sections heard so far, and the model reads its level against that.
+        let section = self.sections.push_bar(&raw);
         // The intensity model sees every bar. It fires PHRASE itself; the grid's PHRASE is the
         // same boundary, so OR-ing both is harmless.
-        let update = self.intensity.push_bar(&bar);
+        let update = self.intensity.push_bar_with(&bar, &raw, &section);
         self.intensity_value = update.intensity;
         self.level = update.level;
         self.events |= update.events;
         self.frame.intensity = update.intensity;
         self.frame.level = update.level;
 
+        let detail = BarDetail {
+            stats: bar,
+            raw,
+            section,
+            update,
+            drop: self.intensity.drop_bar() == Some(bar.bar_index)
+                || update.events.contains(EventFlags::DROP),
+        };
         if self.bars.len() < self.bars.capacity() {
-            self.bars.push(bar);
+            self.bars.push(detail);
         } else {
             // Never expected (drain_bars runs per video frame); keep the newest bar rather than
             // growing the buffer inside push.
             if let Some(last) = self.bars.last_mut() {
-                *last = bar;
+                *last = detail;
             }
         }
+    }
+}
+
+/// Downmix one block into `out` (mono), reusing its buffer. Allocates only when `out` has to
+/// grow, which the first pushes do.
+fn downmix_into(b: &AudioBlock, frames: usize, out: &mut Vec<f32>) {
+    let channels = b.channels.max(1) as usize;
+    if channels == 1 {
+        out.extend_from_slice(&b.samples[..frames]);
+        return;
+    }
+    let scale = 1.0 / channels as f32;
+    for f in 0..frames {
+        let mut sum = 0.0;
+        for c in 0..channels {
+            sum += b.samples[f * channels + c];
+        }
+        out.push(sum * scale);
     }
 }
 

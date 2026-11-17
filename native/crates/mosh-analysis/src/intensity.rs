@@ -1,9 +1,11 @@
 //! The intensity model: per-bar features to a continuous intensity, a 1..=4 level
 //! with hysteresis, and the phrase / build / drop / breakdown events the show uses.
 //!
-//! Task 1.4 of `docs/superpowers/plans/2026-11-17-native-port.md`.
+//! Task 1.4 of `docs/superpowers/plans/2026-11-17-native-port.md`, revised in wave 3 by
+//! A-sections: the level is read against sections as well as bars, and builds and drops are
+//! detected from the cues a build and a drop actually have.
 //!
-//! Two causal stages, both against recent bars:
+//! Three causal stages, all against what has already been heard:
 //!
 //! 1. **Intensity** is the weighted mean of the four terms (loudness 0.45, low 0.25, onset 0.18,
 //!    brightness 0.12; the plan's starting point was 0.35 / 0.30 / 0.20 / 0.15 and the change is
@@ -12,21 +14,28 @@
 //!    last `history_bars` bars; `onset_density` arrives raw, as onsets per beat, and this model
 //!    normalises it the same way. `loudness_db` is the raw short-term level and decides silence,
 //!    because a normalised feature of a noise floor can be anything.
-//! 2. **Level** is where that intensity sits in the recent dynamic range (its 5th-95th percentile
-//!    over the last `history_bars` bars), through the plan's thresholds (0.25 / 0.5 / 0.75) with
-//!    its hysteresis band and at most one step per bar. Reading a position in the range is what
-//!    makes the levels usable: the weighted mean of four correlated terms sits in a narrow band,
-//!    so thresholds on the mean itself put almost every bar in one or two levels. A section that
-//!    does not change reads the middle; a drop reads the top; a breakdown reads the bottom.
+//! 2. **Level** is where that intensity sits in the recent dynamic range, blended with where the
+//!    *section* sits among the sections heard so far (see [`crate::sections`]). The section half
+//!    is 0.85 of the reading: a 32-bar window cannot tell two loud sections 7 dB apart (both sit
+//!    at the top of the window and both read level 4, which is what the tuning tracks showed), so
+//!    the section target, not the bar window, decides the level of a section. The four
+//!    thresholds (0.25 / 0.5 / 0.75), the hysteresis band and the one-step-per-bar rule still apply
+//!    to the reading, so a level never moves faster than a bar and a collapse walks down instead
+//!    of snapping.
+//! 3. **Events.** BUILD_START needs a rising onset density (snare rolls), a rising high end
+//!    (filter or noise sweeps) or a rising intensity, with the low end not rising — those are the
+//!    cues a build has, and any of them starts one. DROP needs a big level jump or a low-end
+//!    return on the bar it happens, with a build or a gap behind it; it is evaluated once mid-bar
+//!    as well, so it lands on the downbeat instead of a bar later at the next bar line. BREAKDOWN
+//!    is the opposite: low end and onsets falling away for a full bar.
 //!
 //! Everything here is causal and per bar: `push_bar` is the only way in, so a level
 //! never changes in the middle of a bar, never moves more than one step per bar, and the same
 //! bar sequence always produces the same events. `reset` is for song markers.
 
-use std::collections::VecDeque;
-
 use mosh_core::{BarStats, EventFlags};
 
+use crate::sections::{BarFeatures, SectionState};
 use crate::RollingRange;
 
 /// Weights of the four normalised terms. They sum to 1, so the intensity is 0..1.
@@ -40,6 +49,11 @@ const W_LOUDNESS: f32 = 0.45;
 const W_LOW: f32 = 0.25;
 const W_ONSET: f32 = 0.18;
 const W_BRIGHTNESS: f32 = 0.12;
+
+/// How much of the level reading comes from the section target rather than the bar's position in
+/// the last `history_bars` bars. The bar half cannot separate two loud sections, and the section
+/// half cannot follow a one-bar change inside a section; 0.85 / 0.15 keeps both jobs.
+const SECTION_WEIGHT: f32 = 0.85;
 
 /// Level boundaries: below 0.25 is level 1, at or above 0.75 is level 4.
 const LEVEL_THRESHOLDS: [f32; 3] = [0.25, 0.5, 0.75];
@@ -59,10 +73,32 @@ const BREAKDOWN_LEVEL: u8 = 3;
 /// Breakdown: normalised low and onsets both below this for a full bar.
 const BREAKDOWN_QUIET: f32 = 0.25;
 
-/// Drop: the low band returns above this, having been at or below it.
-const DROP_LOW: f32 = 0.6;
-/// A bar with low below this counts as "no low end" for the drop detection.
+/// The low band is "there" above this normalised level. Below it the bar has no low end: a gap,
+/// a low-pass, a breakdown.
+const LOW_PRESENT: f32 = 0.30;
+/// ... and above this raw level, dB on the bar's 20-150 Hz mean power. The normalised value is
+/// relative, so a track with no low end at all still maps one bar to 0.5; a drop's low end is a
+/// kick and a bass, not a normalised noise floor.
+const LOW_DB_PRESENT: f32 = -35.0;
+/// ... and it "returns" when it rises this far above the previous bar's low band, staying above
+/// [`LOW_PRESENT`]. A return is a jump in the low band, not a fixed level: the same arrangement
+/// in a quieter section normalises lower on every bar.
+const LOW_RETURN_JUMP: f32 = 0.20;
+/// A bar with low below this counts as "no low end" for the gap counter.
 const LOW_GAP: f32 = 0.2;
+/// A drop needs a level jump of this many dB over the loudest of the last few bars ...
+const DROP_JUMP_DB: f32 = 4.5;
+/// ... measured over this many bars. The first half of a bar is compared with the first half of
+/// the bars before it, and against their *loudest*, not their average: a four-on-the-floor track
+/// alternates a kick-heavy first half with a sparse one every other bar, and an average makes
+/// every second bar look like a drop. A drop is above everything recent, which is what this says.
+const DROP_LOOKBACK_BARS: usize = 4;
+/// A bar this far below the loudest recent bar is a gap (a low-pass, a filter sweep's silence,
+/// a drop-out) even when the low band is still there: a drop comes out of one.
+const GAP_LEVEL_DB: f32 = 5.0;
+/// No second drop this soon: a drop is a structural event, and a re-trigger on the next bar is
+/// the same drop heard twice.
+const DROP_COOLDOWN_BARS: i64 = 2;
 
 /// Silence: short-term loudness below this many dB.
 const SILENCE_DB: f32 = -50.0;
@@ -70,10 +106,17 @@ const SILENCE_DB: f32 = -50.0;
 /// and the history, so the next song starts from nothing.
 const SILENCE_BARS_TO_RESET: u32 = 2;
 
-/// BUILD_START: intensity rose for this many consecutive bars ...
-const BUILD_BARS: usize = 4;
-/// ... by more than this in total.
-const BUILD_RISE: f32 = 0.15;
+/// Build: the cue is measured over the last this many bars ...
+const BUILD_BARS: usize = 3;
+/// ... and needs this much of a rise.
+const BUILD_RISE: f32 = 0.10;
+/// A snare roll: onsets per beat rising this much over [`BUILD_BARS`].
+const BUILD_ONSET_RISE: f32 = 1.0;
+/// A filter or noise sweep: normalised brightness rising this much over [`BUILD_BARS`].
+const BUILD_BRIGHT_RISE: f32 = 0.12;
+/// A build that adds low end is a drop arriving, not a build: the low band may rise by at most
+/// this much while a build is confirmed.
+const BUILD_LOW_ALLOWANCE: f32 = 0.12;
 /// A build stays open for at most this many bars when no drop arrives.
 const BUILD_MAX_BARS: u32 = 8;
 
@@ -99,8 +142,8 @@ pub struct IntensityTerms {
 pub struct IntensityUpdate {
     /// Continuous intensity 0..1: the weighted mean of the four normalised terms.
     pub intensity: f32,
-    /// The intensity through the level machine's calibration (0..1). Diagnostic: this is what
-    /// the thresholds saw.
+    /// The reading the level machine saw: the section target blended with the bar's position in
+    /// the recent range (0..1).
     pub reading: f32,
     /// 1..=4, changing only here, on a bar boundary.
     pub level: u8,
@@ -121,22 +164,31 @@ pub struct IntensityModel {
     /// Onset densities of the last `history_bars` bars.
     onsets: RollingRange,
     /// Intensities of the last `history_bars` bars: the range the level reads a bar against.
-    /// Intensities of the last \history_bars\ bars: the range the level places a bar in.
     scale: RollingRange,
-    /// Intensities of the last `BUILD_BARS` bars, current bar excluded, oldest first.
-    recent: VecDeque<f32>,
-    /// Consecutive bars with a strictly rising intensity.
-    rising_bars: usize,
+    /// The first-half fast level of the last [`DROP_LOOKBACK_BARS`] bars, oldest first: a drop is
+    /// above the loudest of them.
+    early_recent: [f32; DROP_LOOKBACK_BARS],
+    early_len: usize,
+    /// Intensities, onset densities and brightness of the last [`BUILD_BARS`] bars.
+    recent_intensity: [f32; BUILD_BARS],
+    recent_onset: [f32; BUILD_BARS],
+    recent_bright: [f32; BUILD_BARS],
+    recent_len: usize,
     /// BUILD_START fired and no DROP or timeout has closed the build yet.
     build_active: bool,
     /// Bars left before an open build times out.
     build_bars_left: u32,
-    /// Consecutive bars with low below `LOW_GAP`, before the current bar.
-    low_gap_bars: u32,
+    /// Consecutive bars with low below `LOW_GAP` (or with the level collapsed), before this bar.
+    gap_bars: u32,
     /// A level of at least `BREAKDOWN_LEVEL` was seen since the last breakdown.
     breakdown_armed: bool,
     /// Low band of the previous bar, for the "the low end returns" crossing.
     last_low: Option<f32>,
+    /// The bar a DROP already fired on, from the mid-bar pass: the bar close must not fire it
+    /// again.
+    drop_bar: Option<i64>,
+    /// The bar of the last DROP of any kind, for the cooldown.
+    last_drop_bar: Option<i64>,
     /// Consecutive silent bars.
     silent_bars: u32,
 }
@@ -152,13 +204,19 @@ impl IntensityModel {
             phrase_pos: 0,
             scale: RollingRange::new((0.0, 1.0), history_bars, LEVEL_MIN_SPAN),
             onsets: RollingRange::new(ONSET_FALLBACK, history_bars, ONSET_FULL_SPAN),
-            recent: VecDeque::new(),
-            rising_bars: 0,
+            early_recent: [0.0; DROP_LOOKBACK_BARS],
+            early_len: 0,
+            recent_intensity: [0.0; BUILD_BARS],
+            recent_onset: [0.0; BUILD_BARS],
+            recent_bright: [0.0; BUILD_BARS],
+            recent_len: 0,
             build_active: false,
             build_bars_left: 0,
-            low_gap_bars: 0,
+            gap_bars: 0,
             breakdown_armed: false,
             last_low: None,
+            drop_bar: None,
+            last_drop_bar: None,
             silent_bars: 0,
         }
     }
@@ -180,8 +238,21 @@ impl IntensityModel {
         self.silent_bars = 0;
     }
 
-    /// Fold one completed bar in and report what it did.
+    /// Fold one completed bar in and report what it did. No raw features: the fast level falls
+    /// back to the short-term one and no section is known, which is the pre-sections behaviour and
+    /// what the unit tests drive.
     pub fn push_bar(&mut self, b: &BarStats) -> IntensityUpdate {
+        let raw = BarFeatures::from_stats(b);
+        self.push_bar_with(b, &raw, &SectionState::default())
+    }
+
+    /// Fold one completed bar in, with its raw features and the section state of that bar.
+    pub fn push_bar_with(
+        &mut self,
+        b: &BarStats,
+        raw: &BarFeatures,
+        section: &SectionState,
+    ) -> IntensityUpdate {
         // Silence is decided by the raw level: a noise floor normalises to whatever the
         // window makes of it, so the normalised features cannot be trusted there.
         // A NaN level counts as silent rather than poisoning the bar.
@@ -199,8 +270,8 @@ impl IntensityModel {
 
         if silent {
             self.silent_bars += 1;
-            // A rise interrupted by silence is not consecutive.
-            self.rising_bars = 0;
+            // A silent bar is the extreme of a gap: the low end is gone for a whole bar.
+            self.gap_bars = self.gap_bars.saturating_add(1);
         } else {
             self.silent_bars = 0;
         }
@@ -239,11 +310,9 @@ impl IntensityModel {
                 .clamp(0.0, 1.0)
         };
 
-        // The level places this bar in the recent dynamic range (see `LEVEL_MIN_SPAN`), which is
-        // what makes the four levels cover a section instead of hugging the middle of a weighted
-        // mean. The window includes this bar; `position` folds it in. `intensity` stays the plain
-        // weighted mean: the show modulates with it.
-        let reading = if silent {
+        // The bar's position in the recent dynamic range, and the section target that replaces
+        // most of it (see `SECTION_WEIGHT`). `position` includes this bar.
+        let bar_position = if silent {
             0.0
         } else {
             self.scale
@@ -251,14 +320,46 @@ impl IntensityModel {
                 .unwrap_or(0.5)
         };
         self.scale.push(intensity);
+        let reading = if silent {
+            0.0
+        } else if section.present {
+            SECTION_WEIGHT * section.target + (1.0 - SECTION_WEIGHT) * bar_position
+        } else {
+            bar_position
+        };
 
         let previous_level = self.level;
         let mut events = EventFlags::empty();
 
         if !silent {
-            self.track_build(intensity, &mut events);
-            self.track_drop(low, &mut events);
+            // BUILD_START before DROP: a build that ends on this bar is still a build.
+            self.track_build(intensity, low, onset_density, brightness, &mut events);
+            let already = self.drop_bar == Some(b.bar_index);
+            if !already && self.drop_ready(b, raw) {
+                events |= EventFlags::DROP;
+                self.close_build();
+                self.gap_bars = 0;
+                self.last_drop_bar = Some(b.bar_index);
+                self.gap_bars = 0;
+            }
             self.track_breakdown(previous_level, low, onset, &mut events);
+            // The build and the gap bookkeeping see the bar after the drop test: a drop ends
+            // both, and a bar with no low end (a gap, a low-pass) starts one.
+            if !events.contains(EventFlags::DROP) {
+                // A gap is a bar with no low end, or one this far below the loudest recent bar: a
+                // low-pass, a filter sweep's silence, a gap. Both are what a drop comes out of.
+                let dropped_out = self.early_len > 0
+                    && raw.early_db + GAP_LEVEL_DB
+                        < self.early_recent[..self.early_len]
+                            .iter()
+                            .copied()
+                            .fold(f32::NEG_INFINITY, f32::max);
+                if low < LOW_GAP || dropped_out {
+                    self.gap_bars += 1;
+                } else {
+                    self.gap_bars = 0;
+                }
+            }
         }
 
         self.level = next_level(previous_level, reading);
@@ -273,12 +374,26 @@ impl IntensityModel {
             self.phrase_pos = 0;
             events |= EventFlags::PHRASE;
         }
+        // A new section is a section change: the show gets it as a phrase boundary, together
+        // with the level events this bar may carry.
+        if section.present && section.started {
+            events |= EventFlags::PHRASE;
+        }
 
         self.intensity = intensity;
         self.last_low = if silent { None } else { Some(low) };
-        self.recent.push_back(intensity);
-        if self.recent.len() > BUILD_BARS {
-            self.recent.pop_front();
+        self.push_recent(intensity, onset_density, brightness);
+
+        if silent {
+            self.early_len = 0;
+        } else {
+            if self.early_len < DROP_LOOKBACK_BARS {
+                self.early_recent[self.early_len] = raw.early_db;
+                self.early_len += 1;
+            } else {
+                self.early_recent.rotate_left(1);
+                self.early_recent[DROP_LOOKBACK_BARS - 1] = raw.early_db;
+            }
         }
 
         IntensityUpdate {
@@ -290,14 +405,87 @@ impl IntensityModel {
         }
     }
 
-    /// BUILD_START: four consecutive rising bars that together rose by > 0.15.
-    fn track_build(&mut self, intensity: f32, events: &mut EventFlags) {
-        match self.recent.back().copied() {
-            Some(previous) if intensity > previous => self.rising_bars += 1,
-            Some(_) => self.rising_bars = 0,
-            None => self.rising_bars = 0,
-        }
+    /// Whether this bar is a drop, from its own raw features and what the last bars did. Pure:
+    /// the mid-bar pass (`Analyzer::push`) calls it before the bar closes, and the bar close calls
+    /// it again in case the mid-bar pass saw a partial bar that did not qualify.
+    ///
+    /// The mid-bar pass needs the level jump: a partial bar's low band is the first half's, which
+    /// is the kick-heavy part of every bar, so a low-band return seen there is not yet evidence.
+    pub fn is_drop(&self, b: &BarStats, raw: &BarFeatures) -> bool {
+        self.drop_ready(b, raw) && self.level_jump(raw) >= DROP_JUMP_DB
+    }
 
+    /// A DROP already fired on this bar from the mid-bar pass.
+    pub fn note_drop(&mut self, bar_index: i64) {
+        self.drop_bar = Some(bar_index);
+        self.last_drop_bar = Some(bar_index);
+        self.close_build();
+        self.gap_bars = 0;
+    }
+
+    /// The bar a DROP already fired on, if any (for a consumer that watches the frame events).
+    pub fn drop_bar(&self) -> Option<i64> {
+        self.drop_bar
+    }
+
+    fn drop_ready(&self, b: &BarStats, raw: &BarFeatures) -> bool {
+        if !b.loudness_db.is_finite() || b.loudness_db <= SILENCE_DB || self.early_len == 0 {
+            // The first bar of a song has nothing to drop from.
+            return false;
+        }
+        if self
+            .last_drop_bar
+            .is_some_and(|last| b.bar_index - last < DROP_COOLDOWN_BARS)
+        {
+            return false;
+        }
+        let low = unit(b.low);
+        let low_audible = raw.low_db.is_finite() && raw.low_db > LOW_DB_PRESENT;
+        let previous_low = self.last_low.unwrap_or(0.0);
+        let low_returns =
+            low_audible && low > LOW_PRESENT && low - previous_low >= LOW_RETURN_JUMP;
+        let level_jump = self.level_jump(raw);
+        // A drop is a big energy jump. The low-end return and the build are what make it a drop
+        // rather than a crash; they are not a substitute for the jump. A low band that comes back
+        // under a bar of the same level is an arrangement change, not a drop.
+        let jump = level_jump >= DROP_JUMP_DB;
+        // After a build, after a bar whose low end disappeared (a gap, a low-pass) or when the
+        // low band itself comes back.
+        let context = self.build_active || self.gap_bars >= 1 || low_returns;
+        // The low end has to be there. A big fast-level jump without it is a crash, a fill or a
+        // one-off transient on a quiet bar, which is what the intro of the reza track is made of.
+        jump && context && low_audible && low > LOW_PRESENT
+    }
+
+    /// How far this bar's first half is above the loudest first half of the last
+    /// [`DROP_LOOKBACK_BARS`] bars, in dB.
+    fn level_jump(&self, raw: &BarFeatures) -> f32 {
+        if self.early_len == 0 {
+            return 0.0;
+        }
+        let recent = self.early_recent[..self.early_len]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        raw.early_db - recent
+    }
+
+    fn close_build(&mut self) {
+        self.build_active = false;
+        self.build_bars_left = 0;
+    }
+
+    /// BUILD_START: a build's cues, any one of them. Rising intensity (a riser), rising onsets (a
+    /// snare roll) or a rising high end (a sweep), with the low end not rising: once the low end
+    /// arrives, the build is over and the drop is next.
+    fn track_build(
+        &mut self,
+        intensity: f32,
+        low: f32,
+        onset_density: f32,
+        brightness: f32,
+        events: &mut EventFlags,
+    ) {
         if self.build_active {
             if self.build_bars_left == 0 {
                 self.build_active = false;
@@ -305,32 +493,29 @@ impl IntensityModel {
                 self.build_bars_left -= 1;
             }
         }
-
-        if self.build_active || self.rising_bars < BUILD_BARS || self.recent.len() != BUILD_BARS {
+        if self.build_active || self.recent_len < BUILD_BARS {
             return;
         }
-        if let Some(&base) = self.recent.front()
-            && intensity - base > BUILD_RISE
-        {
+
+        let previous_low = self.last_low.unwrap_or(low);
+        let low_flat = low <= previous_low + BUILD_LOW_ALLOWANCE;
+        // The ring holds the previous [`BUILD_BARS`] bars; this bar is the next one. A cue needs
+        // two consecutive rising steps, not one: a single bright or busy bar is a crash or a fill.
+        let last = BUILD_BARS - 1;
+        let intensity_rising = intensity > self.recent_intensity[last]
+            && self.recent_intensity[last] > self.recent_intensity[last - 1]
+            && intensity - self.recent_intensity[0] >= BUILD_RISE;
+        let onsets_rising = onset_density > self.recent_onset[last]
+            && self.recent_onset[last] > self.recent_onset[last - 1]
+            && onset_density - self.recent_onset[0] >= BUILD_ONSET_RISE;
+        let bright_rising = brightness > self.recent_bright[last]
+            && self.recent_bright[last] > self.recent_bright[last - 1]
+            && brightness - self.recent_bright[0] >= BUILD_BRIGHT_RISE;
+
+        if ((intensity_rising || onsets_rising) && low_flat) || bright_rising {
             self.build_active = true;
             self.build_bars_left = BUILD_MAX_BARS;
             *events |= EventFlags::BUILD_START;
-        }
-    }
-
-    /// DROP: the low band crosses back above `DROP_LOW` after a build or after at
-    /// least one bar with no low end.
-    fn track_drop(&mut self, low: f32, events: &mut EventFlags) {
-        let returned = low > DROP_LOW && self.last_low.is_none_or(|previous| previous <= DROP_LOW);
-        if returned && (self.build_active || self.low_gap_bars >= 1) {
-            *events |= EventFlags::DROP;
-            self.build_active = false;
-            self.build_bars_left = 0;
-            self.low_gap_bars = 0;
-        } else if low < LOW_GAP {
-            self.low_gap_bars += 1;
-        } else {
-            self.low_gap_bars = 0;
         }
     }
 
@@ -357,19 +542,37 @@ impl IntensityModel {
         }
     }
 
+    fn push_recent(&mut self, intensity: f32, onset: f32, bright: f32) {
+        if self.recent_len < BUILD_BARS {
+            self.recent_intensity[self.recent_len] = intensity;
+            self.recent_onset[self.recent_len] = onset;
+            self.recent_bright[self.recent_len] = bright;
+            self.recent_len += 1;
+        } else {
+            self.recent_intensity.rotate_left(1);
+            self.recent_onset.rotate_left(1);
+            self.recent_bright.rotate_left(1);
+            self.recent_intensity[BUILD_BARS - 1] = intensity;
+            self.recent_onset[BUILD_BARS - 1] = onset;
+            self.recent_bright[BUILD_BARS - 1] = bright;
+        }
+    }
+
     fn clear_state(&mut self) {
         self.level = 1;
         self.intensity = 0.0;
         self.phrase_pos = 0;
         self.scale.clear();
         self.onsets.clear();
-        self.recent.clear();
-        self.rising_bars = 0;
+        self.recent_len = 0;
+        self.early_len = 0;
         self.build_active = false;
         self.build_bars_left = 0;
-        self.low_gap_bars = 0;
+        self.gap_bars = 0;
         self.breakdown_armed = false;
         self.last_low = None;
+        self.drop_bar = None;
+        self.last_drop_bar = None;
     }
 }
 
@@ -486,4 +689,135 @@ mod tests {
         assert!((LEVEL_HYSTERESIS - 0.08).abs() < 1e-6);
         assert!((LEVEL_BAND - 0.04).abs() < 1e-6);
     }
+
+    fn bar(index: i64, loudness_db: f32, low: f32, onsets: f32) -> BarStats {
+        BarStats {
+            bar_index: index,
+            start_ppq: index as f64 * 4.0,
+            beats: 4,
+            loudness_db,
+            loudness: 0.5,
+            low,
+            onset_density: onsets,
+            brightness: 0.5,
+        }
+    }
+
+    fn raw(loudness_db: f32, level_db: f32) -> BarFeatures {
+        BarFeatures {
+            loudness_db,
+            low_db: -20.0,
+            level_db,
+            early_db: level_db,
+            ..BarFeatures::from_stats(&BarStats::default())
+        }
+    }
+
+    /// The mid-bar pass and the bar close agree on what a drop is: a big fast-level jump with the
+    /// low end present, after a gap.
+    #[test]
+    fn a_level_jump_after_a_gap_is_a_drop() {
+        let mut model = IntensityModel::new(8, 32);
+        // One bar with no low end: a gap.
+        model.push_bar_with(&bar(0, -24.0, 0.1, 2.0), &raw(-24.0, -24.0), &SectionState::default());
+        // The next bar jumps 10 dB and brings the low end back.
+        let drop_bar = bar(1, -12.0, 0.85, 3.0);
+        let drop_raw = raw(-12.0, -12.0);
+        assert!(
+            model.is_drop(&drop_bar, &drop_raw),
+            "a 12 dB jump with the low end back is a drop"
+        );
+        let u = model.push_bar_with(&drop_bar, &drop_raw, &SectionState::default());
+        assert!(u.events.contains(EventFlags::DROP), "events {:?}", u.events);
+    }
+
+    /// A drop fired mid-bar is not fired again when the bar closes.
+    #[test]
+    fn a_drop_fires_once() {
+        let mut model = IntensityModel::new(8, 32);
+        model.push_bar_with(&bar(0, -24.0, 0.1, 2.0), &raw(-24.0, -24.0), &SectionState::default());
+        let drop_bar = bar(1, -12.0, 0.85, 3.0);
+        model.note_drop(1);
+        let u = model.push_bar_with(&drop_bar, &raw(-12.0, -12.0), &SectionState::default());
+        assert!(
+            !u.events.contains(EventFlags::DROP),
+            "the bar close must not repeat the mid-bar drop: {:?}",
+            u.events
+        );
+    }
+
+    /// A steady loop with no build, no gap and no jump is never a drop, however the low band is
+    /// normalised: the old rule fired on the low band alone.
+    #[test]
+    fn a_steady_low_end_is_not_a_drop() {
+        let mut model = IntensityModel::new(8, 32);
+        for i in 0..16 {
+            let b = bar(i, -16.0, 0.8, 2.0);
+            let u = model.push_bar_with(&b, &raw(-16.0, -16.0), &SectionState::default());
+            assert!(
+                !u.events.contains(EventFlags::DROP),
+                "bar {i}: a steady low end is not a drop"
+            );
+        }
+    }
+
+    /// A snare roll raises the onset density without the low end: that is a build.
+    #[test]
+    fn rising_onsets_start_a_build() {
+        let mut model = IntensityModel::new(8, 32);
+        let mut build_bars = Vec::new();
+        for i in 0..8i64 {
+            let u = model.push_bar_with(
+                &bar(i, -20.0, 0.2, 1.0),
+                &raw(-20.0, -20.0),
+                &SectionState::default(),
+            );
+            assert!(!u.events.contains(EventFlags::BUILD_START));
+        }
+        for (i, onsets) in [1.4f32, 2.2, 3.0, 3.8].into_iter().enumerate() {
+            let index = 8 + i as i64;
+            let u = model.push_bar_with(
+                &bar(index, -19.0, 0.2, onsets),
+                &raw(-19.0, -19.0),
+                &SectionState::default(),
+            );
+            if u.events.contains(EventFlags::BUILD_START) {
+                build_bars.push(index);
+            }
+        }
+        assert_eq!(
+            build_bars,
+            vec![9],
+            "BUILD_START on the second bar of the roll, once"
+        );
+    }
+
+    /// The section target is most of the level reading.
+    #[test]
+    fn the_section_target_drives_the_reading() {
+        let mut with = IntensityModel::new(8, 32);
+        for i in 0..8i64 {
+            with.push_bar_with(
+                &bar(i, -18.0, 0.6, 2.0),
+                &raw(-18.0, -18.0),
+                &SectionState::default(),
+            );
+        }
+        let section = SectionState {
+            target: 0.9,
+            present: true,
+            ..SectionState::default()
+        };
+        let u = with.push_bar_with(
+            &bar(8, -18.0, 0.6, 2.0),
+            &raw(-18.0, -18.0),
+            &section,
+        );
+        assert!(
+            u.reading > 0.80,
+            "a section target of 0.9 must carry the reading: {}",
+            u.reading
+        );
+    }
 }
+
