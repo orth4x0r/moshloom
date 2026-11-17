@@ -6,5 +6,23 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+name = "mosh_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mosh-app"
+path = "src/main.rs"
+
 [dependencies]
 mosh-core = { path = "../mosh-core" }
+mosh-ipc = { path = "../mosh-ipc" }
+mosh-capture = { path = "../mosh-capture" }
+mosh-analysis = { path = "../mosh-analysis" }
+mosh-show = { path = "../mosh-show" }
+mosh-midi = { path = "../mosh-midi" }
+mosh-render = { path = "../mosh-render" }
+mosh-visuals = { path = "../mosh-visuals" }
+mosh-video = { path = "../mosh-video" }
+# Window shell only (Task 2.6). The app crate is the one place winit appears.
+winit = "0.30"
