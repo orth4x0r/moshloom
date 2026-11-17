@@ -7,4 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+midir = "0.11.1"
 mosh-core = { path = "../mosh-core" }
+serde = { version = "1.0.229", features = ["derive"] }
+
+[dev-dependencies]
+ron = "0.12.3"

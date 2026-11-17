@@ -8,3 +8,9 @@ publish.workspace = true
 
 [dependencies]
 mosh-core = { path = "../mosh-core" }
+windows = { version = "0.62.2", default-features = false, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Memory",
+  "Win32_System_Performance",
+] }

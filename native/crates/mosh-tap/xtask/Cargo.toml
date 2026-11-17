@@ -1,0 +1,14 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+description = "Bundling helper for mosh-tap, invoked from native/ as `cargo run --manifest-path crates/mosh-tap/xtask/Cargo.toml -- bundle mosh-tap --release`"
+
+# Its own workspace root on purpose: the coordinator owns `native/Cargo.toml`, and this helper must
+# not become a member of the plugin workspace (it pulls in cargo_metadata, goblin and friends).
+[workspace]
+
+[dependencies]
+nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683" }

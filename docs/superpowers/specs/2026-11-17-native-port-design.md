@@ -263,6 +263,6 @@ when it is exceeded on the reference machine.
    and arrangement).
 2. ~~Output~~ answered: fullscreen on a secondary monitor; integrated GPU on battery.
 3. ~~Controller~~ answered: Akai APC mini, used for building and rehearsal, not during a set.
-4. Tuning tracks: 15 of the human's tracks (14 WAV 44.1 kHz, 1 MP3), stored outside the repo in
+4. Tuning tracks: 15 of the human's tracks (13 WAV 44.1 kHz 16-bit, 1 WAV 48 kHz float, 1 MP3 48 kHz), stored outside the repo in
    `C:\Users\ilanf\moshloom-tracks`. Labels: proposed by the coordinator from an offline analysis,
    corrected by the human.
