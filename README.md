@@ -486,8 +486,13 @@ Vulkan SDK (1.4.363.0 on the reference machine). `cargo test --workspace` is the
 | Strobe at 16 requests/s for 1 s | 3 flash starts (limiter) and 3 luminance jumps (read back) |
 | overlay video, 1080p (debug, integrated GPU) | recorded inside the frame (1 submission per frame): 0.12-0.22 ms CPU per frame (was 1.7-2.6 ms of waiting); 0 new GPU allocations over 600 frames |
 
-Known gap: in that 54 s run the intensity level reached 4 at bar 5 and stayed there; the rules
-need the hand-placed marks before they mean much. The first second after start logs one budget
+Intensity (since #46): levels now follow the music. "reza pedia" from 0:00: level 2 through the
+intro (bars 1-8, about -27 dB), 3 then 4 when the beat comes in, 4 through the loud part, down
+to 1 in the breakdown at bar 41; on all 16 tracks, 15 use at least 3 levels and every level change
+is at most one step per bar. The app also starts a fresh analyzer when the input switches
+(loopback before Live plays -> plugin), which otherwise pushed that intro to level 4 in four bars.
+Known gap: two loud sections 7 dB apart (bars 9-23 and 24-39) both read level 4; telling sections
+apart is what the hand-placed marks are for. The first second after start logs one budget
 line (shader compilation, 6-14 ms on the render thread).
 
 Not measured yet: anything in Ableton, a second monitor, the app on battery, latency from audio to

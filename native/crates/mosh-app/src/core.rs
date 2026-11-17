@@ -478,6 +478,9 @@ pub struct AppCore {
     song: Option<usize>,
     song_starts: u64,
     frames: u64,
+    /// The input the analyzer was last fed from; a change starts a fresh analyzer.
+    analyzed_source: Option<SourceKind>,
+    analyzer_resets: u64,
 }
 
 impl AppCore {
@@ -496,7 +499,14 @@ impl AppCore {
             song: None,
             song_starts: 0,
             frames: 0,
+            analyzed_source: None,
+            analyzer_resets: 0,
         }
+    }
+
+    /// Times the analyzer was started fresh because the input changed.
+    pub fn analyzer_resets(&self) -> u64 {
+        self.analyzer_resets
     }
 
     /// The app's core: real inputs, best effort, no failure is fatal.
@@ -529,6 +539,14 @@ impl AppCore {
     pub fn step(&mut self, now: Instant) -> Frame {
         self.blocks.clear();
         let source = self.inputs.poll(now, &mut self.blocks);
+        // A different input is a different stream: the loopback the app listened to before Live
+        // pressed play (or the plugin's last song before a fallback) must not become the history
+        // the new stream's intensity is judged against, so the analyzer starts over.
+        if self.analyzed_source.is_some_and(|previous| previous != source) {
+            self.analyzer = Analyzer::new(AnalysisConfig::default());
+            self.analyzer_resets += 1;
+        }
+        self.analyzed_source = Some(source);
 
         self.events.clear();
         self.controls.poll(&mut self.events, now);

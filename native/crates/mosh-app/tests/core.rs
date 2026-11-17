@@ -410,3 +410,27 @@ fn the_default_project_plan_has_content_without_audio() {
     // Autopilot starts the first scene by itself, with no input at all.
     assert!(launched, "autopilot never launched a clip: {:?}", core.show().mode());
 }
+
+/// Switching inputs starts the analyzer over: the loopback heard before Live pressed play must
+/// not become the history the plugin's music is judged against (seen live: the intro climbed to
+/// level 4 in four bars after a loopback start, and held level 2 when the plugin was there first).
+#[test]
+fn an_input_switch_starts_a_fresh_analyzer() {
+    let plugin = Script::with_block(zero_block(48_000, Some(Transport::default())));
+    let handle = plugin.clone();
+    handle.set_alive(false);
+    let loopback = Script::with_block(zero_block(44_100, None));
+    let mux = InputMux::new(Some(Box::new(plugin)), Some(Box::new(loopback)));
+    let mut core = AppCore::new(default_project(), mux, Controls::new(Vec::new()));
+    let start = Instant::now();
+
+    assert_eq!(core.step(start).source, SourceKind::Plugin);
+    assert_eq!(core.analyzer_resets(), 0, "the first input is not a switch");
+    assert_eq!(core.step(start + Duration::from_millis(2_500)).source, SourceKind::Loopback);
+    assert_eq!(core.analyzer_resets(), 1);
+    assert_eq!(core.step(start + Duration::from_millis(2_600)).source, SourceKind::Loopback);
+    assert_eq!(core.analyzer_resets(), 1, "staying on one input is not a switch");
+    handle.set_alive(true);
+    assert_eq!(core.step(start + Duration::from_millis(3_000)).source, SourceKind::Plugin);
+    assert_eq!(core.analyzer_resets(), 2);
+}
