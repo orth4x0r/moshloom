@@ -24,3 +24,11 @@ publish = false
 
 [profile.release]
 debug = 1
+
+# Twelve worktrees build at once on a 15 GB / 39 GB-free laptop: keep debug artifacts small.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
