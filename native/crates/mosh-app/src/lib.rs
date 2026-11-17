@@ -6,10 +6,12 @@
 //! | --- | --- |
 //! | [`core`] | `AppCore`: the analyzer, the show, audio input switching, control events, song markers, one `RenderPlan` per frame |
 //! | [`budget`] | the design's performance budgets and the once-per-exceeded-budget log |
+//! | [`editor`] | Task 2.7's control window: the editing model (no window), the egui widgets, the window itself |
 //! | [`monitor`] | `monitor_choice`: which monitor the stage takes, from whatever monitors exist |
 //! | [`shell`] | the winit event loop, the two windows and the render thread |
 pub mod budget;
 pub mod core;
+pub mod editor;
 pub mod monitor;
 pub mod shell;
 mod win;

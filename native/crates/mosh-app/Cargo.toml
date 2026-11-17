@@ -24,5 +24,20 @@ mosh-midi = { path = "../mosh-midi" }
 mosh-render = { path = "../mosh-render" }
 mosh-visuals = { path = "../mosh-visuals" }
 mosh-video = { path = "../mosh-video" }
+mosh-als = { path = "../mosh-als" }
 # Window shell only (Task 2.6). The app crate is the one place winit appears.
 winit = "0.30"
+# Control window only (Task 2.7): immediate-mode editors on their own OpenGL context, so the
+# stage's Vulkan device, queue and frame pacing are untouched. See `editor_window.rs`.
+egui = "0.37"
+egui-winit = { version = "0.37", default-features = false }
+egui_glow = "0.37"
+glow = "0.17"
+glutin = "0.32"
+glutin-winit = "0.5"
+mosh-shaders = { path = "../mosh-shaders" }
+
+[dev-dependencies]
+# `tests/editors.rs` builds a gzipped `.als` at run time, like mosh-als's own tests: the repo
+# never holds a real Live set.
+flate2 = "1.1"

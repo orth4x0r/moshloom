@@ -4,9 +4,9 @@
 //!
 //! - the **stage** window is a borderless fullscreen window on the first non-primary monitor, or
 //!   a borderless window on the laptop screen when that monitor is missing. It never shows UI.
-//! - the **control** window is a small window on the laptop screen. It has no scene yet (Task 2.7
-//!   builds the editors); until then its title carries the stats line and it is only updated when
-//!   the line changes, at most 30 times a second.
+//! - the **control** window is the editor: its own winit window on its own OpenGL context
+//!   (`crate::editor`), painted only when something changes and at most 30 times a second, so it
+//!   costs the stage nothing while the performer is not touching it.
 //! - the **render thread** owns the analysis, the show and the GPU. It presents with a FIFO
 //!   swapchain, so the frame loop blocks on the display and never busy-waits.
 //!
@@ -24,11 +24,10 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use mosh_core::{AnalysisFrame, Clip, Layer, Project, RenderPlan, ShowMode};
+use mosh_core::{AnalysisFrame, Clip, ControlEvent, Layer, Project, RenderPlan, ShowMode};
 use mosh_render::{FrameRecorder, Gpu, GpuPreference, RenderError, Stage};
 use mosh_visuals::{LayerSlot, Visuals};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
@@ -38,6 +37,8 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::budget::BudgetWatch;
 use crate::core::{AppCore, SourceName, Status, default_project, stage_placement_label, title_for};
+use crate::editor::model::Command as EditorCommand;
+use crate::editor::{EditorModel, EditorUi, EditorWindow};
 use crate::monitor::{MonitorInfo, StagePlacement, monitor_choice};
 use crate::win::WindowHandle;
 
@@ -47,6 +48,9 @@ const MONITOR_CHECK: Duration = Duration::from_secs(2);
 /// Stats are sent to the window thread at this rate; the control window's title is set at most
 /// 30 times a second regardless.
 const STATUS_INTERVAL: Duration = Duration::from_millis(100);
+/// How often the control window repaints for a changed status line: the numbers are for a glance,
+/// not for the stage, so four times a second is plenty and keeps the editor's cost at nothing.
+const STATUS_PAINT: Duration = Duration::from_millis(250);
 const TITLE_INTERVAL: Duration = Duration::from_millis(33);
 /// Backoff after a failed rebuild.
 const RETRY_AFTER: Duration = Duration::from_millis(500);
@@ -282,6 +286,10 @@ enum Command {
     /// There is no stage window: keep the show running, present nothing.
     DetachSurface,
     SetMode(ShowMode),
+    /// An edited project from the control window: applied on the next bar line.
+    SetProject(Project),
+    /// A control event from the control window (a preview launch).
+    Control(ControlEvent),
     Quit,
 }
 
@@ -393,6 +401,19 @@ impl RenderThread {
                 }
             }
             Command::SetMode(mode) => self.core.show_mut().set_mode(mode),
+            Command::SetProject(project) => {
+                // A layer stack that changed shape needs its targets rebuilt; a clip edit does
+                // not, and must not touch the GPU at all.
+                if project.session.layers != self.project_layers {
+                    self.project_layers = project.session.layers.clone();
+                    let layers = self.project_layers.clone();
+                    if let Some(scene) = self.scene.as_mut() {
+                        scene.rebuild_slots(&layers);
+                    }
+                }
+                self.core.queue_project(project);
+            }
+            Command::Control(event) => self.core.queue_control(event),
             Command::Quit => {}
         }
     }
@@ -583,17 +604,22 @@ fn render_main(mut thread: RenderThread) {
 
 /// The window thread's state.
 struct Shell {
-    project: Project,
+    /// The editing model behind the control window: it owns the project the app runs.
+    model: EditorModel,
+    editor_ui: EditorUi,
     note: Option<String>,
     proxy: EventLoopProxy<UserEvent>,
     stage_window: Option<Window>,
-    control_window: Option<Window>,
+    /// The control window and its OpenGL context (Task 2.7). Absent when it could not be built:
+    /// the show keeps running, because a set does not end because an editor window failed.
+    editor: Option<EditorWindow>,
     monitors: Vec<MonitorHandle>,
     monitor_list: Vec<MonitorInfo>,
     placement: Option<StagePlacement>,
     render: Option<RenderHandle>,
     title: Option<String>,
     last_title_at: Option<Instant>,
+    last_status_paint: Option<Instant>,
     next_monitor_check: Option<Instant>,
     started: bool,
 }
@@ -601,17 +627,19 @@ struct Shell {
 impl Shell {
     fn new(project: Project, note: Option<String>, proxy: EventLoopProxy<UserEvent>) -> Shell {
         Shell {
-            project,
+            model: EditorModel::new(project),
+            editor_ui: EditorUi::default(),
             note,
             proxy,
             stage_window: None,
-            control_window: None,
+            editor: None,
             monitors: Vec::new(),
             monitor_list: Vec::new(),
             placement: None,
             render: None,
             title: None,
             last_title_at: None,
+            last_status_paint: None,
             next_monitor_check: None,
             started: false,
         }
@@ -655,13 +683,87 @@ impl Shell {
             .as_deref()
             .unwrap_or("ilanaVisual · control")
             .to_string();
-        let attributes = Window::default_attributes()
-            .with_title(title)
-            .with_inner_size(PhysicalSize::new(560, 320))
-            .with_min_inner_size(PhysicalSize::new(360, 200));
-        match event_loop.create_window(attributes) {
-            Ok(window) => self.control_window = Some(window),
-            Err(error) => self.log(format!("control window could not be created: {error}")),
+        // Building a GL context is the one place the window thread talks to a driver that may be
+        // absent or broken. A panic there must not take the show with it: the stage keeps running
+        // on the render thread and the app logs one line.
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            EditorWindow::new(event_loop, &title)
+        }));
+        match built {
+            Ok(Ok(editor)) => {
+                self.log(format!(
+                    "control window: {}x{} on OpenGL, at most 30 fps, painted on change",
+                    editor.window().inner_size().width,
+                    editor.window().inner_size().height
+                ));
+                self.editor = Some(editor);
+            }
+            Ok(Err(error)) => self.log(format!("control window could not be created: {error}")),
+            Err(_) => self.log(
+                "control window could not be created: the GL driver panicked building the context"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Paint the control window if it asked for a frame, and apply what the performer did.
+    fn paint_editor(&mut self, now: Instant) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        if !editor.wants_paint(now) {
+            return;
+        }
+        // A panic in the UI (or in the driver, on the paint path) must not take the show with it:
+        // the stage is on the render thread, and the editor is the part that can be given up.
+        let painted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let commands = editor.draw(&mut self.editor_ui, &self.model);
+            (commands, editor.take_error())
+        }));
+        match painted {
+            Ok((commands, error)) => {
+                if let Some(error) = error {
+                    self.log(error);
+                }
+                self.run_editor_commands(commands);
+            }
+            Err(_) => {
+                self.editor = None;
+                self.log(
+                    "control window failed while painting; the editor is gone, the show is not"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    /// Apply one frame's worth of editor commands and hand the result to the show.
+    fn run_editor_commands(&mut self, commands: Vec<EditorCommand>) {
+        let mut applied = false;
+        for command in commands {
+            match self.model.apply(command) {
+                Ok(outcome) => {
+                    applied = true;
+                    // The mode is a show-level action: the stage hears it now, not at the next bar.
+                    if let Some(mode) = outcome.set_mode {
+                        self.send(Command::SetMode(mode));
+                    }
+                    if let Some(event) = outcome.launch {
+                        self.send(Command::Control(event));
+                    }
+                }
+                // The model already put the reason in the status strip.
+                Err(_) => applied = true,
+            }
+        }
+        if let Some(project) = self.model.handoff() {
+            self.send(Command::SetProject(project));
+        }
+        if applied
+            && let Some(editor) = self.editor.as_mut()
+        {
+            // An applied edit changes what the screens show: paint it, at the 30 fps ceiling.
+            editor.request_paint(Instant::now());
         }
     }
 
@@ -742,7 +844,7 @@ impl Shell {
             None => (None, (1920, 1080)),
         };
         let (tx, rx) = channel();
-        let project = self.project.clone();
+        let project = self.model.project().clone();
         let monitor = self.placement.and_then(StagePlacement::monitor);
         let proxy = self.proxy.clone();
         match std::thread::Builder::new()
@@ -852,8 +954,21 @@ impl ApplicationHandler<UserEvent> for Shell {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let is_control = self.control_window.as_ref().map(Window::id) == Some(window_id);
+        let is_control = self
+            .editor
+            .as_ref()
+            .map(|editor| editor.window().id())
+            == Some(window_id);
         let is_stage = self.stage_window.as_ref().map(Window::id) == Some(window_id);
+
+        // The editor sees its own events first: a keystroke it used (a path, a name) must not also
+        // be read as a mode shortcut.
+        let mut consumed = false;
+        if is_control
+            && let Some(editor) = self.editor.as_mut()
+        {
+            consumed = editor.on_window_event(&event);
+        }
 
         match event {
             WindowEvent::CloseRequested => {
@@ -872,13 +987,13 @@ impl ApplicationHandler<UserEvent> for Shell {
                     },
                 ..
             } => {
-                if !is_control {
+                if !is_control || consumed {
                     return;
                 }
                 match logical_key {
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
-                    // Mode keys, for rehearsing without the editors (Task 2.7 owns the real
-                    // control surface). 1 = arrangement, 2 = session, 3 = autopilot.
+                    // Mode keys, for rehearsing with the editor window closed. The Project screen
+                    // is the real control; these stay because they work with the window hidden.
                     Key::Character(key) if key.as_str() == "1" => {
                         self.send(Command::SetMode(ShowMode::Arrangement))
                     }
@@ -902,7 +1017,7 @@ impl ApplicationHandler<UserEvent> for Shell {
                     self.placement = None;
                     self.send(Command::DetachSurface);
                 } else if is_control {
-                    self.control_window = None;
+                    self.editor = None;
                 }
             }
             _ => {}
@@ -912,6 +1027,20 @@ impl ApplicationHandler<UserEvent> for Shell {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Status(status) => {
+                // The status strip is part of the control window: a changed number is a reason to
+                // paint it, an unchanged one is not, and it is throttled to four times a second so
+                // a running show does not repaint the editor ten times a second for a bar phase.
+                let changed = self.model.set_status(status);
+                let due = self
+                    .last_status_paint
+                    .is_none_or(|at| at.elapsed() >= STATUS_PAINT);
+                if changed
+                    && due
+                    && let Some(editor) = self.editor.as_mut()
+                {
+                    editor.request_paint(Instant::now());
+                    self.last_status_paint = Some(Instant::now());
+                }
                 let Some(title) = title_for(self.title.as_deref(), &status) else {
                     return;
                 };
@@ -921,8 +1050,8 @@ impl ApplicationHandler<UserEvent> for Shell {
                 if !due {
                     return;
                 }
-                if let Some(window) = self.control_window.as_ref() {
-                    window.set_title(&title);
+                if let Some(editor) = self.editor.as_ref() {
+                    editor.window().set_title(&title);
                 }
                 self.title = Some(title);
                 self.last_title_at = Some(Instant::now());
@@ -950,7 +1079,15 @@ impl ApplicationHandler<UserEvent> for Shell {
                 self.send_replace_surface();
             }
         }
-        let next = self.next_monitor_check.unwrap_or(now + MONITOR_CHECK);
+        // The control window paints on change only, so an idle app sleeps until the next monitor
+        // check (or the next frame the editor asked for).
+        self.paint_editor(now);
+        let mut next = self.next_monitor_check.unwrap_or(now + MONITOR_CHECK);
+        if let Some(editor) = self.editor.as_ref()
+            && let Some(at) = editor.next_paint_at()
+        {
+            next = next.min(at);
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
     }
 }

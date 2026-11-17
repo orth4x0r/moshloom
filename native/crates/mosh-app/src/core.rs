@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 use mosh_analysis::{AnalysisConfig, Analyzer};
 use mosh_capture::Loopback;
 use mosh_core::{
-    ArrClip, AudioBlock, BlendMode, Clip, ClipParams, ControlEvent, FollowAction, LaunchQuantize,
-    Layer, MidiEvent, ParamRange, Project, RenderPlan, SceneRow, SessionGrid, ShowMode,
-    SongMarker, Transition,
+    ArrClip, AudioBlock, BlendMode, Clip, ClipId, ClipParams, ControlEvent, EventFlags,
+    FollowAction, LaunchQuantize, Layer, MidiEvent, ParamRange, Project, RenderPlan, SceneRow,
+    SessionGrid, ShowMode, SongMarker, Transition,
 };
 use mosh_ipc::IpcReader;
 use mosh_show::Show;
@@ -467,6 +467,14 @@ pub struct AppCore {
     controls: Controls,
     blocks: Vec<AudioBlock>,
     events: Vec<ControlEvent>,
+    /// Control events handed in by the control window (a preview launch), not from a device.
+    queued: Vec<ControlEvent>,
+    /// The project the editor handed over, waiting for the next bar line.
+    pending_project: Option<Project>,
+    /// The clip each layer drew last frame, so a project swap can put the show back where it was.
+    playing: Vec<Option<ClipId>>,
+    /// The last analysis frame, for the bar-line rule (the same one the show engine uses).
+    last: Option<mosh_core::AnalysisFrame>,
     song: Option<usize>,
     song_starts: u64,
     frames: u64,
@@ -481,6 +489,10 @@ impl AppCore {
             controls,
             blocks: Vec::new(),
             events: Vec::new(),
+            queued: Vec::new(),
+            pending_project: None,
+            playing: Vec::new(),
+            last: None,
             song: None,
             song_starts: 0,
             frames: 0,
@@ -520,6 +532,8 @@ impl AppCore {
 
         self.events.clear();
         self.controls.poll(&mut self.events, now);
+        // The control window's preview launches arrive here, on the same path as a controller's.
+        self.events.append(&mut self.queued);
 
         for index in 0..self.blocks.len() {
             if let Some(transport) = self.blocks[index].transport {
@@ -530,7 +544,12 @@ impl AppCore {
         self.blocks.clear();
 
         let analysis = self.analyzer.take_frame();
+        // An edited project lands on a bar line, before the show reads the analysis, so the new
+        // project's first frame is the one the playhead is on.
+        self.apply_pending_project(&analysis);
         let plan = self.show.update(&analysis, &self.events);
+        self.playing = plan.layers.iter().map(|layer| layer.clip).collect();
+        self.last = Some(analysis);
         self.frames += 1;
         Frame {
             analysis,
@@ -539,6 +558,52 @@ impl AppCore {
             mode: self.show.mode(),
             song: self.song,
         }
+    }
+
+    /// Give the show an edited project. It is swapped in on the next bar line, never mid-phrase.
+    ///
+    /// A newer project replaces one that has not been applied yet: only the last edit matters,
+    /// and the performer may well drag a slider across a whole bar.
+    pub fn queue_project(&mut self, project: Project) {
+        self.pending_project = Some(project);
+    }
+
+    /// Is an edited project waiting for the next bar line?
+    pub fn pending_project(&self) -> bool {
+        self.pending_project.is_some()
+    }
+
+    /// A control event from the control window, for the next frame.
+    pub fn queue_control(&mut self, event: ControlEvent) {
+        self.queued.push(event);
+    }
+
+    /// Swap in the queued project if this frame is a bar line.
+    ///
+    /// `mosh-show` owns `Show` and has no way to replace its project, so the show is rebuilt from
+    /// the edited one here. The clock, the analyzer, the render thread and the stage are
+    /// untouched, which is what "without restarting" means for a set. What a rebuild costs:
+    ///
+    /// * **Arrangement** mode re-reads the playhead on this same frame, so the right clip is
+    ///   drawn immediately.
+    /// * **Session** and **Autopilot** get their layers' clips back through ordinary launch
+    ///   events, so the project's own quantize applies to them too (on the bar line itself that
+    ///   is this frame).
+    /// * Procedural clips draw again from the default seed, and a transition in progress ends.
+    fn apply_pending_project(&mut self, f: &mosh_core::AnalysisFrame) {
+        if self.pending_project.is_none() || !crossed_bar(self.last.as_ref(), f) {
+            return;
+        }
+        let Some(project) = self.pending_project.take() else {
+            return;
+        };
+        let mode = self.show.mode();
+        let mut show = Show::new(project);
+        show.set_mode(mode);
+        if mode != ShowMode::Arrangement {
+            self.events.extend(restore_cells(&show, &self.playing));
+        }
+        self.show = show;
     }
 
     /// A transport block moved the playhead: crossing into another song restarts the intensity
@@ -554,6 +619,37 @@ impl AppCore {
             self.song_starts += 1;
         }
     }
+}
+
+/// A bar line, by the same rule the show engine uses: the analysis' `BAR` flag, or the bar counter
+/// or phase moving, and never twice for a position that did not move forward.
+fn crossed_bar(prev: Option<&mosh_core::AnalysisFrame>, f: &mosh_core::AnalysisFrame) -> bool {
+    /// Frame phases are `f32`, so a boundary derived from one carries about 1e-7 of a beat.
+    const EPS: f64 = 1e-4;
+    let Some(prev) = prev else {
+        return f.events.contains(EventFlags::BAR);
+    };
+    if f.ppq <= prev.ppq + EPS {
+        return false;
+    }
+    f.events.contains(EventFlags::BAR) || f.bar_index != prev.bar_index || f.bar_phase < prev.bar_phase
+}
+
+/// Launch events that put the clips a layer was drawing back on the rebuilt show, in their own
+/// column of the session grid. A clip that the edit removed is simply not restored.
+fn restore_cells(show: &Show, playing: &[Option<ClipId>]) -> Vec<ControlEvent> {
+    let grid = &show.project().session;
+    let mut events = Vec::new();
+    for (layer, clip) in playing.iter().enumerate() {
+        let Some(id) = *clip else { continue };
+        let scene = grid.scenes.iter().enumerate().find_map(|(scene, row)| {
+            (row.cells.get(layer) == Some(&Some(id))).then_some(scene)
+        });
+        if let Some(scene) = scene {
+            events.push(ControlEvent::LaunchClip { layer, scene });
+        }
+    }
+    events
 }
 
 /// The project the app runs with when it is started without one: an empty show in Autopilot over
