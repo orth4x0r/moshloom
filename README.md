@@ -479,6 +479,7 @@ number — it is the same work minus presentation.
 | control window idle frame (egui layout + tessellation, release, no paint) | Session 0.047 ms, Clip editor 0.338 ms |
 | **stress project**, `mosh-budget`, offscreen release, **1920x1080 output, 960x540 layers**, 300 frames | **GPU median 4.82 ms, p95 6.05 ms** (steady frames: median 4.79, p95 4.99; 2-beat 4-layer crossfade frames: median 6.02, max 6.23) against a 6 ms budget; render-thread CPU (recording + overlay upload) median 0.82 ms; 132 MB of targets and textures |
 | **stress project**, same bench at **2560x1600** (the laptop panel, 1280x800 layers) | GPU median 9.15 ms, p95 11.57 ms (steady 8.84 / 9.99; crossfade 10.56); CPU median 1.30 ms; 232 MB |
+| **stress project windowed on the laptop panel after V-budget** (2560x1600, 60 fps cap, release, on AC at 100%, display on) | GPU 7.2-8.5 ms per frame (one 11.8 ms sample), render thread 0.34-0.74 ms, process 8.7% of one core, 460-463 MB working set |
 | stress project on the laptop panel, windowed at 120 Hz, before the frame cap and the profile (release, 2.6 Mpx panels, FIFO) | GPU 20-24 ms per frame, render thread 1.0-1.7 ms, process 18% of one core, 593 MB — twice the pixels and twice the frame rate of the budget's case |
 | **first app run**, loopback, nothing playing (release, integrated GPU, laptop screen only) | GPU 0.70-0.75 ms, render thread 0.05-0.11 ms per frame; process about 5.5% of one core; 322 MB |
 | **app + mosh-feed**, "reza pedia" (93 BPM) from 0:30 for 54 s | plugin mode, 93.0 BPM, bars advancing, Autopilot changed scenes; GPU 0.77-1.53 ms, render thread 0.08-0.19 ms; process about 5.6% of one core; 285 MB |
@@ -521,7 +522,8 @@ two datamosh feedbacks (0.65), the overlay upload (0.40) and the fluid solver pl
 (0.47). `mosh-budget` prints that table; `mosh-stress-project out.ron <video>` writes the project.
 Memory: the renderer holds 124 MB at 1080p and 217 MB at 2560x1600 with four layers, plus the
 driver's swapchain (~25 MB at 1080p, ~49 MB at 2560x1600) and the app's own heap; the windowed
-process working set was 593 MB at 2560x1600 before this pass and has not been re-measured windowed.
+process working set was 593 MB at 2560x1600 before this pass and 460-463 MB after (windowed,
+under the 500 MB budget, with one video).
 Candidate for the next pass: the two remaining ping-pong pairs per layer (the scene and transition
 targets already hold one image each), ~2 MB per layer per pair at 1080p.
 
