@@ -9,9 +9,9 @@ Audio-reactive datamosh visualizer with a block timeline.
 - If WebGPU is missing or the device is lost, the app falls back to the CPU renderer in the
   same wasm (`render(f)`), which has the first 8 visuals only.
 
-**In progress: Moshloom Native** (`native/`), a Rust + Vulkan port for playing live next to
-Ableton Live: two VST3 plugins feed it the master audio and Live's transport, and it runs
-hands-free on the integrated GPU. See [Moshloom Native](#moshloom-native-rust-in-progress) below.
+**In progress: ilanaVisual** (`native/`, by Ilana Audio), a Rust + Vulkan port for playing live
+next to Ableton Live: two VST3 plugins feed it the master audio and Live's transport, and it runs
+hands-free on the integrated GPU. See [ilanaVisual](#ilanavisual-rust-in-progress) below.
 The web app stays as the reference implementation.
 
 Files
@@ -396,19 +396,19 @@ mid, high, pulse, vari, dens, beat, mel[24], line colours l0..l2; helpers `lut()
 `mel()`, `melh()`, `ca()`), add its name/colour to `SCENES` in index.src.html, and a
 default palette to `DEFPAL` in engine.c (raise the scene limit there and in `pack_scene`).
 
-## Moshloom Native (Rust, in progress)
+## ilanaVisual (Rust, in progress)
 
 A native Windows rebuild for live shows: the performer presses play on backing tracks in Ableton
 Live and sings; nothing is touched during the set, so the visuals follow Live by themselves.
 Design: `docs/superpowers/specs/2026-11-17-native-port-design.md`. Plan, with every task's
 interfaces and tests: `docs/superpowers/plans/2026-11-17-native-port.md`.
 
-    Ableton master ---> [Moshloom Tap VST3] ----shared memory---> mosh-app
-    Ableton MIDI track -> [Moshloom Control VST3] -shared memory--> mosh-app
-    APC mini (rehearsal) ----MIDI-------------------------------> mosh-app
-    (fallback) WASAPI loopback ---------------------------------> mosh-app
+    Ableton master ---> [ilanaVisual Tap VST3] ----shared memory---> ilanaVisual.exe
+    Ableton MIDI track -> [ilanaVisual Control VST3] -shared memory--> ilanaVisual.exe
+    APC mini (rehearsal) ----MIDI----------------------------------> ilanaVisual.exe
+    (fallback) WASAPI loopback ------------------------------------> ilanaVisual.exe
 
-    mosh-app: input -> analysis (beat grid, intensity 1-4, build/drop/breakdown)
+    ilanaVisual.exe: input -> analysis (beat grid, intensity 1-4, build/drop/breakdown)
               -> show (Arrangement / Session / Autopilot) -> visuals (Vulkan) -> stage window
 
 - **Two ways to play**, like Ableton: Arrangement (one timeline in beats that follows Live's
@@ -428,7 +428,7 @@ interfaces and tests: `docs/superpowers/plans/2026-11-17-native-port.md`.
 | --- | --- |
 | `mosh-core` | the shared contract: transport, shared-memory layout, analysis output, show model, control events |
 | `mosh-ipc` | shared-memory rings, per-slot seqlock |
-| `mosh-tap` | the VST3 plugins **Moshloom Tap** (master, pass-through) and **Moshloom Control** (MIDI) |
+| `mosh-tap` | the VST3 plugins **ilanaVisual Tap** (master, pass-through) and **ilanaVisual Control** (MIDI), vendor Ilana Audio, one bundle `ilanaVisual.vst3` |
 | `mosh-capture` | WASAPI loopback fallback |
 | `mosh-analysis` | causal features, beat grid, intensity model, tempo tracker, `mosh-analyze` CLI |
 | `mosh-show` | Session, Arrangement, Autopilot, follow actions, seeded procedural looks, RON projects |
@@ -438,7 +438,7 @@ interfaces and tests: `docs/superpowers/plans/2026-11-17-native-port.md`.
 | `mosh-shaders` | the web app's WGSL (34 modules) compiled to SPIR-V; the layer uniform layout |
 | `mosh-render` | Vulkan core (ash): device on the integrated GPU, targets, pipelines, compositor, swapchain, flash limiter |
 | `mosh-visuals` | one layer = scene / fluid / video -> datamosh -> effects (one pass) -> transition; all five stages in |
-| `mosh-app` | the app: input fallback (plugin -> loopback after 2 s), Autopilot by default, stage + control windows, budgets, self-recovery; `mosh-feed` streams a file into shared memory as the Tap plugin would |
+| `mosh-app` | the app, `ilanaVisual.exe`: input fallback (plugin -> loopback after 2 s), Autopilot by default, stage + control windows, budgets, self-recovery; `mosh-feed` streams a file into shared memory as the Tap plugin would |
 
 ### Build and test
 
@@ -447,10 +447,12 @@ cd native
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run --manifest-path crates/mosh-tap/xtask/Cargo.toml -- bundle mosh-tap --release
-#   -> native/target/bundled/mosh-tap.vst3 (Live lists Moshloom Tap and Moshloom Control)
+#   -> native/target/bundled/ilanaVisual.vst3; install by copying it into
+#      C:\Program Files\Common Files\VST3 (Live lists ilanaVisual Tap and ilanaVisual Control
+#      under Ilana Audio)
 ```
 
-Run it: `target/release/mosh-app.exe [project.ron]` (no project: Autopilot over the 16 scenes).
+Run it: `target/release/ilanaVisual.exe [project.ron]` (no project: Autopilot over the 16 scenes).
 Without Ableton, `target/release/mosh-feed.exe "<track>.wav" [--bpm 93] [--start-s 30]` plays a
 track into shared memory with a beat-accurate transport, silently, so the app runs in plugin mode.
 
@@ -462,6 +464,7 @@ Vulkan SDK (1.4.363.0 on the reference machine). `cargo test --workspace` is the
 
 | what | number |
 | --- | --- |
+| **Ableton -> app** (Live 12, Tap on the master, by the performer) | works: the app switches to plugin mode and follows the set |
 | **first app run**, loopback, nothing playing (release, integrated GPU, laptop screen only) | GPU 0.70-0.75 ms, render thread 0.05-0.11 ms per frame; process about 5.5% of one core; 322 MB |
 | **app + mosh-feed**, "reza pedia" (93 BPM) from 0:30 for 54 s | plugin mode, 93.0 BPM, bars advancing, Autopilot changed scenes; GPU 0.77-1.53 ms, render thread 0.08-0.19 ms; process about 5.6% of one core; 285 MB |
 | `IpcWriter::push_block`, 256 stereo frames | median 200 ns, p99 500 ns, 0 allocations / 10 000 |
@@ -567,5 +570,5 @@ the rules are not tuned yet: that waits for hand-placed marks.
   compileShader, probe, reset, dispose). `setProject` and `loadFeatures` were added in R1: the
   feature-loading sequence (arrays, mel, then `set_grid`) exists once, in `gpuLoadFeatures`, used by the
   page and the render worker. The 13 goldens were unchanged by the T1a refactor and by R1.
-- Not built in the web app: live audio input, MIDI, desktop packaging. Moshloom Native (above) is
+- Not built in the web app: live audio input, MIDI, desktop packaging. ilanaVisual (above) is
   where those are being built.

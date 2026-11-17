@@ -80,7 +80,7 @@ impl Scene {
                 static LOGGED: std::sync::Once = std::sync::Once::new();
                 LOGGED.call_once(|| {
                     eprintln!(
-                        "moshloom: integrated GPU unavailable ({error}); falling back to the discrete GPU"
+                        "ilanaVisual: integrated GPU unavailable ({error}); falling back to the discrete GPU"
                     )
                 });
                 Gpu::new(GpuPreference::Discrete)?
@@ -182,7 +182,7 @@ impl VideoBank {
                     self.sources.insert(clip.id, source);
                 }
                 Err(error) => {
-                    eprintln!("moshloom: overlay video {} ({path}): {error}", clip.id);
+                    eprintln!("ilanaVisual: overlay video {} ({path}): {error}", clip.id);
                     self.failed.insert(clip.id);
                     return None;
                 }
@@ -444,7 +444,7 @@ impl RenderThread {
         }
 
         for line in self.budget.sample(cpu_ms, gpu_ms, Instant::now()) {
-            eprintln!("moshloom: {line}");
+            eprintln!("ilanaVisual: {line}");
         }
 
         if self
@@ -653,7 +653,7 @@ impl Shell {
         let title = self
             .note
             .as_deref()
-            .unwrap_or("moshloom · control")
+            .unwrap_or("ilanaVisual · control")
             .to_string();
         let attributes = Window::default_attributes()
             .with_title(title)
@@ -682,7 +682,7 @@ impl Shell {
         };
         let size = monitor.size();
         let mut attributes = Window::default_attributes()
-            .with_title("moshloom stage")
+            .with_title("ilanaVisual stage")
             .with_decorations(false)
             .with_visible(true);
         if placement.is_fullscreen() {
@@ -792,7 +792,7 @@ impl Shell {
     }
 
     fn log(&self, text: String) {
-        eprintln!("moshloom: {text}");
+        eprintln!("ilanaVisual: {text}");
     }
 
     fn shutdown(&mut self) {

@@ -126,10 +126,10 @@ impl Default for MoshloomTap {
 }
 
 impl Plugin for MoshloomTap {
-    const NAME: &'static str = "Moshloom Tap";
-    const VENDOR: &'static str = "Moshloom";
-    const URL: &'static str = "https://github.com/orth4x0r/moshloom";
-    const EMAIL: &'static str = "noreply@moshloom.invalid";
+    const NAME: &'static str = "ilanaVisual Tap";
+    const VENDOR: &'static str = "Ilana Audio";
+    const URL: &'static str = "";
+    const EMAIL: &'static str = "";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
@@ -213,7 +213,7 @@ impl Plugin for MoshloomTap {
 }
 
 impl Vst3Plugin for MoshloomTap {
-    const VST3_CLASS_ID: [u8; 16] = *b"MoshloomTap00001";
+    const VST3_CLASS_ID: [u8; 16] = *b"ilanaVisualTap01";
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
         &[Vst3SubCategory::Fx, Vst3SubCategory::Tools];
 }

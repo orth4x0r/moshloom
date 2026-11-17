@@ -255,10 +255,10 @@ impl Default for MoshloomControl {
 }
 
 impl Plugin for MoshloomControl {
-    const NAME: &'static str = "Moshloom Control";
-    const VENDOR: &'static str = "Moshloom";
-    const URL: &'static str = "https://github.com/orth4x0r/moshloom";
-    const EMAIL: &'static str = "noreply@moshloom.invalid";
+    const NAME: &'static str = "ilanaVisual Control";
+    const VENDOR: &'static str = "Ilana Audio";
+    const URL: &'static str = "";
+    const EMAIL: &'static str = "";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
@@ -340,7 +340,7 @@ impl Plugin for MoshloomControl {
 }
 
 impl Vst3Plugin for MoshloomControl {
-    const VST3_CLASS_ID: [u8; 16] = *b"MoshloomCtl00001";
+    const VST3_CLASS_ID: [u8; 16] = *b"ilanaVisualCtl01";
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
         Vst3SubCategory::Instrument,
         Vst3SubCategory::Synth,

@@ -688,7 +688,7 @@ pub fn arrangement_project(spans: &[(u32, f64, f64)], songs: &[(&str, f64)]) -> 
 /// window. `None` means the title is unchanged and must not be set again.
 pub fn title_for(previous: Option<&str>, status: &Status) -> Option<String> {
     let next = format!(
-        "moshloom · {} · {} · {:.1} BPM · bar {} ({:.0}%) · L{} · GPU {:.2} ms · CPU {:.2} ms",
+        "ilanaVisual · {} · {} · {:.1} BPM · bar {} ({:.0}%) · L{} · GPU {:.2} ms · CPU {:.2} ms",
         status.mode,
         status.source,
         status.tempo_bpm,

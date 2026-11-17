@@ -11,7 +11,7 @@ name = "mosh_app"
 path = "src/lib.rs"
 
 [[bin]]
-name = "mosh-app"
+name = "ilanaVisual"
 path = "src/main.rs"
 
 [dependencies]

@@ -5,7 +5,7 @@
 
 fn main() {
     if let Err(error) = mosh_app::shell::run() {
-        eprintln!("moshloom: {error}");
+        eprintln!("ilanaVisual: {error}");
         std::process::exit(1);
     }
 }
