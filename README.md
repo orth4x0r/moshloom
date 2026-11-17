@@ -437,7 +437,7 @@ interfaces and tests: `docs/superpowers/plans/2026-11-17-native-port.md`.
 | `mosh-video` | Media Foundation overlay decoding |
 | `mosh-shaders` | the web app's WGSL (34 modules) compiled to SPIR-V; the layer uniform layout |
 | `mosh-render` | Vulkan core (ash): device on the integrated GPU, targets, pipelines, compositor, swapchain, flash limiter |
-| `mosh-visuals` | scenes, mosh, effects, transitions, fluid, overlays (Phase 2, in progress) |
+| `mosh-visuals` | one layer = scene / fluid / video -> datamosh -> effects (one pass) -> transition; all five stages in |
 | `mosh-app` | the app (Phase 2, in progress) |
 
 ### Build and test
@@ -469,12 +469,18 @@ Vulkan SDK (1.4.363.0 on the reference machine). `cargo test --workspace` is the
 | loopback capture | 185-187 blocks/s at 48 kHz, within one block of wall time |
 | overlay decode (160x90 fixture, debug) | 0.18 ms/frame |
 | 16 web scenes at 960x540 (debug, integrated GPU) | all lit at 3 levels x 3 seeds (144/144 draws), 0 validation messages; 0.10-0.32 ms each except Numogram 3.4-9.5 ms and Swarm 1.6-4.5 ms |
+| datamosh, one layer (debug, integrated GPU) | 0.88 ms at 960x540, 2.09 ms at 1280x720; a static picture stays exact (0/255), a moving bar leaves its trail behind it |
+| fluid visualizer, one layer at 1280x720 internal (debug) | 0.80-1.12 ms (17 passes, 8 pressure iterations); 10 000 noisy frames with no NaN |
 | effects lane, all 8 effects in one pass at 960x540 (debug, integrated GPU) | 0.91-1.01 ms; amount 0 is the exact identity (0 of 9216 pixels change) |
 | Strobe at 16 requests/s for 1 s | 3 flash starts (limiter) and 3 luminance jumps (read back) |
 | overlay 1080p upload / upload+draw (debug, integrated GPU) | 0.53-0.72 ms / 2.78-4.36 ms; 0 new GPU allocations over 600 frames |
 
 Known gap: Numogram alone can exceed the 6 ms GPU budget at 960x540 on the integrated GPU; it
 needs a cheaper version or a lower internal scale before it goes in a set.
+
+Known gap: a clip change cannot force a datamosh refresh (I-frame) yet; the mosh refreshes on
+drops, every fourth bar and playback jumps. Adding a "clip changed" input is a contract change for
+after Phase 2.
 
 Known gap: an overlay layer is drawn in its own submission that the CPU waits on (1.7-2.6 ms per
 layer in debug), because the frame recorder only samples render targets; it has to move into the
