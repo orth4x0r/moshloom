@@ -502,9 +502,15 @@ intro (bars 1-8, about -27 dB), 3 then 4 when the beat comes in, 4 through the l
 to 1 in the breakdown at bar 41; on all 16 tracks, 15 use at least 3 levels and every level change
 is at most one step per bar. The app also starts a fresh analyzer when the input switches
 (loopback before Live plays -> plugin), which otherwise pushed that intro to level 4 in four bars.
-Known gap: two loud sections 7 dB apart (bars 9-23 and 24-39) both read level 4; telling sections
-apart is what the hand-placed marks are for. The first second after start logs one budget
-line (shader compilation, 6-14 ms on the render thread).
+Sections and drops (since #56, no hand labels): the analyzer finds section boundaries causally
+(mel novelty against the last 4 bars plus a level step, snapped to 4-bar phrase lines, confirmed
+within 1-2 bars) and ranks each section's energy against the sections heard so far; a drop needs
+a >= 4.5 dB rise on the downbeat half of the bar after a build or a low-end gap. On the 16 tuning
+tracks: sections more than 3 dB apart are ordered correctly 92% of the time (was 80%), the loudest
+section reaches level 4 on 10 of 16 tracks (was 0), drops land on one of the biggest energy rises
+in 9 of 12 cases (was 2 of 10). "reza pedia": bars 9-23 now average level 3.0 and bars 24-39 level
+4.0 (both were ~3.9). `Analyzer::push` stays at 32-37 us per 256-sample block (release), 54-90 us
+with drum and bass stems fed through `push_stem` (budget 200 us).
 
 Known gap: the stress project's *steady* 1080p frame is inside the 6 ms GPU budget (p95 4.99 ms),
 and so is a 2-beat crossfade frame on its own (median 6.02 ms), but the 300-frame run's p95 is
