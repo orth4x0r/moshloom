@@ -468,6 +468,8 @@ Vulkan SDK (1.4.363.0 on the reference machine). `cargo test --workspace` is the
 | Vulkan device | "AMD Radeon(TM) Graphics" picked by default; 0 validation messages in every GPU test |
 | loopback capture | 185-187 blocks/s at 48 kHz, within one block of wall time |
 | overlay decode (160x90 fixture, debug) | 0.18 ms/frame |
+| effects lane, all 8 effects in one pass at 960x540 (debug, integrated GPU) | 0.91-1.01 ms; amount 0 is the exact identity (0 of 9216 pixels change) |
+| Strobe at 16 requests/s for 1 s | 3 flash starts (limiter) and 3 luminance jumps (read back) |
 | overlay 1080p upload / upload+draw (debug, integrated GPU) | 0.53-0.72 ms / 2.78-4.36 ms; 0 new GPU allocations over 600 frames |
 
 Known gap: an overlay layer is drawn in its own submission that the CPU waits on (1.7-2.6 ms per

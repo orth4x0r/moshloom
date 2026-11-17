@@ -127,9 +127,17 @@ for (const f of files) {
 
 const expected = new Map(files.map((f) => [`${f.name}.wgsl`, f.text]));
 
+// Hand-written native shaders live in the same directory under a lane prefix (AGENTS.md, native
+// lanes): the extractor never reports or deletes them. Extracted scene files are `sceneNN_*`, so
+// the `scene_` prefix (with the underscore right after) does not collide with them.
+const LANE_PREFIXES = ['scene_', 'mosh_', 'fx_', 'tr_', 'fluidvis_', 'overlay_'];
+// Extracted web passes also use `fx_*` names, so a file counts as hand-written only when the
+// extractor does not produce it.
+const handWritten = (n) => LANE_PREFIXES.some((p) => n.startsWith(p)) && !expected.has(n);
+
 function existing() {
   try {
-    return readdirSync(OUT_DIR).filter((n) => n.endsWith('.wgsl'));
+    return readdirSync(OUT_DIR).filter((n) => n.endsWith('.wgsl') && !handWritten(n));
   } catch {
     return [];
   }
