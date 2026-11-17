@@ -103,6 +103,7 @@ Rules for native lanes:
 - Audio for tuning lives in `C:\Users\ilanf\moshloom-tracks` and is never committed.
 - `index.src.html`, `gpu.js`, `engine.c`, `fixtures/**` are read-only for native lanes.
 
+## Definition of done
 
 - one task = one branch = one PR = one worker
 - PR body: what changed, the test numbers, and what is *not* verified
