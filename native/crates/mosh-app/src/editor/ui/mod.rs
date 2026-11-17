@@ -38,6 +38,7 @@ use crate::editor::theme;
 use crate::preview::{Picture, ThumbRequest, has_thumbnail, thumb_key};
 
 pub use arrangement::{SpanDrag, SpanZone, TimeAxis, drag_result, hit_span};
+pub use session::{HeaderDrawn, HeaderRects, MIN_COLUMN, column_width, header_layout};
 pub use topbar::{TopBarPlan, top_bar_plan};
 
 /// How many thumbnails the cache keeps (96 x 54 RGBA each: 21 KB, so about 5 MB when full).
@@ -45,8 +46,9 @@ const THUMB_CACHE: usize = 240;
 /// A look must hold still this long before its thumbnail is drawn, so dragging a slider does
 /// not queue a picture per frame.
 const THUMB_SETTLE_S: f64 = 0.25;
-/// Thumbnails asked for and not yet delivered, at most.
-const THUMB_PENDING: usize = 6;
+/// Thumbnails asked for and not yet delivered, at most. The render thread draws one per stage
+/// frame, so this is a fifth of a second of work queued, refilled as pictures arrive.
+const THUMB_PENDING: usize = 12;
 /// The recent-projects list.
 pub const RECENT_MAX: usize = 8;
 
@@ -130,6 +132,12 @@ impl Thumbs {
         std::mem::take(&mut self.outbox)
     }
 
+    /// The render thread could not take this request now (no stage yet, a full queue): ask
+    /// again the next time the look is on screen.
+    pub fn retry(&mut self, key: u64) {
+        self.pending.remove(&key);
+    }
+
     /// A thumbnail arrived (`None`: that look has no picture).
     pub fn deliver(&mut self, ctx: &egui::Context, key: u64, picture: Option<Picture>) {
         self.pending.remove(&key);
@@ -190,15 +198,17 @@ pub struct EditorUi {
     pub thumbs: Thumbs,
     /// The live preview of the stage and its aspect (width / height).
     pub preview: Option<(egui::TextureHandle, f32)>,
-    /// The performer's choice for the preview (`P`, or a click on it). `None` is automatic: on
-    /// when the stage is on another monitor, off when it is a window right beside the controls
-    /// (where the stage itself is the preview, and the readback would be paid for nothing).
+    /// The performer's choice for the preview (`P`, or a click on it). `None` is the default:
+    /// on. (It costs the render thread a memcpy ten times a second, so there is no reason for it
+    /// to depend on where the stage is.)
     pub preview_on: Option<bool>,
     /// The preview was drawn this frame, so the shell keeps the render thread sending it.
     pub preview_shown: bool,
     pub stage: StageInfo,
     /// Requests for the shell, drained after each frame.
     pub actions: Vec<UiAction>,
+    /// What each layer header drew this frame (see [`HeaderDrawn`]): the layout tests read it.
+    pub header_probe: Vec<HeaderDrawn>,
     /// The dice button's generator state.
     pub seed_state: u64,
 }
@@ -225,6 +235,7 @@ impl Default for EditorUi {
             preview_shown: false,
             stage: StageInfo::default(),
             actions: Vec::new(),
+            header_probe: Vec::new(),
             seed_state: 0x9e37_79b9_7f4a_7c15,
         }
     }
@@ -252,7 +263,7 @@ impl EditorUi {
 
     /// Whether the preview is switched on (by the performer, or automatically).
     pub fn preview_enabled(&self) -> bool {
-        self.preview_on.unwrap_or(!self.stage.shared_monitor)
+        self.preview_on.unwrap_or(true)
     }
 
     /// Whether the render thread should be sending preview frames: the preview is on *and* the
@@ -320,6 +331,7 @@ fn quantize_label(quantize: LaunchQuantize) -> &'static str {
 pub fn draw(root: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel) -> Vec<Command> {
     let mut out = Vec::new();
     state.preview_shown = false;
+    state.header_probe.clear();
 
     shortcuts(root, state, model, &mut out);
 

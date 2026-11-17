@@ -614,6 +614,109 @@ fn a_visualizer_dragged_from_the_browser_becomes_a_clip() {
     );
 }
 
+/// A layer header's controls stay inside their column and off each other, with any number of
+/// layers, in both views, at the sizes the window is actually used at. 833 points wide is the
+/// control window on the reference laptop (58% of a 2560 px panel at 175%), where the first
+/// windowed run showed the opacity control cut off by the stop button.
+#[test]
+fn layer_headers_fit_their_columns_from_two_to_eight_layers() {
+    use mosh_app::editor::ui::{MIN_COLUMN, column_width, header_layout};
+
+    // The layout itself, at the narrowest column and at a roomy one.
+    for width in [MIN_COLUMN - 2.0, 178.0, 238.0] {
+        let column = Rect::from_min_size(Pos2::new(40.0, 60.0), Vec2::new(width, 56.0));
+        let rects = header_layout(column);
+        let all = rects.all();
+        for (index, rect) in all.iter().enumerate() {
+            assert!(column.contains_rect(*rect), "{width}: control {index} {rect:?}");
+            assert!(rect.width() >= 20.0 && rect.height() >= 20.0, "{width}: {rect:?}");
+            for other in &all[index + 1..] {
+                assert!(!rect.intersects(*other), "{width}: {rect:?} overlaps {other:?}");
+            }
+        }
+        // The pickers get what the fixed controls leave, and it is enough for a short label.
+        assert!(rects.kind.width() >= 64.0, "{width}: kind {:?}", rects.kind);
+        assert!(rects.blend.width() >= 64.0, "{width}: blend {:?}", rects.blend);
+        assert_eq!(rects.opacity.width(), 48.0, "room for \"100%\"");
+    }
+
+    for layers in 2..=8usize {
+        let mut model = EditorModel::new(default_project());
+        while model.project().session.layers.len() < layers {
+            model.apply(Command::AddLayer).expect("layer");
+        }
+        // The widest labels there are: every kind and blend mode appears.
+        for layer in 0..layers {
+            let kinds = [
+                LayerKind::Visualizer,
+                LayerKind::Adjustment,
+                LayerKind::Overlay,
+                LayerKind::Mask,
+            ];
+            let blends = [
+                BlendMode::LumaKey,
+                BlendMode::Multiply,
+                BlendMode::Normal,
+                BlendMode::Screen,
+            ];
+            model
+                .apply(Command::SetLayerKind {
+                    layer,
+                    kind: kinds[layer % 4],
+                })
+                .expect("kind");
+            model
+                .apply(Command::SetLayerBlend {
+                    layer,
+                    blend: blends[layer % 4],
+                })
+                .expect("blend");
+        }
+        for width in [833.0, 1280.0, 1920.0] {
+            for view in [View::Session, View::Arrangement] {
+                model.apply(Command::SelectView(view)).expect("view");
+                let mut harness = Harness::new((width, 827.0));
+                harness.idle(&model);
+                harness.idle(&model);
+                let what = format!("{layers} layers, {width} wide, {view:?}");
+                let drawn = harness.state.header_probe.clone();
+                assert_eq!(drawn.len(), layers, "{what}: one header per layer");
+                if view == View::Session {
+                    let column = column_width(width - 212.0, layers, layers < 8);
+                    assert!(column >= MIN_COLUMN, "{what}: column {column}");
+                    assert!(
+                        (drawn[0].column.width() - (column - 2.0)).abs() < 0.01,
+                        "{what}: {:?}",
+                        drawn[0].column
+                    );
+                }
+                for header in &drawn {
+                    let column = header.column.expand(0.5);
+                    // What was planned is in the column...
+                    for rect in header.planned.all() {
+                        assert!(column.contains_rect(rect), "{what}: {rect:?} in {column:?}");
+                    }
+                    // ...and what the pickers actually drew stayed in their rectangles: a long
+                    // label ("Adjustment", "Luma key") is shortened, not allowed to push the
+                    // opacity bar or the stop button out.
+                    for (name, actual, planned) in [
+                        ("kind", header.kind, header.planned.kind),
+                        ("blend", header.blend, header.planned.blend),
+                    ] {
+                        assert!(
+                            planned.expand(1.0).contains_rect(actual),
+                            "{what}: layer {} {name} drew {actual:?}, planned {planned:?}",
+                            header.layer + 1
+                        );
+                    }
+                    assert!(!header.kind.intersects(header.planned.stop), "{what}");
+                    assert!(!header.blend.intersects(header.planned.opacity), "{what}");
+                }
+            }
+        }
+    }
+}
+
 /// What one frame of the control window costs on this machine, with no window: layout and
 /// tessellation, no GL, no swapchain. "Idle" is a frame in which nothing changed; "busy" is a
 /// frame of a running show (the playhead moved, the meters changed, a slot is blinking).
@@ -819,7 +922,8 @@ fn screenshots() {
     std::fs::create_dir_all(&folder).expect("shots folder");
     /// One screenshot: file name, window size, view, browser open, detail open, help open.
     type Shot = (&'static str, (f32, f32), View, bool, bool, bool);
-    let shots: [Shot; 6] = [
+    let shots: [Shot; 7] = [
+        ("session-833", (833.0, 827.0), View::Session, true, true, false),
         ("session-1280", (1280.0, 800.0), View::Session, true, true, false),
         ("arrangement-1280", (1280.0, 800.0), View::Arrangement, true, true, false),
         ("arrangement-1920", (1920.0, 1080.0), View::Arrangement, true, true, false),

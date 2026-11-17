@@ -18,7 +18,8 @@ pub fn caption(painter: &egui::Painter, pos: Pos2, text: &str) {
     );
 }
 
-/// Text that is cut off at `rect`'s right edge instead of running over its neighbour.
+/// One line of text in `rect`. Text that is too long for it ends in an ellipsis instead of
+/// running over its neighbour.
 pub fn clipped_text(
     painter: &egui::Painter,
     rect: Rect,
@@ -27,9 +28,18 @@ pub fn clipped_text(
     font: egui::FontId,
     color: Color32,
 ) {
-    let painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
-    let pos = anchor.pos_in_rect(&rect);
-    painter.text(pos, anchor, text, font, color);
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
+    job.wrap = egui::text::TextWrapping {
+        max_width: rect.width().max(0.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('\u{2026}'),
+    };
+    let galley = painter.layout_job(job);
+    let pos = anchor.align_size_within_rect(galley.size(), rect).min;
+    painter
+        .with_clip_rect(rect.intersect(painter.clip_rect()))
+        .galley(pos, galley, color);
 }
 
 /// A row of mutually exclusive choices in `rect`. Returns the one that was clicked.

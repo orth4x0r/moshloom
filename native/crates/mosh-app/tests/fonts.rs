@@ -6,7 +6,7 @@ fn the_editor_can_draw_its_text() {
     let ctx = egui::Context::default();
     let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
     output.textures_delta.clear();
-    let text = "Session Arrangement Follow Manual Autopilot ilanaVisual ILANA AUDIO 0123456789 % + - ? . () · BPM > scene";
+    let text = "Session Arrangement Follow Manual Autopilot ilanaVisual ILANA AUDIO 0123456789 % + - ? . () \u{2026} · BPM > scene";
     // Every character the editor writes must be in the bundled fonts (they have no U+25B6 play
     // triangle: that drew a box on the launch buttons).
     // Every file that puts text in the control window: the views, the theme, the model's

@@ -83,15 +83,28 @@ slots and the lane.
   Launching, stopping and the show mode are the running show's state, not edits.
 - **The keyboard is Live's where Live has one** (`Tab`, `Shift+Tab`, `Ctrl+D`, `Delete`), and
   the top row is the scene column. `?` shows all of it.
-- **The window never hides.** On one screen the stage is an ordinary window beside the controls
-  (64% / the rest, 16:9). `F11` in either window takes the stage fullscreen and back; `Esc` on
+- **The window never hides.** On one screen the stage is an ordinary window beside the controls,
+  both wholly inside the monitor's work area (the taskbar is not covered): the controls take the
+  left 58% from top to bottom, the stage the rest of the width with a 16:9 picture. Where the
+  performer then puts the windows is remembered per monitor setup
+  (`%APPDATA%\ilanaVisual\windows.txt`) and used again while it is still on a screen. `F11` in either window takes the stage fullscreen and back; `Esc` on
   the stage leaves fullscreen and brings the controls to the front. With a second monitor the
   stage is fullscreen there and the controls are on the laptop. `Esc` no longer quits: closing
   the control window does.
-- **The preview is small, slow and often off, on purpose.** Each capture waits about 5.5 ms on
-  the render thread (see `preview.rs` for why and for what would fix it), so it is 96 px wide,
-  4 fps, on only when the stage is on another monitor (click it or press `P` to change that),
-  and never runs while the control window is minimised.
+- **The pictures cost the stage nothing to speak of.** The preview and the clip thumbnails ride
+  in frames the stage draws anyway: a blit and a copy inside the present submission, picked up
+  two frames later with no wait (`mosh_render::AsyncReadback`). A preview picture costs the
+  render thread about 0.03 ms (it was 5.5 ms with the blocking readback), so the preview is on
+  whenever the control window is visible, at 10 fps, on one screen too; `P` or a click turns it
+  off. Thumbnails are drawn one per stage frame, none in the renderer's first 30 frames, and add
+  about 0.06 ms to the frame that carries one. Neither runs while the control window is
+  minimised.
+- **A layer header's controls have their own rectangles** and stay in them: number, kind and
+  stop on one row, blend and opacity on the next. The opacity is a thin bar with the percentage
+  in it (drag sideways, double-click for 100%). In a narrow column the pickers show short names
+  ("Adjust", "Luma") with the full ones in the list and the hover text; a clip name that does
+  not fit ends in an ellipsis and is one hover away. Columns are never narrower than 156 points:
+  with more layers than fit, the columns scroll sideways and the scene column stays put.
 
 ## Shortcuts
 
@@ -113,6 +126,11 @@ slots and the lane.
 | `F11`, `Esc` (on the stage) | stage fullscreen on/off, back to the controls |
 
 ## More pictures
+
+The control window at the size it has on the reference laptop (58% of a 2560 px panel at 175%
+is 833 points), four layers:
+
+![833 points wide](session-833.png)
 
 ![Arrangement at 1920x1080](arrangement-1920.png)
 
