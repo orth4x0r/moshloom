@@ -27,16 +27,143 @@ const CELL: f32 = 46.0;
 const SCENES: f32 = 148.0;
 const ADD: f32 = 30.0;
 const LAUNCH: f32 = 30.0;
-const MIN_COLUMN: f32 = 132.0;
+/// A column is never narrower than this: its header's controls and a clip's name need the
+/// room. With more layers than fit, the grid scrolls sideways.
+pub const MIN_COLUMN: f32 = 156.0;
 const MAX_COLUMN: f32 = 240.0;
 
-const BLENDS: [(BlendMode, &str); 5] = [
-    (BlendMode::Normal, "Normal"),
-    (BlendMode::Add, "Add"),
-    (BlendMode::Screen, "Screen"),
-    (BlendMode::Multiply, "Multiply"),
-    (BlendMode::LumaKey, "Luma key"),
+/// The width of a session column for `layers` layers in a view `width` wide.
+pub fn column_width(width: f32, layers: usize, can_add: bool) -> f32 {
+    let add = if can_add { ADD } else { 0.0 };
+    ((width - SCENES - add - 8.0) / layers.max(1) as f32).clamp(MIN_COLUMN, MAX_COLUMN)
+}
+
+/// Blend modes: the name, and the short one a narrow header shows.
+const BLENDS: [(BlendMode, &str, &str); 5] = [
+    (BlendMode::Normal, "Normal", "Normal"),
+    (BlendMode::Add, "Add", "Add"),
+    (BlendMode::Screen, "Screen", "Screen"),
+    (BlendMode::Multiply, "Multiply", "Mult"),
+    (BlendMode::LumaKey, "Luma key", "Luma"),
 ];
+
+/// Where a layer header's five controls go.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeaderRects {
+    /// The layer's number.
+    pub badge: Rect,
+    /// The kind picker.
+    pub kind: Rect,
+    /// The stop button.
+    pub stop: Rect,
+    /// The blend picker.
+    pub blend: Rect,
+    /// The opacity bar.
+    pub opacity: Rect,
+}
+
+impl HeaderRects {
+    pub fn all(&self) -> [Rect; 5] {
+        [self.badge, self.kind, self.stop, self.blend, self.opacity]
+    }
+}
+
+/// Lay a layer header's controls out in `rect`, in two rows:
+///
+/// ```text
+/// | 1 | Visualizer      v | [] |     number, kind, stop
+/// | Normal        v | 100%     |     blend, opacity
+/// ```
+///
+/// The number, the stop button and the opacity bar have fixed widths; the two pickers take
+/// what is left of their row, so nothing is ever pushed out of the column.
+pub fn header_layout(rect: Rect) -> HeaderRects {
+    const ROW: f32 = 22.0;
+    const GAP: f32 = 4.0;
+    const BADGE: f32 = 20.0;
+    const OPACITY: f32 = 48.0;
+    let inner = rect.shrink2(Vec2::new(6.0, 5.0));
+    let row = |index: f32, left: f32, right: f32| {
+        Rect::from_min_max(
+            Pos2::new(left, inner.top() + (ROW + GAP) * index),
+            Pos2::new(right.max(left), inner.top() + (ROW + GAP) * index + ROW),
+        )
+    };
+    let badge = row(0.0, inner.left(), inner.left() + BADGE);
+    let stop = row(0.0, inner.right() - ROW, inner.right());
+    let kind = row(0.0, badge.right() + GAP, stop.left() - GAP);
+    let opacity = row(1.0, inner.right() - OPACITY, inner.right());
+    let blend = row(1.0, inner.left(), opacity.left() - GAP);
+    HeaderRects {
+        badge,
+        kind,
+        stop,
+        blend,
+        opacity,
+    }
+}
+
+/// What a layer header actually drew, for the layout tests: the column and the rectangle each
+/// control ended up in (a picker reports its own, which is where a too-long label would show).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeaderDrawn {
+    pub layer: usize,
+    pub column: Rect,
+    pub planned: HeaderRects,
+    pub kind: Rect,
+    pub blend: Rect,
+}
+
+/// A layer kind's short name, for a header too narrow for the long one.
+fn kind_short(kind: LayerKind) -> &'static str {
+    match kind {
+        LayerKind::Visualizer => "Visual",
+        LayerKind::Overlay => "Video",
+        LayerKind::Adjustment => "Adjust",
+        LayerKind::Mask => "Mask",
+    }
+}
+
+/// The opacity control: a thin bar that fills with the value and carries the percentage. Drag
+/// sideways to change it (a pixel is a percent), double-click for 100%.
+fn opacity_bar(ui: &mut egui::Ui, rect: Rect, layer: usize, opacity: f32) -> Option<f32> {
+    let response = ui
+        .interact(rect, ui.scope_id().with(("opacity", layer)), Sense::click_and_drag())
+        .on_hover_text(format!(
+            "opacity {:.0}%\ndrag left or right, double-click for 100%",
+            opacity * 100.0
+        ));
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        theme::RADIUS,
+        if response.hovered() || response.dragged() {
+            theme::HOVER
+        } else {
+            theme::RAISED
+        },
+    );
+    let fill = Rect::from_min_max(
+        rect.min,
+        Pos2::new(
+            rect.left() + rect.width() * opacity.clamp(0.0, 1.0),
+            rect.bottom(),
+        ),
+    );
+    painter.rect_filled(fill, theme::RADIUS, theme::ACCENT_DIM);
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        format!("{:.0}%", opacity * 100.0),
+        theme::small(),
+        theme::TEXT,
+    );
+    if response.double_clicked() {
+        return Some(1.0);
+    }
+    let delta = response.drag_delta().x;
+    (response.dragged() && delta != 0.0).then(|| (opacity + delta / 100.0).clamp(0.0, 1.0))
+}
 
 /// Blink phase for queued slots: on for half of every 0.4 s, and ask for the next frame.
 fn blink(ui: &egui::Ui) -> bool {
@@ -48,13 +175,16 @@ fn blink(ui: &egui::Ui) -> bool {
 /// A layer's controls: its number, kind, blend, opacity and a stop button, in `rect`.
 ///
 /// Shared by the Session column headers and the Arrangement lane headers, so a layer is edited
-/// the same way in both views.
+/// the same way in both views. Every control is given its rectangle by [`header_layout`] and
+/// stays in it: a picker's label is shortened, then truncated, never allowed to push the
+/// control beside it out of the column.
 pub(super) fn layer_header(
     ui: &mut egui::Ui,
     rect: Rect,
     index: usize,
     layer: &Layer,
     model: &EditorModel,
+    probe: &mut Vec<HeaderDrawn>,
     out: &mut Vec<Command>,
 ) {
     let status = model.status();
@@ -63,96 +193,107 @@ pub(super) fn layer_header(
     let header = ui.interact(rect, ui.scope_id().with(("layer_menu", index)), Sense::click());
     ui.painter().rect_filled(rect, 0.0, theme::PANEL);
     widgets::kind_texture(ui.painter(), rect, layer.kind);
+    let rects = header_layout(rect);
 
-    let inner = rect.shrink2(Vec2::new(6.0, 5.0));
-    let row = 22.0;
-    // Line 1: the layer's number and its kind.
-    let badge = Rect::from_min_size(inner.min, Vec2::new(20.0, row));
     ui.painter().rect_filled(
-        badge,
+        rects.badge,
         theme::RADIUS,
         if playing { theme::ACCENT } else { theme::RAISED },
     );
     ui.painter().text(
-        badge.center(),
+        rects.badge.center(),
         Align2::CENTER_CENTER,
         index + 1,
         theme::strong(),
         if playing { theme::ON_ACCENT } else { theme::TEXT },
     );
-    let line1 = Rect::from_min_max(
-        Pos2::new(badge.right() + 6.0, inner.top()),
-        Pos2::new(inner.right(), inner.top() + row),
-    );
-    let line2 = Rect::from_min_max(
-        Pos2::new(inner.left(), inner.top() + row + 4.0),
-        Pos2::new(inner.right(), inner.top() + row * 2.0 + 4.0),
-    );
-    let stop = Rect::from_min_size(
-        Pos2::new(line2.right() - row, line2.top()),
-        Vec2::splat(row),
-    );
 
-    ui.scope_builder(UiBuilder::new().max_rect(line1).id_salt(("layer_kind", index)), |ui| {
-        egui::ComboBox::from_id_salt("kind")
-            .width(line1.width() - 8.0)
-            .selected_text(widgets::kind_label(layer.kind))
-            .show_ui(ui, |ui| {
-                for kind in widgets::LAYER_KINDS {
-                    if ui
-                        .selectable_label(layer.kind == kind, widgets::kind_label(kind))
-                        .on_hover_text(widgets::kind_tip(kind))
-                        .clicked()
-                    {
-                        out.push(Command::SetLayerKind { layer: index, kind });
-                    }
+    // A picker in exactly its rectangle: the button is that wide, and its label is cut to fit.
+    let picker = |ui: &mut egui::Ui,
+                  area: Rect,
+                  salt: &'static str,
+                  label: &str,
+                  tip: String,
+                  list: &mut dyn FnMut(&mut egui::Ui)|
+     -> Rect {
+        ui.scope_builder(
+            UiBuilder::new().max_rect(area).id_salt((salt, index)),
+            |ui| {
+                ui.spacing_mut().button_padding.x = 5.0;
+                egui::ComboBox::from_id_salt(salt)
+                    .width(area.width())
+                    .truncate()
+                    .selected_text(label.to_string())
+                    .show_ui(ui, |ui| list(ui))
+                    .response
+                    .on_hover_text(tip)
+                    .rect
+            },
+        )
+        .inner
+    };
+
+    let kind_label = if rects.kind.width() >= 104.0 {
+        widgets::kind_label(layer.kind)
+    } else {
+        kind_short(layer.kind)
+    };
+    let kind_rect = picker(
+        ui,
+        rects.kind,
+        "kind",
+        kind_label,
+        format!(
+            "{}: {}",
+            widgets::kind_label(layer.kind),
+            widgets::kind_tip(layer.kind)
+        ),
+        &mut |ui| {
+            for kind in widgets::LAYER_KINDS {
+                if ui
+                    .selectable_label(layer.kind == kind, widgets::kind_label(kind))
+                    .on_hover_text(widgets::kind_tip(kind))
+                    .clicked()
+                {
+                    out.push(Command::SetLayerKind { layer: index, kind });
                 }
-            })
-            .response
-            .on_hover_text(widgets::kind_tip(layer.kind));
-    });
-
-    ui.scope_builder(UiBuilder::new().max_rect(line2).id_salt(("layer_mix", index)), |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let blend_width = (line2.width() - row - 4.0 - 46.0 - 12.0).max(40.0);
-            let name = BLENDS
-                .iter()
-                .find(|(mode, _)| *mode == layer.blend)
-                .map_or("Normal", |(_, name)| *name);
-            egui::ComboBox::from_id_salt("blend")
-                .width(blend_width)
-                .selected_text(name)
-                .show_ui(ui, |ui| {
-                    for (mode, name) in BLENDS {
-                        if ui.selectable_label(layer.blend == mode, name).clicked() {
-                            out.push(Command::SetLayerBlend {
-                                layer: index,
-                                blend: mode,
-                            });
-                        }
-                    }
-                })
-                .response
-                .on_hover_text("how this layer is mixed onto the ones below");
-            let mut percent = (layer.opacity * 100.0).round();
-            let response = ui
-                .add(
-                    egui::DragValue::new(&mut percent)
-                        .range(0.0..=100.0)
-                        .speed(0.5)
-                        .fixed_decimals(0)
-                        .suffix("%"),
-                )
-                .on_hover_text("opacity (drag, or double-click to type)");
-            if response.changed() {
-                out.push(Command::SetLayerOpacity {
-                    layer: index,
-                    opacity: percent / 100.0,
-                });
             }
+        },
+    );
+
+    let (_, blend_name, blend_short) = BLENDS
+        .iter()
+        .find(|(mode, _, _)| *mode == layer.blend)
+        .copied()
+        .unwrap_or(BLENDS[0]);
+    let blend_rect = picker(
+        ui,
+        rects.blend,
+        "blend",
+        if rects.blend.width() >= 96.0 {
+            blend_name
+        } else {
+            blend_short
+        },
+        format!("blend: {blend_name}\nhow this layer is mixed onto the ones below"),
+        &mut |ui| {
+            for (mode, name, _) in BLENDS {
+                if ui.selectable_label(layer.blend == mode, name).clicked() {
+                    out.push(Command::SetLayerBlend {
+                        layer: index,
+                        blend: mode,
+                    });
+                }
+            }
+        },
+    );
+
+    if let Some(opacity) = opacity_bar(ui, rects.opacity, index, layer.opacity) {
+        out.push(Command::SetLayerOpacity {
+            layer: index,
+            opacity,
         });
-    });
+    }
 
     let stopping = status.stopping & (1 << index.min(7)) != 0;
     let ink = if stopping && blink(ui) {
@@ -164,7 +305,7 @@ pub(super) fn layer_header(
     };
     if widgets::icon_button(
         ui,
-        stop,
+        rects.stop,
         ("layer_stop", index),
         theme::RAISED,
         ink,
@@ -182,6 +323,13 @@ pub(super) fn layer_header(
             ui.close();
         }
     });
+    probe.push(HeaderDrawn {
+        layer: index,
+        column: rect,
+        planned: rects,
+        kind: kind_rect,
+        blend: blend_rect,
+    });
 }
 
 pub fn draw(ui: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel, out: &mut Vec<Command>) {
@@ -192,47 +340,85 @@ pub fn draw(ui: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel, out: &
     let layers = grid.layers.len();
     let can_add = layers < MAX_LAYERS;
     let add = if can_add { ADD } else { 0.0 };
-    let column = ((area.width() - SCENES - add - 8.0) / layers.max(1) as f32)
-        .clamp(MIN_COLUMN, MAX_COLUMN);
-    let grid_width = column * layers as f32 + add + SCENES;
+    let column = column_width(area.width(), layers, can_add);
+    let columns_width = column * layers as f32 + add;
 
-    egui::ScrollArea::both()
+    // The rows scroll up and down as one. The layer columns scroll sideways on their own when
+    // there are more of them than fit, so the scene column (the launch buttons) stays in view.
+    egui::ScrollArea::vertical()
         .id_salt("session_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let height = HEADER + CELL * grid.scenes.len() as f32 + CELL + 8.0;
             let (rect, _) =
-                ui.allocate_exact_size(Vec2::new(grid_width, height), Sense::hover());
-            let column_x = |layer: usize| rect.left() + column * layer as f32;
-            let scenes_x = column_x(layers) + add;
-
-            // Column headers.
-            for (index, layer) in grid.layers.iter().enumerate() {
-                let header = Rect::from_min_size(
-                    Pos2::new(column_x(index), rect.top()),
-                    Vec2::new(column - 2.0, HEADER - 2.0),
-                );
-                layer_header(ui, header, index, layer, model, out);
-            }
-            if can_add {
-                let plus = Rect::from_min_size(
-                    Pos2::new(column_x(layers) + 2.0, rect.top() + 6.0),
-                    Vec2::splat(ADD - 6.0),
-                );
-                if widgets::icon_button(
-                    ui,
-                    plus,
-                    "add_layer",
-                    theme::RAISED,
-                    theme::DIM,
-                    widgets::plus_icon,
-                )
-                .on_hover_text("add a layer on top")
-                .clicked()
-                {
-                    out.push(Command::AddLayer);
-                }
-            }
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+            let scenes_x = (rect.left() + columns_width).min(rect.right() - SCENES);
+            let columns = Rect::from_min_max(
+                rect.min,
+                Pos2::new(scenes_x - 4.0, rect.top() + HEADER + CELL * grid.scenes.len() as f32 + 12.0),
+            );
+            ui.scope_builder(UiBuilder::new().max_rect(columns).id_salt("columns"), |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("session_columns")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let (rect, _) = ui.allocate_exact_size(
+                            Vec2::new(columns_width, columns.height() - 12.0),
+                            Sense::hover(),
+                        );
+                        let column_x = |layer: usize| rect.left() + column * layer as f32;
+                        // Column headers.
+                        for (index, layer) in grid.layers.iter().enumerate() {
+                            let header = Rect::from_min_size(
+                                Pos2::new(column_x(index), rect.top()),
+                                Vec2::new(column - 2.0, HEADER - 2.0),
+                            );
+                            layer_header(
+                                ui,
+                                header,
+                                index,
+                                layer,
+                                model,
+                                &mut state.header_probe,
+                                out,
+                            );
+                        }
+                        if can_add {
+                            let plus = Rect::from_min_size(
+                                Pos2::new(column_x(layers) + 2.0, rect.top() + 6.0),
+                                Vec2::splat(ADD - 6.0),
+                            );
+                            if widgets::icon_button(
+                                ui,
+                                plus,
+                                "add_layer",
+                                theme::RAISED,
+                                theme::DIM,
+                                widgets::plus_icon,
+                            )
+                            .on_hover_text("add a layer on top")
+                            .clicked()
+                            {
+                                out.push(Command::AddLayer);
+                            }
+                        }
+                        // The slots.
+                        for (scene, row) in grid.scenes.iter().enumerate() {
+                            let y = rect.top() + HEADER + CELL * scene as f32;
+                            for layer in 0..layers {
+                                let cell = Rect::from_min_size(
+                                    Pos2::new(column_x(layer), y),
+                                    Vec2::new(column - 2.0, CELL - 2.0),
+                                );
+                                if !ui.is_rect_visible(cell) {
+                                    continue;
+                                }
+                                let clip = row.cells.get(layer).copied().flatten();
+                                slot(ui, state, model, cell, layer, scene, clip, out);
+                            }
+                        }
+                    });
+            });
             ui.painter().text(
                 Pos2::new(scenes_x + 8.0, rect.top() + HEADER - 12.0),
                 Align2::LEFT_BOTTOM,
@@ -241,21 +427,9 @@ pub fn draw(ui: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel, out: &
                 theme::FAINT,
             );
 
-            // The grid.
+            // The scene column.
             for (scene, row) in grid.scenes.iter().enumerate() {
                 let y = rect.top() + HEADER + CELL * scene as f32;
-                for layer in 0..layers {
-                    let cell = Rect::from_min_size(
-                        Pos2::new(column_x(layer), y),
-                        Vec2::new(column - 2.0, CELL - 2.0),
-                    );
-                    if !ui.is_rect_visible(cell) {
-                        continue;
-                    }
-                    let clip = row.cells.get(layer).copied().flatten();
-                    slot(ui, state, model, cell, layer, scene, clip, out);
-                }
-
                 // The scene's launch button.
                 let button = Rect::from_min_size(
                     Pos2::new(scenes_x, y),
@@ -394,6 +568,16 @@ fn slot(
     );
     let dropping = response.dnd_hover_payload::<DragPayload>().is_some();
     let clip = clip.and_then(|id| model.clip(id));
+    // A narrow column cuts a long name short: the whole of it is one hover away.
+    let response = match clip {
+        Some(clip) => response.on_hover_text(format!(
+            "{}\n{}",
+            clip.name,
+            crate::editor::model::catalog_entry(&clip.visualizer)
+                .map_or(clip.visualizer.as_str(), |entry| entry.name)
+        )),
+        None => response,
+    };
 
     let Some(clip) = clip else {
         // An empty slot: a quiet well, lit while something is dragged over it.

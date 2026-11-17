@@ -36,7 +36,7 @@ use winit::window::{Window, WindowAttributes};
 use crate::editor::model::{Command, EditorModel};
 use crate::editor::theme;
 use crate::editor::ui::{self, EditorUi};
-use crate::monitor::Area;
+use crate::monitor::{Chrome, SavedWindow};
 
 /// The control window never paints more often than this, however loudly egui asks.
 pub const MAX_PERIOD: Duration = Duration::from_millis(33);
@@ -68,12 +68,13 @@ impl EditorWindow {
     /// The window is created through glutin's builder so the config it gets is the one the
     /// context is made with; that is why the shell does not create it with `create_window`.
     ///
-    /// `place` is where the window goes: a monitor's top-left corner in desktop coordinates and
-    /// the area on it (`crate::monitor::window_plan`), or `None` to let the OS decide.
+    /// `place` is where the window goes: its outer position on the desktop and its client size
+    /// (from `crate::monitor`: the plan, or where the performer left it), or `None` to let the
+    /// OS decide.
     pub fn new(
         event_loop: &ActiveEventLoop,
         title: &str,
-        place: Option<(PhysicalPosition<i32>, Area)>,
+        place: Option<SavedWindow>,
     ) -> Result<EditorWindow, Box<dyn std::error::Error>> {
         let attributes = control_attributes(title, place);
         let template = ConfigTemplateBuilder::new()
@@ -166,6 +167,40 @@ impl EditorWindow {
     /// Whether the window is minimised: it paints nothing and asks for no preview.
     pub fn is_hidden(&self) -> bool {
         self.hidden()
+    }
+
+    /// What the window's frame adds to its client area, measured on the real window.
+    pub fn chrome(&self) -> Chrome {
+        let (outer, inner) = (self.window.outer_size(), self.window.inner_size());
+        Chrome {
+            width: outer.width.saturating_sub(inner.width),
+            height: outer.height.saturating_sub(inner.height),
+        }
+    }
+
+    /// Where the window is now, in the form it can be put back in. `None` while it is
+    /// minimised or maximised: neither is a place worth remembering.
+    pub fn placement(&self) -> Option<SavedWindow> {
+        if self.hidden() || self.window.is_maximized() {
+            return None;
+        }
+        let position = self.window.outer_position().ok()?;
+        let size = self.window.inner_size();
+        (size.width > 0 && size.height > 0).then_some(SavedWindow {
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height,
+        })
+    }
+
+    /// Move and size the window.
+    pub fn place(&self, place: SavedWindow) {
+        self.window
+            .set_outer_position(PhysicalPosition::new(place.x, place.y));
+        let _ = self
+            .window
+            .request_inner_size(PhysicalSize::new(place.width, place.height));
     }
 
     /// Ask for a frame (after a window event, a status line, or an applied command).
@@ -282,17 +317,14 @@ impl Drop for EditorWindow {
 }
 
 /// Kept out of `new` so the text does not fight the GL setup.
-fn control_attributes(
-    title: &str,
-    place: Option<(PhysicalPosition<i32>, Area)>,
-) -> WindowAttributes {
+fn control_attributes(title: &str, place: Option<SavedWindow>) -> WindowAttributes {
     let attributes = Window::default_attributes()
         .with_title(title)
         .with_min_inner_size(PhysicalSize::new(800, 560));
     match place {
-        Some((origin, area)) => attributes
-            .with_inner_size(PhysicalSize::new(area.width, area.height))
-            .with_position(PhysicalPosition::new(origin.x + area.x, origin.y + area.y)),
+        Some(place) => attributes
+            .with_inner_size(PhysicalSize::new(place.width, place.height))
+            .with_position(PhysicalPosition::new(place.x, place.y)),
         None => attributes.with_inner_size(PhysicalSize::new(1280, 800)),
     }
 }

@@ -425,7 +425,15 @@ pub fn draw(ui: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel, out: &
                 );
                 let kind = layers.get(lane).map_or(LayerKind::Visualizer, |layer| layer.kind);
                 match layers.get(lane) {
-                    Some(layer) => layer_header(ui, header, lane, layer, model, out),
+                    Some(layer) => layer_header(
+                        ui,
+                        header,
+                        lane,
+                        layer,
+                        model,
+                        &mut state.header_probe,
+                        out,
+                    ),
                     None => {
                         ui.painter().rect_filled(header, 0.0, theme::PANEL);
                         ui.painter().text(

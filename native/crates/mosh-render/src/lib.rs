@@ -77,6 +77,16 @@
 //!   the device can do any of it, and the `textureCompressionBC` feature is now enabled when
 //!   available.
 
+//!
+//! ## Asynchronous readback (UI wave)
+//!
+//! - `AsyncReadback` takes a small RGBA8 picture of an image inside a frame that is being
+//!   recorded anyway and hands it out `READBACK_DELAY` frames later, with no submission, fence
+//!   or wait of its own (`Gpu::read_back` costs about 5 ms; this costs a memcpy).
+//! - `Stage::set_preview_size` / `request_preview` / `take_preview` are that for the presented
+//!   image (the control window's stage preview), and `Stage::present_with_capture` /
+//!   `take_capture` for one layer target per frame (clip thumbnails).
+
 use std::fmt;
 
 mod compositor;
@@ -84,6 +94,7 @@ mod device;
 mod flash;
 pub mod pace;
 mod pipeline;
+mod readback;
 mod shaders;
 mod swapchain;
 mod target;
@@ -97,6 +108,7 @@ pub use device::{Gpu, GpuPreference};
 pub use flash::{FlashLimiter, FLASH_INTERVAL};
 pub use pace::{FramePacer, WaitTimer, DEFAULT_MAX_FPS};
 pub use pipeline::{FrameRecorder, Pipeline};
+pub use readback::{AsyncReadback, Readback, READBACK_DELAY};
 pub use swapchain::{
     MonitorId, PresentResult, Stage, SwapchainAction, SwapchainPolicy, STAGE_FORMAT,
 };

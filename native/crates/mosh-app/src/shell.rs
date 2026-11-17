@@ -11,8 +11,9 @@
 //!   (`crate::editor`), painted only when something changes and at most 30 times a second, so it
 //!   costs the stage nothing while the performer is not touching it. Closing it quits the app.
 //! - the control window's two pictures of the show, the **stage preview** and the **clip
-//!   thumbnails**, are drawn on the render thread and sent over as bytes (`crate::preview`);
-//!   the preview only while the control window is on screen and showing it.
+//!   thumbnails**, ride in the stage's own frames and are sent over as bytes (`crate::preview`):
+//!   no wait on the render thread, at most one thumbnail per frame, the preview only while the
+//!   control window is on screen and showing it.
 //! - the **render thread** owns the analysis, the show and the GPU. It presents with a FIFO
 //!   swapchain, so the frame loop blocks on the display and never busy-waits.
 //!
@@ -25,14 +26,12 @@
 //! keeps ticking and tries again a second later. No dialog, no exit, no panic: a set must survive
 //! a monitor unplug, a device reset or a driver restart.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use mosh_core::{
-    AnalysisFrame, BlendMode, Clip, ControlEvent, Layer, Project, RenderPlan, ShowMode,
-};
+use mosh_core::{AnalysisFrame, Clip, ControlEvent, Layer, Project, RenderPlan, ShowMode};
 use mosh_render::{
     FramePacer, FrameRecorder, Gpu, GpuPreference, LayerTarget, RenderError, Stage, WaitTimer,
 };
@@ -43,6 +42,7 @@ use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::monitor::MonitorHandle;
+use winit::platform::windows::MonitorHandleExtWindows;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::window::{Fullscreen, Window, WindowId};
 
@@ -51,9 +51,13 @@ use crate::core::{AppCore, Lamps, Status, default_project, window_title};
 use crate::editor::model::Command as EditorCommand;
 use crate::editor::ui::{StageInfo, UiAction};
 use crate::editor::{EditorModel, EditorUi, EditorWindow};
-use crate::monitor::{MonitorInfo, StageWindow, WindowPlan, window_plan};
+use crate::monitor::{
+    Area, Chrome, MonitorInfo, SavedLayout, SavedWindow, StageWindow, WindowPlan, format_layouts,
+    parse_layouts, recall, remember, setup_key, usable, window_plan,
+};
 use crate::preview::{
-    PREVIEW_FPS, Picture, PreviewClock, PreviewTap, ThumbRequest, ThumbTap,
+    PREVIEW_FPS, PREVIEW_WIDTH, Picture, PreviewClock, THUMB_SIZE, ThumbQueue, ThumbRequest,
+    has_thumbnail, preview_size, thumb_frame,
 };
 use crate::win::WindowHandle;
 
@@ -65,8 +69,6 @@ const STATUS_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the control window repaints for a changed status: ten times a second moves the
 /// playhead and the meters smoothly enough to read, and an unchanged status paints nothing.
 const STATUS_PAINT: Duration = Duration::from_millis(100);
-/// Thumbnail requests waiting for a frame, at most; older ones are dropped.
-const THUMB_QUEUE: usize = 64;
 /// Backoff after a failed rebuild.
 const RETRY_AFTER: Duration = Duration::from_millis(500);
 /// How often the same render error is logged again.
@@ -81,10 +83,11 @@ const IDLE_TICK: Duration = Duration::from_millis(16);
 struct Scene {
     stage: Option<Stage>,
     slots: Vec<LayerSlot>,
-    /// The control window's pictures (`crate::preview`), built on first use.
-    preview: Option<PreviewTap>,
-    thumbs: Option<ThumbTap>,
+    /// Where a clip thumbnail is drawn (`crate::preview`), built on first use.
+    thumb: Option<LayerTarget>,
     visuals: Option<Visuals>,
+    /// The internal size `visuals` was built for.
+    visuals_size: (u32, u32),
     gpu: Option<Gpu>,
     out: (u32, u32),
 }
@@ -113,9 +116,9 @@ impl Scene {
         let mut scene = Scene {
             stage: None,
             slots: Vec::with_capacity(layers.len()),
-            preview: None,
-            thumbs: None,
+            thumb: None,
             visuals: Some(visuals),
+            visuals_size: (w, h),
             gpu: Some(gpu),
             out,
         };
@@ -145,12 +148,16 @@ impl Scene {
     fn rescale(&mut self, out: (u32, u32), layers: &[Layer]) -> Result<(), RenderError> {
         let gpu = self.gpu()?;
         let (w, h) = internal_size(out, 0.5);
-        // Build the new visuals before dropping the old ones: if this fails the old scene is
-        // still intact and the next frame can try again.
-        let visuals = Visuals::new(gpu, w, h)?;
-        self.visuals = Some(visuals);
-        // The preview is sized from the stage; it is rebuilt on its next capture.
-        self.preview = None;
+        // The visuals (every pipeline, the fluid and mosh targets) are rebuilt only when their
+        // size changes. Starting up used to build them twice (once for the window's size, once
+        // more when the swapchain reported the same size), which was most of the first second.
+        if self.visuals.is_none() || self.visuals_size != (w, h) {
+            // Build the new visuals before dropping the old ones: if this fails the old scene
+            // is still intact and the next frame can try again.
+            let visuals = Visuals::new(gpu, w, h)?;
+            self.visuals = Some(visuals);
+            self.visuals_size = (w, h);
+        }
         self.out = out;
         self.rebuild_slots(layers);
         if let Some(stage) = self.stage.as_mut() {
@@ -177,45 +184,6 @@ impl Scene {
 
     fn detach_stage(&mut self) {
         self.stage = None;
-    }
-
-    /// Composite the stack the stage just presented at preview size and read it back.
-    fn capture_preview(&mut self, plan: &RenderPlan) -> Result<Picture, RenderError> {
-        let Some(gpu) = self.gpu.as_ref() else {
-            return Err(RenderError::Stage("no device".into()));
-        };
-        if self.preview.as_ref().is_none_or(|tap| tap.stage() != self.out) {
-            // Drop the old tap before building one for the new stage size.
-            self.preview = None;
-            self.preview = Some(PreviewTap::new(gpu, self.out)?);
-        }
-        let layers: Vec<(&LayerTarget, BlendMode, f32)> = plan
-            .layers
-            .iter()
-            .enumerate()
-            .filter_map(|(index, state)| {
-                self.slots
-                    .get(index)
-                    .map(|slot| (slot.output(), state.blend, state.opacity))
-            })
-            .collect();
-        match self.preview.as_mut() {
-            Some(tap) => tap.capture(gpu, &layers),
-            None => Err(RenderError::Stage("no preview".into())),
-        }
-    }
-
-    /// Draw one clip thumbnail (`None`: that visualizer has no thumbnail).
-    fn render_thumb(&mut self, request: &ThumbRequest) -> Result<Option<Picture>, RenderError> {
-        let Some(gpu) = self.gpu.as_ref() else {
-            return Err(RenderError::Stage("no device".into()));
-        };
-        let Some(visuals) = self.visuals.as_mut() else {
-            return Err(RenderError::Stage("no visuals".into()));
-        };
-        self.thumbs
-            .get_or_insert_with(|| ThumbTap::new(gpu))
-            .render(gpu, visuals, request)
     }
 }
 
@@ -257,15 +225,31 @@ impl VideoBank {
     }
 }
 
-/// What one presented frame measured.
+/// What one presented frame measured, and the pictures that came back with it.
 struct Outcome {
     cpu_ms: f32,
     gpu_ms: f32,
     surface_lost: bool,
+    /// A preview picture recorded two frames ago.
+    preview: Option<Picture>,
+    /// Thumbnails recorded two frames ago, by key.
+    thumbs: Vec<(u64, Picture)>,
+    /// The thumbnail asked for this frame could not be drawn.
+    thumb_failed: Option<u64>,
+}
+
+/// The control window's pictures a frame is asked to take along.
+#[derive(Default)]
+struct Pictures {
+    /// Blit the presented image into the preview.
+    preview: bool,
+    /// Draw this clip thumbnail at the end of the frame.
+    thumb: Option<ThumbRequest>,
 }
 
 /// Draw every layer of `plan` and present the result. `frame_start` is when the frame's CPU work
 /// began, so `cpu_ms` covers analysis, the show and the recording but not the vsync wait.
+#[allow(clippy::too_many_arguments)]
 fn render_frame(
     scene: &mut Scene,
     plan: &RenderPlan,
@@ -274,6 +258,7 @@ fn render_frame(
     frame_start: Instant,
     videos: &mut VideoBank,
     project: &Project,
+    pictures: Pictures,
 ) -> Result<Outcome, RenderError> {
     let Some(gpu) = scene.gpu.as_ref() else {
         return Err(RenderError::Stage("no device".into()));
@@ -316,6 +301,37 @@ fn render_frame(
         }
     }
 
+    // A clip thumbnail, when this frame carries one: one more scene pass at the end of the
+    // frame's own recorder, into a small target of its own. It is drawn after the layers, with
+    // the frame's clock and spectrum, so the tables the scenes share are left as the stage's
+    // own draws left them. A scene that fails to draw costs the thumbnail, never the frame.
+    let mut capture = None;
+    let mut thumb_failed = None;
+    if let Some(request) = pictures.thumb.as_ref()
+        && scene.stage.is_some()
+    {
+        let target = scene
+            .thumb
+            .get_or_insert_with(|| LayerTarget::new_single(gpu, THUMB_SIZE.0, THUMB_SIZE.1));
+        let drawn = match scene.visuals.as_mut() {
+            Some(visuals) => visuals.scenes.draw(
+                &mut recorder,
+                target,
+                &request.visualizer,
+                &thumb_frame(analysis),
+                &request.params,
+                t,
+            ),
+            None => Err(RenderError::Stage("no visuals".into())),
+        };
+        match drawn {
+            Ok(()) => capture = Some((&*target, request.key)),
+            Err(_) => thumb_failed = Some(request.key),
+        }
+    } else if let Some(request) = pictures.thumb.as_ref() {
+        thumb_failed = Some(request.key);
+    }
+
     let cpu_ms = frame_start.elapsed().as_secs_f32() * 1_000.0;
     let Some(stage) = scene.stage.as_mut() else {
         // No window to present in: the layers were still drawn, so the next monitor that appears
@@ -325,13 +341,39 @@ fn render_frame(
             cpu_ms,
             gpu_ms: 0.0,
             surface_lost: false,
+            preview: None,
+            thumbs: Vec::new(),
+            thumb_failed,
         });
     };
-    let present = stage.present(recorder);
+    // The pictures are copied out inside the present submission and picked up two presents
+    // later; neither size call does anything unless the size changed.
+    let extent = stage.extent();
+    let preview_ready = stage
+        .set_preview_size(
+            gpu,
+            Some(preview_size((extent[0], extent[1]), PREVIEW_WIDTH)),
+        )
+        .is_ok();
+    if pictures.preview && preview_ready {
+        stage.request_preview();
+    }
+    if capture.is_some() && stage.set_capture_size(gpu, THUMB_SIZE.0, THUMB_SIZE.1).is_err() {
+        thumb_failed = capture.take().map(|(_, key)| key);
+    }
+    let present = stage.present_with_capture(recorder, capture);
+    let preview = stage.take_preview().map(Picture::from);
+    let mut thumbs = Vec::new();
+    while let Some(picture) = stage.take_capture() {
+        thumbs.push((picture.tag, Picture::from(picture)));
+    }
     Ok(Outcome {
         cpu_ms,
         gpu_ms: stage.timings().frame_ms,
         surface_lost: present.surface_lost,
+        preview,
+        thumbs,
+        thumb_failed,
     })
 }
 
@@ -370,6 +412,8 @@ pub enum UserEvent {
     Preview(Picture),
     /// A clip thumbnail, or `None` when that look has no picture.
     Thumb { key: u64, picture: Option<Picture> },
+    /// A thumbnail request that could not be taken now: the control window asks again.
+    ThumbRetry(u64),
 }
 
 struct RenderHandle {
@@ -399,9 +443,8 @@ struct RenderThread {
     /// The control window is showing the stage preview.
     preview_on: bool,
     preview_clock: PreviewClock,
-    /// Whether the first capture's cost has been logged.
-    preview_logged: bool,
-    thumb_queue: VecDeque<ThumbRequest>,
+    /// Clip thumbnails waiting for a frame: one per stage frame, none while the renderer warms up.
+    thumb_queue: ThumbQueue,
     lamps: Lamps,
     started: Instant,
     last_status: Option<Instant>,
@@ -437,8 +480,7 @@ impl RenderThread {
             paced_frames: 0,
             preview_on: false,
             preview_clock: PreviewClock::new(PREVIEW_FPS),
-            preview_logged: false,
-            thumb_queue: VecDeque::new(),
+            thumb_queue: ThumbQueue::new(),
             lamps: Lamps::default(),
             started: Instant::now(),
             last_status: None,
@@ -514,10 +556,13 @@ impl RenderThread {
             Command::Control(event) => self.core.queue_control(event),
             Command::SetPreview(on) => self.preview_on = on,
             Command::Thumb(request) => {
-                if self.thumb_queue.len() >= THUMB_QUEUE {
-                    self.thumb_queue.pop_front();
+                if !has_thumbnail(&request.visualizer) {
+                    self.send_thumb(request.key, None);
+                } else if let Some(dropped) = self.thumb_queue.push(request) {
+                    // The queue was full: the control window is told, and asks again if the
+                    // clip is still on screen.
+                    let _ = self.proxy.send_event(UserEvent::ThumbRetry(dropped.key));
                 }
-                self.thumb_queue.push_back(request);
             }
             Command::Quit => {}
         }
@@ -542,20 +587,39 @@ impl RenderThread {
         let frame = self.core.step(frame_start);
         self.lamps.note(frame.analysis.events, frame_start);
 
+        // Building the renderer (a device, every pipeline) is not a frame: it happens before
+        // the first one and after a device loss, takes as long as it takes, and is logged on its
+        // own line. The frame's CPU time is counted from after it, so the 2 ms budget line means
+        // "a frame's work", not "the frame in which the app started".
+        let mut work_start = frame_start;
         if self.scene.is_none() && self.retry_at.is_none_or(|at| frame_start >= at) {
             self.build();
+            self.thumb_queue.renderer_rebuilt();
+            self.note(format!(
+                "renderer built in {:.0} ms (not a frame: the budget counts from the next one)",
+                frame_start.elapsed().as_secs_f32() * 1_000.0
+            ));
+            work_start = Instant::now();
         }
         // A window that exists without a stage (a failed surface, a monitor change) gets its
         // stage rebuilt on the retry interval.
         let wants_stage = self.scene.as_ref().is_some_and(|scene| scene.stage.is_none());
         if wants_stage && self.handle.is_some() && self.retry_at.is_none_or(|at| frame_start >= at) {
             self.attach_stage();
+            work_start = Instant::now();
         }
 
         let mut cpu_ms = 0.0;
         let mut gpu_ms = 0.0;
         let has_stage = self.scene.as_ref().is_some_and(|scene| scene.stage.is_some());
         if has_stage {
+            // The control window's pictures ride in this frame: the preview when one is due and
+            // wanted, and at most one clip thumbnail (none while the renderer warms up).
+            let pictures = Pictures {
+                preview: self.preview_on && self.preview_clock.due(frame_start),
+                thumb: self.thumb_queue.next_frame(),
+            };
+            let asked = pictures.thumb.as_ref().map(|request| request.visualizer.clone());
             if let Some(scene) = self.scene.as_mut() {
                 let t = self.started.elapsed().as_secs_f32();
                 match render_frame(
@@ -563,9 +627,10 @@ impl RenderThread {
                     &frame.plan,
                     &frame.analysis,
                     t,
-                    frame_start,
+                    work_start,
                     &mut self.videos,
                     self.core.show().project(),
+                    pictures,
                 ) {
                     Ok(outcome) => {
                         cpu_ms = outcome.cpu_ms;
@@ -573,11 +638,30 @@ impl RenderThread {
                         if outcome.surface_lost {
                             let _ = self.proxy.send_event(UserEvent::SurfaceLost);
                         }
+                        if let Some(picture) = outcome.preview {
+                            let _ = self.proxy.send_event(UserEvent::Preview(picture));
+                        }
+                        for (key, picture) in outcome.thumbs {
+                            self.thumb_queue.settled(key);
+                            self.send_thumb(key, Some(picture));
+                        }
+                        if let Some(key) = outcome.thumb_failed {
+                            self.thumb_queue.settled(key);
+                            self.note_once(format!(
+                                "thumbnail of {} could not be drawn",
+                                asked.as_deref().unwrap_or("a clip")
+                            ));
+                            self.send_thumb(key, None);
+                        }
                     }
                     Err(error) => self.recover(&error),
                 }
             }
-            self.control_pictures(&frame.plan);
+            // A picture that never came back (its frame was not presented): the control window
+            // asks again instead of waiting for it for ever.
+            for key in self.thumb_queue.lost() {
+                let _ = self.proxy.send_event(UserEvent::ThumbRetry(key));
+            }
         } else {
             // Nothing to present: the show keeps its clock, and the loop sleeps instead of
             // spinning on an acquire that can never succeed.
@@ -599,60 +683,8 @@ impl RenderThread {
         }
     }
 
-    /// The control window's pictures, after the stage frame has been presented: a preview frame
-    /// when one is due and wanted, and at most one clip thumbnail.
-    ///
-    /// Both wait for a small submission of their own, so they are done after the present (never
-    /// between a frame's passes) and neither is counted in the frame's `cpu_ms`. A failure here
-    /// is the control window's problem, not the stage's: it is logged and the stage goes on.
-    fn control_pictures(&mut self, plan: &RenderPlan) {
-        let now = Instant::now();
-        if self.preview_on && self.preview_clock.due(now) {
-            let captured = match self.scene.as_mut() {
-                Some(scene) => scene.capture_preview(plan),
-                None => return,
-            };
-            match captured {
-                Ok(picture) => {
-                    if !self.preview_logged {
-                        self.preview_logged = true;
-                        self.note(format!(
-                            "stage preview on: {}x{} at {PREVIEW_FPS} fps, first capture {:.2} ms on the render thread",
-                            picture.width,
-                            picture.height,
-                            now.elapsed().as_secs_f32() * 1_000.0
-                        ));
-                    }
-                    let _ = self.proxy.send_event(UserEvent::Preview(picture));
-                }
-                Err(error) => {
-                    self.preview_on = false;
-                    self.note_once(format!("stage preview stopped: {error}"));
-                }
-            }
-        }
-        // At most one picture per frame: a thumbnail waits for a frame without a preview capture.
-        let captured = now.elapsed() > Duration::from_micros(200);
-        if !captured && let Some(request) = self.thumb_queue.pop_front() {
-            let picture = match self.scene.as_mut() {
-                Some(scene) => scene.render_thumb(&request),
-                None => Ok(None),
-            };
-            let picture = match picture {
-                Ok(picture) => picture,
-                Err(error) => {
-                    self.note_once(format!(
-                        "thumbnail of {} could not be drawn: {error}",
-                        request.visualizer
-                    ));
-                    None
-                }
-            };
-            let _ = self.proxy.send_event(UserEvent::Thumb {
-                key: request.key,
-                picture,
-            });
-        }
+    fn send_thumb(&self, key: u64, picture: Option<Picture>) {
+        let _ = self.proxy.send_event(UserEvent::Thumb { key, picture });
     }
 
     fn build(&mut self) {
@@ -797,6 +829,13 @@ struct Shell {
     next_monitor_check: Option<Instant>,
     /// Whether the render thread was last told to send preview frames.
     preview_sent: bool,
+    /// What a window frame adds to a client area: a guess from the display's scale until the
+    /// control window exists, then its measured frame.
+    chrome: Chrome,
+    /// Where the performer left the windows, per monitor setup (`windows.txt`).
+    layouts: Vec<(String, SavedLayout)>,
+    /// A window was moved or resized since the layouts were last written.
+    layout_dirty: bool,
     started: bool,
 }
 
@@ -836,7 +875,85 @@ impl Shell {
             last_status_paint: None,
             next_monitor_check: None,
             preview_sent: false,
+            chrome: Chrome::estimate(1.0),
+            layouts: read_layouts(),
+            layout_dirty: false,
             started: false,
+        }
+    }
+
+    /// The saved layout for the monitors that are plugged in now.
+    fn saved_layout(&self) -> Option<SavedLayout> {
+        recall(&self.layouts, &setup_key(&self.monitor_list))
+    }
+
+    /// A planned outer rectangle on a monitor, as a desktop position and a client size.
+    fn planned(&self, monitor: u32, area: Area) -> Option<SavedWindow> {
+        let info = self.monitor_list.iter().find(|info| info.index == monitor)?;
+        let (width, height) = area.inner(self.chrome);
+        Some(SavedWindow {
+            x: info.x + area.x,
+            y: info.y + area.y,
+            width,
+            height,
+        })
+    }
+
+    /// Where the control window goes: where the performer left it on this monitor setup, if
+    /// that is still on a screen, and the plan's place otherwise.
+    fn control_place(&self) -> Option<SavedWindow> {
+        let saved = self
+            .saved_layout()
+            .and_then(|layout| layout.control)
+            .filter(|window| usable(*window, &self.monitor_list, self.chrome));
+        saved.or_else(|| {
+            let (monitor, area) = self.plan?.control?;
+            self.planned(monitor, area)
+        })
+    }
+
+    /// Where a windowed stage goes, the same way.
+    fn stage_place(&self, monitor: u32, area: Area) -> Option<SavedWindow> {
+        let saved = self
+            .saved_layout()
+            .and_then(|layout| layout.stage)
+            .filter(|window| usable(*window, &self.monitor_list, self.chrome));
+        saved.or_else(|| self.planned(monitor, area))
+    }
+
+    /// Remember where the windows are now, for this monitor setup, and write the file.
+    fn save_layout(&mut self) {
+        if !std::mem::take(&mut self.layout_dirty) {
+            return;
+        }
+        let mut layout = self.saved_layout().unwrap_or_default();
+        if let Some(place) = self.editor.as_ref().and_then(EditorWindow::placement) {
+            layout.control = Some(place);
+        }
+        let windowed = matches!(
+            self.plan.map(|plan| plan.stage),
+            Some(StageWindow::Windowed { .. })
+        );
+        if windowed
+            && let Some(window) = self.stage_window.as_ref()
+            && !window.is_minimized().unwrap_or(false)
+            && window.fullscreen().is_none()
+            && let Ok(position) = window.outer_position()
+        {
+            let size = window.inner_size();
+            if size.width > 0 && size.height > 0 {
+                layout.stage = Some(SavedWindow {
+                    x: position.x,
+                    y: position.y,
+                    width: size.width,
+                    height: size.height,
+                });
+            }
+        }
+        let key = setup_key(&self.monitor_list);
+        if recall(&self.layouts, &key) != Some(layout) {
+            remember(&mut self.layouts, &key, layout);
+            write_layouts(&self.layouts);
         }
     }
 
@@ -852,20 +969,45 @@ impl Shell {
         self.monitor_list.clear();
         for (index, monitor) in event_loop.available_monitors().enumerate() {
             let size = monitor.size();
+            let position = monitor.position();
             let name = monitor.name().unwrap_or_else(|| format!("monitor {index}"));
             let is_primary = match primary.as_ref() {
                 Some(primary) => same_monitor(primary, &monitor),
                 None => index == 0,
             };
-            self.monitor_list.push(MonitorInfo::new(
+            let mut info = MonitorInfo::new(
                 index as u32,
                 name,
                 is_primary,
                 size.width,
                 size.height,
-            ));
+            )
+            .at(position.x, position.y);
+            // The work area is what windows are placed in: the desktop without the taskbar.
+            if let Some((x, y, width, height)) = crate::win::work_area(monitor.hmonitor()) {
+                info = info.with_work(Area {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
+            }
+            self.monitor_list.push(info);
             self.monitors.push(monitor);
         }
+    }
+
+    /// The scale of the monitor the control window opens on, for the first guess at a window
+    /// frame's size.
+    fn control_scale(&self) -> f64 {
+        let index = self
+            .monitor_list
+            .iter()
+            .position(|info| info.primary)
+            .unwrap_or(0);
+        self.monitors
+            .get(index)
+            .map_or(1.0, MonitorHandle::scale_factor)
     }
 
     fn monitor(&self, index: u32) -> Option<MonitorHandle> {
@@ -874,10 +1016,11 @@ impl Shell {
 
     fn create_control_window(&mut self, event_loop: &ActiveEventLoop) {
         let title = window_title(self.model.path(), self.model.modified());
-        let place = self.plan.and_then(|plan| plan.control).and_then(|(index, area)| {
-            self.monitor(index)
-                .map(|monitor| (monitor.position(), area))
-        });
+        let place = self.control_place();
+        let remembered = self
+            .saved_layout()
+            .and_then(|layout| layout.control)
+            .is_some_and(|window| Some(window) == place);
         // Building a GL context is the one place the window thread talks to a driver that may be
         // absent or broken. A panic there must not take the show with it: the stage keeps running
         // on the render thread and the app logs one line.
@@ -891,6 +1034,16 @@ impl Shell {
                     editor.window().inner_size().width,
                     editor.window().inner_size().height
                 ));
+                // The frame was a guess until now. With the real one, a planned place is planned
+                // again (a remembered place is already exact: it was saved as it is restored).
+                let measured = editor.chrome();
+                if measured != self.chrome && measured.height > 0 {
+                    self.chrome = measured;
+                    self.plan = Some(window_plan(&self.monitor_list, self.fullscreen, measured));
+                    if !remembered && let Some(place) = self.control_place() {
+                        editor.place(place);
+                    }
+                }
                 self.title = Some(title);
                 self.editor = Some(editor);
             }
@@ -1076,13 +1229,13 @@ impl Shell {
             StageWindow::Fullscreen { .. } => attributes
                 .with_decorations(false)
                 .with_fullscreen(Some(Fullscreen::Borderless(Some(monitor)))),
-            StageWindow::Windowed { area, .. } => {
-                let origin = monitor.position();
-                attributes
+            StageWindow::Windowed { monitor, area } => match self.stage_place(monitor, area) {
+                Some(place) => attributes
                     .with_decorations(true)
-                    .with_inner_size(PhysicalSize::new(area.width, area.height))
-                    .with_position(PhysicalPosition::new(origin.x + area.x, origin.y + area.y))
-            }
+                    .with_inner_size(PhysicalSize::new(place.width, place.height))
+                    .with_position(PhysicalPosition::new(place.x, place.y)),
+                None => attributes.with_decorations(true),
+            },
             StageWindow::Hidden => attributes,
         };
         match event_loop.create_window(attributes) {
@@ -1156,7 +1309,7 @@ impl Shell {
 
     /// Work out where the windows go now and move the stage there if that changed.
     fn apply_plan(&mut self) {
-        let plan = window_plan(&self.monitor_list, self.fullscreen);
+        let plan = window_plan(&self.monitor_list, self.fullscreen, self.chrome);
         let previous = self.plan.replace(plan);
         if previous.map(|plan| plan.stage) == Some(plan.stage) {
             return;
@@ -1180,18 +1333,14 @@ impl Shell {
                 window.set_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
             }
             StageWindow::Windowed { monitor, area } => {
-                let Some(monitor) = self.monitor(monitor) else {
+                let Some(place) = self.stage_place(monitor, area) else {
                     return;
                 };
-                let origin = monitor.position();
                 window.set_visible(true);
                 window.set_fullscreen(None);
                 window.set_decorations(true);
-                window.set_outer_position(PhysicalPosition::new(
-                    origin.x + area.x,
-                    origin.y + area.y,
-                ));
-                let _ = window.request_inner_size(PhysicalSize::new(area.width, area.height));
+                window.set_outer_position(PhysicalPosition::new(place.x, place.y));
+                let _ = window.request_inner_size(PhysicalSize::new(place.width, place.height));
             }
         }
         self.send_replace_surface();
@@ -1202,6 +1351,7 @@ impl Shell {
     }
 
     fn shutdown(&mut self) {
+        self.save_layout();
         self.send(Command::Quit);
         if let Some(mut render) = self.render.take()
             && let Some(thread) = render.thread.take()
@@ -1260,6 +1410,29 @@ fn read_recent() -> Vec<String> {
     recent
 }
 
+/// Where the windows' remembered places are kept: `%APPDATA%\ilanaVisual\windows.txt`.
+fn layouts_file() -> Option<std::path::PathBuf> {
+    recent_file().map(|path| path.with_file_name("windows.txt"))
+}
+
+fn read_layouts() -> Vec<(String, SavedLayout)> {
+    layouts_file()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| parse_layouts(&text))
+        .unwrap_or_default()
+}
+
+/// Best effort, like the recent list.
+fn write_layouts(layouts: &[(String, SavedLayout)]) {
+    let Some(path) = layouts_file() else {
+        return;
+    };
+    if let Some(folder) = path.parent() {
+        let _ = std::fs::create_dir_all(folder);
+    }
+    let _ = std::fs::write(path, format_layouts(layouts));
+}
+
 /// Best effort: a list that cannot be written is not worth a line during a rehearsal.
 fn write_recent(recent: &[String]) {
     let Some(path) = recent_file() else {
@@ -1290,7 +1463,8 @@ impl ApplicationHandler<UserEvent> for Shell {
             )
         });
         self.refresh_monitors(event_loop);
-        self.plan = Some(window_plan(&self.monitor_list, self.fullscreen));
+        self.chrome = Chrome::estimate(self.control_scale());
+        self.plan = Some(window_plan(&self.monitor_list, self.fullscreen, self.chrome));
         self.create_control_window(event_loop);
         self.create_stage(event_loop);
         self.start_render();
@@ -1349,7 +1523,15 @@ impl ApplicationHandler<UserEvent> for Shell {
                     _ => {}
                 }
             }
+            WindowEvent::Moved(_) => {
+                if is_stage || is_control {
+                    self.layout_dirty = true;
+                }
+            }
             WindowEvent::Resized(size) => {
+                if is_stage || is_control {
+                    self.layout_dirty = true;
+                }
                 if is_stage && size.width > 0 && size.height > 0 {
                     self.send(Command::Resize(size.width, size.height));
                 }
@@ -1401,6 +1583,7 @@ impl ApplicationHandler<UserEvent> for Shell {
                     editor.request_paint(Instant::now());
                 }
             }
+            UserEvent::ThumbRetry(key) => self.editor_ui.thumbs.retry(key),
             UserEvent::SurfaceLost => {
                 // The stage's surface went away (a monitor was unplugged): re-place the window
                 // where the monitors now say it goes, and rebuild the surface on its handle.
@@ -1427,6 +1610,8 @@ impl ApplicationHandler<UserEvent> for Shell {
                 self.send_replace_surface();
             }
             self.sync_preview();
+            // Where the performer put the windows, written at most this often.
+            self.save_layout();
         }
         // The control window paints on change only, so an idle app sleeps until the next monitor
         // check (or the next frame the editor asked for).

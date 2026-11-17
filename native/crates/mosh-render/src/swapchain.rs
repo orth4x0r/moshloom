@@ -17,6 +17,7 @@ use raw_window_handle::RawWindowHandle;
 use crate::compositor::Compositor;
 use crate::device::{Gpu, FRAMES_IN_FLIGHT};
 use crate::target::{cmd_barrier, Barrier, LayerTarget};
+use crate::readback::{AsyncReadback, Readback};
 use crate::timing::GpuTimings;
 use crate::win::module_handle;
 use crate::RenderError;
@@ -186,6 +187,8 @@ struct Swapchain {
     views: Vec<vk::ImageView>,
     /// Layout each image was left in; `UNDEFINED` after a present.
     layouts: Vec<vk::ImageLayout>,
+    /// The images can be the source of a blit (the preview's readback).
+    transfer_src: bool,
 }
 
 /// The stage output: one fullscreen, borderless window on the secondary monitor (the app places
@@ -213,7 +216,17 @@ pub struct Stage {
     frame_index: usize,
     timings: GpuTimings,
     last_error: Option<String>,
+    /// The control window's picture of the presented frame, when it wants one.
+    preview: Option<AsyncReadback>,
+    preview_requested: bool,
+    preview_ready: Option<Readback>,
+    /// One layer target per frame, read back the same way (clip thumbnails).
+    capture: Option<AsyncReadback>,
+    capture_ready: std::collections::VecDeque<Readback>,
 }
+
+/// Pictures waiting for the app to take them, at most. More than this means nobody is taking.
+const CAPTURES_KEPT: usize = 8;
 
 impl Stage {
     /// Creates the surface and the first swapchain for `window`.
@@ -272,6 +285,11 @@ impl Stage {
             frame_index: 0,
             timings: GpuTimings::default(),
             last_error: None,
+            preview: None,
+            preview_requested: false,
+            preview_ready: None,
+            capture: None,
+            capture_ready: std::collections::VecDeque::new(),
         };
 
         stage.image_available = [
@@ -342,6 +360,64 @@ impl Stage {
         self.policy.resize(width, height);
     }
 
+    /// The size of the preview pictures, or `None` for no preview at all. Changing it waits for
+    /// the device once (pictures in flight belong to the old size), so call it when the stage's
+    /// shape changes, not per frame.
+    pub fn set_preview_size(
+        &mut self,
+        gpu: &Gpu,
+        size: Option<(u32, u32)>,
+    ) -> Result<(), RenderError> {
+        if self.preview.as_ref().map(AsyncReadback::size) == size {
+            return Ok(());
+        }
+        unsafe {
+            let _ = self.device.device_wait_idle();
+        }
+        self.preview = None;
+        self.preview_ready = None;
+        self.preview_requested = false;
+        if let Some((width, height)) = size {
+            self.preview = Some(AsyncReadback::new(gpu, width, height)?);
+        }
+        Ok(())
+    }
+
+    /// Ask for a picture of the frame the next `present` shows. It arrives in `take_preview`
+    /// [`crate::READBACK_DELAY`] presents later and costs the render thread no wait.
+    pub fn request_preview(&mut self) {
+        self.preview_requested = self.preview.is_some();
+    }
+
+    /// The newest finished preview picture, once.
+    pub fn take_preview(&mut self) -> Option<Readback> {
+        self.preview_ready.take()
+    }
+
+    /// The size of the pictures `present_with_capture` takes of a layer target.
+    pub fn set_capture_size(
+        &mut self,
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+    ) -> Result<(), RenderError> {
+        if self.capture.as_ref().map(AsyncReadback::size) == Some((width, height)) {
+            return Ok(());
+        }
+        unsafe {
+            let _ = self.device.device_wait_idle();
+        }
+        self.capture = None;
+        self.capture_ready.clear();
+        self.capture = Some(AsyncReadback::new(gpu, width, height)?);
+        Ok(())
+    }
+
+    /// The oldest finished capture, once. Its `tag` is the one `present_with_capture` was given.
+    pub fn take_capture(&mut self) -> Option<Readback> {
+        self.capture_ready.pop_front()
+    }
+
     /// Composites `recorder`'s layers and presents one frame.
     ///
     /// The recorder's GPU work is submitted and waited for first, so the layers are readable
@@ -350,10 +426,35 @@ impl Stage {
     /// frame is made, so a four-layer frame writes the output once (V-budget: it used to be a
     /// full 16F composite plus a blit, 1.2 ms at 1080p).
     pub fn present(&mut self, recorder: crate::pipeline::FrameRecorder<'_>) -> PresentResult {
+        self.present_with_capture(recorder, None)
+    }
+
+    /// [`Self::present`], and a small picture of `capture`'s target as the recorder left it (a
+    /// clip thumbnail drawn inside this frame). The picture is copied out inside the present
+    /// submission and arrives in [`Self::take_capture`] [`crate::READBACK_DELAY`] presents
+    /// later, with the tag given here. Needs [`Self::set_capture_size`]; without it the capture
+    /// is dropped. A frame that cannot be presented takes no pictures.
+    pub fn present_with_capture(
+        &mut self,
+        recorder: crate::pipeline::FrameRecorder<'_>,
+        capture: Option<(&LayerTarget, u64)>,
+    ) -> PresentResult {
         let gpu = recorder.gpu();
         let layers: Vec<(&LayerTarget, BlendMode, f32)> = recorder.layers().to_vec();
         let ticket = recorder.submit();
         self.timings = gpu.wait_frame(ticket);
+
+        // The frame's layers are done, and so is everything submitted before them: the pictures
+        // recorded two presents ago are plain bytes by now.
+        if let Some(picture) = self.preview.as_mut().and_then(AsyncReadback::begin_frame) {
+            self.preview_ready = Some(picture);
+        }
+        if let Some(picture) = self.capture.as_mut().and_then(AsyncReadback::begin_frame) {
+            if self.capture_ready.len() >= CAPTURES_KEPT {
+                self.capture_ready.pop_front();
+            }
+            self.capture_ready.push_back(picture);
+        }
 
         if !self.ensure_swapchain(gpu) {
             return PresentResult {
@@ -370,7 +471,7 @@ impl Stage {
             }
         };
 
-        if let Err(error) = self.present_image(image_index, &layers) {
+        if let Err(error) = self.present_image(image_index, &layers, capture) {
             self.last_error = Some(error.to_string());
         }
         self.frame_index = (self.frame_index + 1) % FRAMES_IN_FLIGHT;
@@ -457,6 +558,16 @@ impl Stage {
             if capabilities.max_image_count > 0 {
                 image_count = image_count.min(capabilities.max_image_count);
             }
+            // The preview blits from the presented image; a surface that cannot be a transfer
+            // source simply has no preview.
+            let transfer_src = capabilities
+                .supported_usage_flags
+                .contains(vk::ImageUsageFlags::TRANSFER_SRC);
+            let usage = if transfer_src {
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
+            } else {
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+            };
             let composite_alpha = if capabilities
                 .supported_composite_alpha
                 .contains(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -472,7 +583,7 @@ impl Stage {
                 .image_color_space(format.color_space)
                 .image_extent(extent)
                 .image_array_layers(1)
-                .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                .image_usage(usage)
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .pre_transform(capabilities.current_transform)
                 .composite_alpha(composite_alpha)
@@ -508,6 +619,7 @@ impl Stage {
                 layouts: vec![vk::ImageLayout::UNDEFINED; images.len()],
                 images,
                 views,
+                transfer_src,
             })
         })();
 
@@ -597,7 +709,12 @@ impl Stage {
         &mut self,
         image_index: u32,
         layers: &[(&LayerTarget, BlendMode, f32)],
+        capture: Option<(&LayerTarget, u64)>,
     ) -> Result<(), RenderError> {
+        let transfer_src = self
+            .swapchain
+            .as_ref()
+            .is_some_and(|swapchain| swapchain.transfer_src);
         let (handle, extent, view, image, old_layout) = {
             let swapchain = self.swapchain.as_ref().ok_or(RenderError::ZeroSized)?;
             let index = image_index as usize;
@@ -669,8 +786,38 @@ impl Stage {
             }
         }
 
-        unsafe {
-            cmd_barrier(
+        // The control window's pictures ride in this submission: a thumbnail's layer target,
+        // and the presented image itself on its way to the present layout.
+        if let (Some(readback), Some((target, tag))) = (self.capture.as_mut(), capture) {
+            readback.record(self.cmd, crate::readback::target_source(target), tag);
+            target.set_front_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        }
+        let wants_preview = std::mem::take(&mut self.preview_requested) && transfer_src;
+        match self.preview.as_mut() {
+            Some(readback) if wants_preview => {
+                let source = crate::readback::ReadbackSource {
+                    image,
+                    extent,
+                    before: Barrier {
+                        old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        src_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                        src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                        dst_stage: vk::PipelineStageFlags::TRANSFER,
+                        dst_access: vk::AccessFlags::TRANSFER_READ,
+                    },
+                    after: Barrier {
+                        old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        new_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+                        src_stage: vk::PipelineStageFlags::TRANSFER,
+                        src_access: vk::AccessFlags::TRANSFER_READ,
+                        dst_stage: vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        dst_access: vk::AccessFlags::empty(),
+                    },
+                };
+                readback.record(self.cmd, source, 0);
+            }
+            _ => cmd_barrier(
                 &self.device,
                 self.cmd,
                 image,
@@ -682,7 +829,9 @@ impl Stage {
                     dst_stage: vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     dst_access: vk::AccessFlags::empty(),
                 },
-            );
+            ),
+        }
+        unsafe {
             self.device.end_command_buffer(self.cmd)?;
         }
 
@@ -753,6 +902,8 @@ impl Stage {
         }
         self.destroy_swapchain();
         self.compositor = None;
+        self.preview = None;
+        self.capture = None;
         unsafe {
             for semaphore in self.image_available {
                 if semaphore != vk::Semaphore::null() {

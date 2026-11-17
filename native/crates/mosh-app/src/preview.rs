@@ -4,46 +4,45 @@
 //! sent to the window thread as plain RGBA bytes, where they become egui textures on the control
 //! window's own OpenGL context. Nothing is shared between the two contexts.
 //!
-//! * **Preview**: after a stage frame is presented, the same layer stack is composited once more
-//!   into a [`PREVIEW_WIDTH`]-wide image and read back, at most [`PREVIEW_FPS`] times a second
-//!   and only while the control window asks for it (never while it is minimised).
-//! * **Thumbnails**: one frame of a clip's scene drawn into a [`THUMB_SIZE`] target with the
-//!   clip's parameters, on request, at most one per stage frame. The control window caches them
-//!   by [`thumb_key`], so a clip is drawn once and again only when its look changes.
+//! Neither one makes the render thread wait. They ride in the frame that is being drawn anyway
+//! (`mosh_render::AsyncReadback`, through `Stage`):
 //!
-//! **What they cost, and why they are this small.** `mosh-render`'s readback allocates a
-//! buffer, submits a copy, waits for it and converts RGBA16F to RGBA8 one channel at a time out
-//! of mapped device memory. On the reference machine (`tests/preview_gpu.rs`, release) that is
-//! about 5 ms however small the picture is, plus about half a microsecond a pixel: 22 ms for
-//! 256x144, 5.9 ms for 128x72, 5.5 ms for 96x54. The render thread waits for it, after the
-//! frame has been presented, inside the slack a 60 fps frame leaves. So:
+//! * **Preview**: the present submission blits the image it is about to present down to
+//!   [`PREVIEW_WIDTH`] pixels and copies that into a mapped buffer; two frames later the bytes are
+//!   picked up. [`PREVIEW_FPS`] times a second, and only while the control window is on screen
+//!   and showing it.
+//! * **Thumbnails**: one frame of a clip's scene is recorded into a [`THUMB_SIZE`] target at the
+//!   end of a stage frame's own recorder, and read back the same way. [`ThumbQueue`] hands out
+//!   at most one per stage frame, and none during the first frames after the renderer is built,
+//!   so a show with fifty clips draws its thumbnails over a second instead of in one frame. The
+//!   control window caches them by [`thumb_key`].
 //!
-//! * the pictures are exactly as large as the control window draws them (the top bar's preview
-//!   slot is 86 px wide) and no larger;
-//! * the preview runs at [`PREVIEW_FPS`], is off by default when the stage is a window beside
-//!   the controls (the stage is its own preview there), and never runs while the control window
-//!   is minimised, which is what it is during a set;
-//! * a thumbnail is drawn once per look, one per frame at most, never in a frame that captured
-//!   a preview.
+//! What a picture costs the render thread is recording a draw and two blits and, two frames
+//! later, a memcpy: measured in `mosh-render/tests/readback.rs` and `tests/preview_gpu.rs`. The
+//! first version of this module used the blocking `Gpu::read_back` and cost 5.5 ms a picture.
 //!
-//! A readback into a buffer that is kept, in 8 bits, would take the 5 ms away. That is a change
-//! to `mosh-render`, which is not this lane's crate: it is reported, not made.
-//!
-//! The sizes, the rate and the letterboxing are pure functions, tested without a GPU; the GPU
-//! half is exercised offscreen in `tests/preview_gpu.rs`, which also prints what it costs.
+//! The sizes, the rate, the letterboxing and the queue are pure, tested without a GPU.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use mosh_core::{AnalysisFrame, BlendMode, ClipParams};
-use mosh_render::{Compositor, FrameRecorder, Gpu, LayerTarget, OutputImage, RenderError};
-use mosh_visuals::Visuals;
+use mosh_core::{AnalysisFrame, ClipParams};
 
-/// The preview's width in pixels; its height follows the stage's aspect.
-pub const PREVIEW_WIDTH: u32 = 96;
-/// The preview's refresh rate. A glance, not a monitor: the stage itself is the monitor.
-pub const PREVIEW_FPS: u32 = 4;
-/// A thumbnail's size: 16:9, as large as the detail panel draws it.
-pub const THUMB_SIZE: (u32, u32) = (96, 54);
+/// The preview's width in pixels; its height follows the stage's aspect. The top bar draws it
+/// 86 points wide, which is 150 pixels on the reference laptop's 175% display.
+pub const PREVIEW_WIDTH: u32 = 160;
+/// The preview's refresh rate.
+pub const PREVIEW_FPS: u32 = 10;
+/// A thumbnail's size: 16:9, as large as the detail panel draws it on a high-DPI display.
+pub const THUMB_SIZE: (u32, u32) = (128, 72);
+/// Stage frames after the renderer is built in which no thumbnail is drawn: the first frames
+/// are the ones that compile pipelines and fill caches, and they are late enough already.
+pub const THUMB_WARMUP_FRAMES: u32 = 30;
+/// Thumbnail requests waiting for a frame, at most; older ones are dropped.
+pub const THUMB_QUEUE: usize = 96;
+/// Stage frames a thumbnail may take to come back (it normally takes two) before it is given
+/// up on: a frame that could not be presented took its picture with it.
+pub const THUMB_PATIENCE_FRAMES: u32 = 30;
 
 /// The preview image's size for a stage of `out` pixels: `max_width` wide (or the stage's own
 /// width when that is smaller), the stage's aspect, even numbers, never smaller than 16 pixels
@@ -109,84 +108,13 @@ pub struct Picture {
     pub rgba: Vec<u8>,
 }
 
-/// Linear light 0..255 to sRGB 0..255. The offscreen targets hold linear values (the stage's
-/// swapchain does this encoding in hardware); egui textures are sRGB bytes.
-fn srgb_table() -> &'static [u8; 256] {
-    static TABLE: std::sync::OnceLock<[u8; 256]> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| {
-        std::array::from_fn(|index| {
-            let linear = index as f32 / 255.0;
-            let encoded = if linear <= 0.003_130_8 {
-                linear * 12.92
-            } else {
-                1.055 * linear.powf(1.0 / 2.4) - 0.055
-            };
-            (encoded * 255.0).round().clamp(0.0, 255.0) as u8
-        })
-    })
-}
-
-/// Turn a linear RGBA8 readback into a display picture: sRGB-encoded, alpha forced opaque.
-pub fn to_display(width: u32, height: u32, mut rgba: Vec<u8>) -> Picture {
-    let table = srgb_table();
-    for pixel in rgba.as_chunks_mut::<4>().0 {
-        *pixel = [
-            table[usize::from(pixel[0])],
-            table[usize::from(pixel[1])],
-            table[usize::from(pixel[2])],
-            255,
-        ];
-    }
-    Picture {
-        width,
-        height,
-        rgba,
-    }
-}
-
-/// The preview's GPU half: a compositor and a small output of its own, so the stage's
-/// compositor, its swapchain and its timings are never touched.
-///
-/// Must be dropped before the [`Gpu`] it was built on (like every `mosh-render` object).
-pub struct PreviewTap {
-    compositor: Compositor,
-    out: OutputImage,
-    stage: (u32, u32),
-}
-
-impl PreviewTap {
-    /// A tap for a stage of `stage` pixels.
-    pub fn new(gpu: &Gpu, stage: (u32, u32)) -> Result<PreviewTap, RenderError> {
-        let (width, height) = preview_size(stage, PREVIEW_WIDTH);
-        Ok(PreviewTap {
-            compositor: Compositor::new(gpu)?,
-            out: OutputImage::new(gpu, width, height),
-            stage,
-        })
-    }
-
-    /// The stage size this tap was built for; a different one needs a new tap.
-    pub fn stage(&self) -> (u32, u32) {
-        self.stage
-    }
-
-    pub fn size(&self) -> (u32, u32) {
-        (self.out.width(), self.out.height())
-    }
-
-    /// Composite `layers` (the stack the stage just presented) at preview size and read it back.
-    ///
-    /// Call between frames: the layer targets must not be in a recorder. This submits one small
-    /// pass and one copy and waits for both, which is the preview's whole cost on the render
-    /// thread.
-    pub fn capture(
-        &mut self,
-        gpu: &Gpu,
-        layers: &[(&LayerTarget, BlendMode, f32)],
-    ) -> Result<Picture, RenderError> {
-        self.compositor.composite(layers, &self.out)?;
-        let rgba = gpu.read_back_output(&self.out);
-        Ok(to_display(self.out.width(), self.out.height(), rgba))
+impl From<mosh_render::Readback> for Picture {
+    fn from(readback: mosh_render::Readback) -> Picture {
+        Picture {
+            width: readback.width,
+            height: readback.height,
+            rgba: readback.rgba,
+        }
     }
 }
 
@@ -219,85 +147,122 @@ pub fn thumb_key(visualizer: &str, params: &ClipParams) -> u64 {
     hash
 }
 
-/// Whether a thumbnail of `visualizer` can be drawn from the clip alone. A camera, a text and a
-/// video depend on a source the thumbnail pass does not open; they get a labelled tile instead.
+/// Whether a thumbnail of `visualizer` can be drawn from the clip alone, without touching what
+/// the stage is drawing. A camera, a text and a video depend on a source the thumbnail pass does
+/// not open; the fluid and the particles are simulations the stage owns, and a thumbnail would
+/// step them. Those get a tile in the clip's colour instead.
 pub fn has_thumbnail(visualizer: &str) -> bool {
-    !matches!(visualizer, "overlay" | "camera" | "text" | "particles")
-        && !visualizer.starts_with("custom:")
+    !matches!(
+        visualizer,
+        "overlay" | "camera" | "text" | "particles" | "fluid"
+    ) && !visualizer.starts_with("custom:")
 }
 
-/// The analysis frame thumbnails are drawn with: a loud, bright moment a little after a beat,
+/// The analysis frame a thumbnail is drawn with: a loud, bright moment a little after a beat,
 /// the same for every clip so two thumbnails differ only by their clips.
-pub fn thumb_frame() -> AnalysisFrame {
+///
+/// The clock and the spectrum are `live`'s (the frame the stage is drawing): the scenes share
+/// one spectrum history, written once per frame time, and a thumbnail must leave in it exactly
+/// what the stage would have.
+pub fn thumb_frame(live: &AnalysisFrame) -> AnalysisFrame {
     AnalysisFrame {
-        time_s: 12.0,
-        ppq: 16.25,
         beat_phase: 0.25,
         bar_phase: 0.062_5,
-        beat_index: 16,
-        bar_index: 4,
-        tempo_bpm: 120.0,
         playing: true,
         bands: [0.8, 0.65, 0.5],
-        mel: std::array::from_fn(|band| 0.8 * (1.0 - band as f32 / 30.0)),
         onset: 0.6,
         loudness: 0.8,
         brightness: 0.6,
         intensity: 0.75,
         level: 3,
-        ..AnalysisFrame::default()
+        events: mosh_core::EventFlags::empty(),
+        ..*live
     }
 }
 
-/// The thumbnails' GPU half: one small scene target.
-///
-/// Must be dropped before the [`Gpu`] it was built on.
-pub struct ThumbTap {
-    target: LayerTarget,
+/// Thumbnails waiting to be drawn, handed out one stage frame at a time.
+#[derive(Debug, Default)]
+pub struct ThumbQueue {
+    waiting: VecDeque<ThumbRequest>,
+    /// Handed to a frame and not back yet: the key, and the frames it has been away.
+    in_flight: Vec<(u64, u32)>,
+    /// Stage frames since the renderer was (re)built.
+    frames: u32,
+    handed_out: u64,
 }
 
-impl ThumbTap {
-    pub fn new(gpu: &Gpu) -> ThumbTap {
-        ThumbTap {
-            target: LayerTarget::new_single(gpu, THUMB_SIZE.0, THUMB_SIZE.1),
-        }
+impl ThumbQueue {
+    pub fn new() -> ThumbQueue {
+        ThumbQueue::default()
     }
 
-    /// Draw one frame of the requested scene and read it back. `None` for a visualizer that has
-    /// no thumbnail (see [`has_thumbnail`]).
-    ///
-    /// Only the scene pass runs (no datamosh, effects or transition: those have history a single
-    /// frame cannot show), so the stage's per-layer state is not touched.
-    pub fn render(
-        &mut self,
-        gpu: &Gpu,
-        visuals: &mut Visuals,
-        request: &ThumbRequest,
-    ) -> Result<Option<Picture>, RenderError> {
-        if !has_thumbnail(&request.visualizer) {
-            return Ok(None);
+    /// Queue a request. One that is already waiting is not queued twice; when the queue is
+    /// full the oldest request gives way (the control window asks again for what it still shows).
+    /// Returns the request that was dropped, so its asker can be told.
+    pub fn push(&mut self, request: ThumbRequest) -> Option<ThumbRequest> {
+        if self.waiting.iter().any(|other| other.key == request.key) {
+            return None;
         }
-        let frame = thumb_frame();
-        let t = frame.time_s as f32;
-        let mut recorder = FrameRecorder::new(gpu);
-        if request.visualizer == "fluid" {
-            visuals
-                .fluid
-                .draw(&mut recorder, &self.target, &frame, &request.params, t)?;
+        let dropped = if self.waiting.len() >= THUMB_QUEUE {
+            self.waiting.pop_front()
         } else {
-            visuals.scenes.draw(
-                &mut recorder,
-                &self.target,
-                &request.visualizer,
-                &frame,
-                &request.params,
-                t,
-            )?;
+            None
+        };
+        self.waiting.push_back(request);
+        dropped
+    }
+
+    /// The renderer was rebuilt: its first frames are warm-up again.
+    pub fn renderer_rebuilt(&mut self) {
+        self.frames = 0;
+    }
+
+    /// Called once per stage frame: the one thumbnail this frame may draw, if any.
+    pub fn next_frame(&mut self) -> Option<ThumbRequest> {
+        self.frames = self.frames.saturating_add(1);
+        for (_, age) in &mut self.in_flight {
+            *age += 1;
         }
-        let ticket = recorder.submit();
-        gpu.wait_frame(ticket);
-        let rgba = gpu.read_back(&self.target);
-        Ok(Some(to_display(THUMB_SIZE.0, THUMB_SIZE.1, rgba)))
+        if self.frames <= THUMB_WARMUP_FRAMES {
+            return None;
+        }
+        let request = self.waiting.pop_front()?;
+        self.handed_out += 1;
+        self.in_flight.push((request.key, 0));
+        Some(request)
+    }
+
+    /// A thumbnail came back (or was refused): it is no longer on its way.
+    pub fn settled(&mut self, key: u64) {
+        self.in_flight.retain(|(other, _)| *other != key);
+    }
+
+    /// Thumbnails that were handed to a frame [`THUMB_PATIENCE_FRAMES`] ago and never came
+    /// back (the frame was not presented, the renderer was rebuilt under them). They are
+    /// forgotten here and returned, so whoever asked can ask again.
+    pub fn lost(&mut self) -> Vec<u64> {
+        let lost: Vec<u64> = self
+            .in_flight
+            .iter()
+            .filter(|(_, age)| *age > THUMB_PATIENCE_FRAMES)
+            .map(|(key, _)| *key)
+            .collect();
+        self.in_flight
+            .retain(|(_, age)| *age <= THUMB_PATIENCE_FRAMES);
+        lost
+    }
+
+    pub fn len(&self) -> usize {
+        self.waiting.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.waiting.is_empty()
+    }
+
+    /// Thumbnails handed to a frame so far.
+    pub fn handed_out(&self) -> u64 {
+        self.handed_out
     }
 }
 
@@ -307,10 +272,10 @@ mod tests {
 
     #[test]
     fn the_preview_keeps_the_stage_aspect() {
-        // 1080p: 96 x 54, exactly 16:9.
-        assert_eq!(preview_size((1920, 1080), PREVIEW_WIDTH), (96, 54));
+        // 1080p: 160 x 90, exactly 16:9.
+        assert_eq!(preview_size((1920, 1080), PREVIEW_WIDTH), (160, 90));
         // The laptop panel is 16:10.
-        assert_eq!(preview_size((2560, 1600), PREVIEW_WIDTH), (96, 60));
+        assert_eq!(preview_size((2560, 1600), PREVIEW_WIDTH), (160, 100));
         // A windowed stage that is smaller than the preview is not enlarged.
         assert_eq!(preview_size((64, 36), PREVIEW_WIDTH), (64, 36));
         // Odd sizes round up to even ones; degenerate sizes still give an image.
@@ -318,10 +283,10 @@ mod tests {
         assert_eq!(preview_size((0, 0), PREVIEW_WIDTH), (16, 16));
         assert_eq!(preview_size((8, 8), PREVIEW_WIDTH), (16, 16));
         // A portrait stage does not make a tower: at most twice as tall as wide.
-        assert_eq!(preview_size((1080, 3840), PREVIEW_WIDTH), (96, 192));
-        // 96 x 54 RGBA is what crosses the thread boundary, four times a second: 83 KB.
+        assert_eq!(preview_size((1080, 3840), PREVIEW_WIDTH), (160, 320));
+        // 160 x 90 RGBA is what crosses the thread boundary, ten times a second: 576 KB.
         let (width, height) = preview_size((1920, 1080), PREVIEW_WIDTH);
-        assert_eq!(width * height * 4 * PREVIEW_FPS, 82_944);
+        assert_eq!(width * height * 4 * PREVIEW_FPS, 576_000);
     }
 
     #[test]
@@ -350,7 +315,7 @@ mod tests {
                 taken += 1;
             }
         }
-        assert!((7..=9).contains(&taken), "{taken} previews in 2 s");
+        assert!((18..=21).contains(&taken), "{taken} previews in 2 s");
     }
 
     #[test]
@@ -371,16 +336,101 @@ mod tests {
         assert_eq!(key, thumb_key("tunnel", &nudged));
         nudged.p[0] = 0.56;
         assert_ne!(key, thumb_key("tunnel", &nudged));
-        assert!(has_thumbnail("tunnel") && has_thumbnail("fluid"));
-        assert!(!has_thumbnail("camera") && !has_thumbnail("text") && !has_thumbnail("overlay"));
+        assert!(has_thumbnail("tunnel") && has_thumbnail("swarm"));
+        // Sources the pass does not open, and simulations the stage owns.
+        for id in ["camera", "text", "overlay", "fluid", "particles", "custom:mine"] {
+            assert!(!has_thumbnail(id), "{id}");
+        }
     }
 
     #[test]
-    fn readbacks_are_encoded_for_the_display() {
-        // Linear mid grey (0.5) is sRGB 188; black and white stay; alpha is forced opaque.
-        let picture = to_display(1, 3, vec![0, 128, 255, 0, 0, 0, 0, 10, 255, 255, 255, 200]);
-        assert_eq!(picture.rgba[..4], [0, 188, 255, 255]);
-        assert_eq!(picture.rgba[4..8], [0, 0, 0, 255]);
-        assert_eq!(picture.rgba[8..], [255, 255, 255, 255]);
+    fn a_thumbnail_leaves_the_stage_clock_and_spectrum_alone() {
+        let live = AnalysisFrame {
+            time_s: 91.5,
+            ppq: 244.0,
+            bar_index: 61,
+            tempo_bpm: 163.0,
+            mel: [0.3; 24],
+            level: 1,
+            intensity: 0.1,
+            ..AnalysisFrame::default()
+        };
+        let frame = thumb_frame(&live);
+        assert_eq!((frame.time_s, frame.ppq, frame.bar_index), (91.5, 244.0, 61));
+        assert_eq!(frame.mel, live.mel);
+        // And is bright whatever the music is doing, so thumbnails are comparable.
+        assert_eq!(frame.level, 3);
+        assert!(frame.intensity > 0.7 && frame.bands[0] > 0.7);
+    }
+
+    fn request(key: u64) -> ThumbRequest {
+        ThumbRequest {
+            key,
+            visualizer: "tunnel".to_string(),
+            params: ClipParams::default(),
+        }
+    }
+
+    #[test]
+    fn thumbnails_are_drawn_one_frame_at_a_time_after_the_warm_up() {
+        // A show opens: fifty clips ask for a picture in the same instant.
+        let mut queue = ThumbQueue::new();
+        for key in 0..50 {
+            assert!(queue.push(request(key)).is_none());
+        }
+        // Asked twice (two cells show the same look): drawn once.
+        assert!(queue.push(request(7)).is_none());
+        assert_eq!(queue.len(), 50);
+
+        // The first frames after the renderer is built draw none.
+        for frame in 0..THUMB_WARMUP_FRAMES {
+            assert!(queue.next_frame().is_none(), "frame {frame} is warm-up");
+        }
+        // Then exactly one per frame, in the order they were asked for.
+        let mut per_frame = Vec::new();
+        for _ in 0..60 {
+            per_frame.push(queue.next_frame().map(|request| request.key));
+        }
+        assert_eq!(
+            per_frame[..50],
+            (0..50).map(Some).collect::<Vec<_>>()[..],
+            "one per frame, in order"
+        );
+        assert!(per_frame[50..].iter().all(Option::is_none), "then nothing");
+        assert_eq!(queue.handed_out(), 50);
+        assert!(queue.is_empty());
+
+        // A rebuilt renderer warms up again before it draws thumbnails.
+        queue.push(request(99));
+        queue.renderer_rebuilt();
+        assert!(queue.next_frame().is_none());
+
+        // A picture that comes back is settled; one that never does is reported lost, once.
+        let mut queue = ThumbQueue::new();
+        queue.push(request(1));
+        queue.push(request(2));
+        for _ in 0..THUMB_WARMUP_FRAMES {
+            queue.next_frame();
+        }
+        assert_eq!(queue.next_frame().map(|request| request.key), Some(1));
+        assert_eq!(queue.next_frame().map(|request| request.key), Some(2));
+        queue.next_frame();
+        queue.settled(1);
+        for _ in 0..THUMB_PATIENCE_FRAMES - 2 {
+            queue.next_frame();
+            assert!(queue.lost().is_empty(), "two frames is normal, thirty is patience");
+        }
+        queue.next_frame();
+        queue.next_frame();
+        assert_eq!(queue.lost(), vec![2]);
+        assert!(queue.lost().is_empty());
+
+        // A full queue drops its oldest request and says which.
+        let mut queue = ThumbQueue::new();
+        for key in 0..THUMB_QUEUE as u64 {
+            queue.push(request(key));
+        }
+        assert_eq!(queue.push(request(1_000)).map(|dropped| dropped.key), Some(0));
+        assert_eq!(queue.len(), THUMB_QUEUE);
     }
 }

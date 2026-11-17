@@ -217,6 +217,10 @@ impl LayerTarget {
         OFFSCREEN_FORMAT
     }
 
+    pub(crate) fn set_front_layout(&self, layout: vk::ImageLayout) {
+        self.layouts[self.front.get()].set(layout);
+    }
+
     pub(crate) fn front_image(&self) -> vk::Image {
         self.pair.images[self.front.get()]
     }
