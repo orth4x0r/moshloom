@@ -25,7 +25,7 @@ fn beat_and_bar_phase_from_transport() {
     assert!((tick.beat_phase - 0.5).abs() < 1e-6, "{tick:?}");
     assert!((tick.bar_phase - 0.625).abs() < 1e-6, "{tick:?}");
     assert_eq!(tick.beat_index, 6);
-    assert_eq!(tick.bar_index, 0, "the first transport opens bar 0");
+    assert_eq!(tick.bar_index, 1, "a bar starting at ppq 4 in 4/4 is Live's second bar (index 1)");
 }
 
 #[test]
@@ -128,4 +128,26 @@ fn tempo_is_reported_from_the_transport() {
     let tick = g.update(&t);
     assert!((tick.bpm - 137.5).abs() < 1e-6);
     assert!(tick.playing);
+}
+
+#[test]
+fn bar_index_starts_from_lives_bar_and_follows_jumps() {
+    use mosh_analysis::grid::BeatGrid;
+    use mosh_core::Transport;
+    let at = |ppq: f64| Transport {
+        tempo_bpm: 93.0,
+        ppq,
+        bar_start_ppq: (ppq / 4.0).floor() * 4.0,
+        sig_num: 4,
+        sig_den: 4,
+        playing: true,
+        sample_pos: 0,
+    };
+    let mut grid = BeatGrid::new(8);
+    // Joining at 0:30 of a 93 BPM song: ppq 46.5 is inside Live's bar 12 (index 11).
+    assert_eq!(grid.update(&at(46.5)).bar_index, 11);
+    assert_eq!(grid.update(&at(48.0)).bar_index, 12);
+    // A jump back to bar 3 restarts the count there.
+    assert_eq!(grid.update(&at(8.5)).bar_index, 2);
+    assert_eq!(grid.update(&at(12.0)).bar_index, 3);
 }

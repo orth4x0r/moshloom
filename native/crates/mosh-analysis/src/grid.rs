@@ -98,6 +98,10 @@ impl BeatGrid {
     }
 
     /// Feed one transport snapshot. The analysis stage calls this once per block.
+    ///
+    /// `bar_index` is Live's bar number counted from 0 (Live's bar 1 is index 0): it starts from
+    /// the transport's `bar_start_ppq` when the stream starts or jumps, then counts bar lines, so
+    /// phrases and every-N-bar rules line up with the song rather than with when the app started.
     pub fn update(&mut self, t: &Transport) -> GridTick {
         let bar_len = bar_len_ppq(t.sig_num, t.sig_den);
         let beat_len = beat_len_ppq(t.sig_den);
@@ -114,7 +118,7 @@ impl BeatGrid {
             self.bar_len = bar_len;
             self.beat_len = beat_len;
             self.sig_num = t.sig_num;
-            self.bar_index = 0;
+            self.bar_index = live_bar_index(t.bar_start_ppq, bar_len);
             self.beat_index = (t.ppq / beat_len).floor() as i64;
         } else if (t.bar_start_ppq - self.bar_start).abs() <= PPQ_EPS {
             // Same bar. The signature can be changed inside it; keep the bar we are in.
@@ -136,7 +140,9 @@ impl BeatGrid {
             tick.completed = Some(completed);
             tick.bar_started = true;
         } else {
-            // A jump, a loop or a scrub: whatever bar we were in is abandoned.
+            // A jump, a loop or a scrub: whatever bar we were in is abandoned, and the count
+            // restarts from where Live is now.
+            self.bar_index = live_bar_index(t.bar_start_ppq, bar_len);
             self.bar_start = t.bar_start_ppq;
             self.bar_len = bar_len;
             self.beat_len = beat_len;
@@ -170,4 +176,14 @@ mod tests {
         // A nonsense signature never divides by zero.
         assert!(bar_len_ppq(0, 0) >= 0.25);
     }
+}
+
+/// Live's bar number (0-based) for a bar starting at `bar_start_ppq`, assuming the current bar
+/// length held since the start of the song. Exact for a constant meter; after a meter change it is
+/// the bar count in the current meter, which keeps every-N-bar rules regular.
+fn live_bar_index(bar_start_ppq: f64, bar_len: f64) -> i64 {
+    if bar_len <= 0.0 {
+        return 0;
+    }
+    (bar_start_ppq / bar_len).round() as i64
 }
