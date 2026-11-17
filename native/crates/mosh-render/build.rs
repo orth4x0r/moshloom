@@ -15,6 +15,8 @@ const SHADERS: &[(&str, &str)] = &[
     ("fullscreen.vert.wgsl", "FULLSCREEN_VERT"),
     ("compositor.frag.wgsl", "COMPOSITOR_FRAG"),
     ("compositor_stack.frag.wgsl", "COMPOSITOR_STACK_FRAG"),
+    // HAP (block-compressed) overlay video: YCoCg, straight or separate alpha (O-hap).
+    ("overlay_hap.frag.wgsl", "OVERLAY_HAP_FRAG"),
 ];
 
 fn compile(path: &Path) -> Vec<u32> {

@@ -56,6 +56,13 @@
 //!   buffer instead of a one-shot submission the CPU waits on (V-perf, Task 2.8's follow-up).
 //! - `submission_count()` (device) counts `vkQueueSubmit` calls process-wide, so a test can prove
 //!   that a per-frame pass did not add one.
+//! - Block-compressed overlay video (O-hap): `upload::BlockFormat` (BC1/BC3/BC3-YCoCg/BC4),
+//!   `VideoTexture::new_plane` / `upload_plane` for a HAP plane, `HapCoverPass` (YCoCg + straight
+//!   alpha, premultiplied output), `FrameRecorder::draw_video_pair` for HAP Q Alpha's two planes,
+//!   `Pipeline::fullscreen_with_filter` (a nearest sampler when the device cannot filter BCn
+//!   linearly) and `RenderError::FormatUnsupported`. `Gpu::texture_compression_bc()` says whether
+//!   the device can do any of it, and the `textureCompressionBC` feature is now enabled when
+//!   available.
 
 use std::fmt;
 
@@ -82,7 +89,7 @@ pub use swapchain::{
 };
 pub use target::{LayerTarget, OutputImage};
 pub use timing::{FrameTicket, GpuTimings};
-pub use upload::{CoverPass, VideoTexture};
+pub use upload::{BlockFormat, CoverPass, HapCoverPass, VideoTexture};
 
 /// Everything this crate can fail at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +127,9 @@ pub enum RenderError {
     },
     EmptyShader,
     FrameFinished,
+    /// A format the device cannot use for what was asked (a block-compressed texture without
+    /// `textureCompressionBC`, or without sampled-image/transfer support).
+    FormatUnsupported(ash::vk::Format),
     /// A swapchain or surface problem the stage could not recover from, as text for the stats
     /// overlay (the stage keeps running).
     Stage(String),
@@ -155,6 +165,9 @@ impl fmt::Display for RenderError {
             }
             RenderError::EmptyShader => write!(formatter, "empty SPIR-V module"),
             RenderError::FrameFinished => write!(formatter, "frame already submitted"),
+            RenderError::FormatUnsupported(format) => {
+                write!(formatter, "format {format:?} is not usable on this device")
+            }
             RenderError::Stage(message) => write!(formatter, "stage: {message}"),
         }
     }

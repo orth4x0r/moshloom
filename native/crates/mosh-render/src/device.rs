@@ -227,6 +227,12 @@ pub struct Gpu {
     pub(crate) timestamp_period_ns: f32,
     pub(crate) timestamp_valid_bits: u32,
     pub(crate) sampler: vk::Sampler,
+    /// The same sampler with nearest filtering. Block-compressed (BCn) formats are not required
+    /// to support linear filtering, so a pipeline that samples HAP blocks picks between the two
+    /// by asking [`Gpu::supports_linear_filter`].
+    pub(crate) nearest_sampler: vk::Sampler,
+    /// `textureCompressionBC` was available and enabled: HAP textures can be created.
+    texture_compression_bc: bool,
     pub(crate) uniform_ring: MappedBuffer,
     pub(crate) uniform_stride: u64,
     uniform_alignment: u64,
@@ -405,6 +411,14 @@ impl Gpu {
         if features12.host_query_reset != vk::TRUE {
             return Err(RenderError::MissingFeature("hostQueryReset"));
         }
+        // The 1.0 feature set sits in `features2.features`, not in the pNext chain: ask for the
+        // one feature this crate needs (block-compressed textures, which HAP uploads into) and
+        // leave the rest off, instead of enabling everything the query reported.
+        let texture_compression_bc = features2.features.texture_compression_bc == vk::TRUE;
+        features2.features = vk::PhysicalDeviceFeatures::default();
+        if texture_compression_bc {
+            features2.features.texture_compression_bc = vk::TRUE;
+        }
 
         let priorities = [1.0f32];
         let queue_infos = [vk::DeviceQueueCreateInfo::default()
@@ -428,6 +442,17 @@ impl Gpu {
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .max_lod(1.0);
         let sampler = unsafe { device.create_sampler(&sampler_info, None) }?;
+        // Nearest, for formats without linear filtering (block-compressed textures on drivers
+        // that do not report SAMPLED_IMAGE_FILTER_LINEAR for them).
+        let nearest_sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .max_lod(0.0);
+        let nearest_sampler = unsafe { device.create_sampler(&nearest_sampler_info, None) }?;
 
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
 
@@ -528,6 +553,8 @@ impl Gpu {
             timestamp_period_ns: properties.limits.timestamp_period,
             timestamp_valid_bits,
             sampler,
+            nearest_sampler,
+            texture_compression_bc,
             uniform_ring: MappedBuffer {
                 buffer: uniform_buffer,
                 memory: uniform_memory,
@@ -556,6 +583,29 @@ impl Gpu {
     /// The name of the GPU the device was created on, e.g. `AMD Radeon(TM) Graphics`.
     pub fn adapter_name(&self) -> &str {
         &self.adapter_name
+    }
+
+    /// True when the device has `textureCompressionBC` and this renderer enabled it, so
+    /// block-compressed (HAP) textures can be created and sampled.
+    pub fn texture_compression_bc(&self) -> bool {
+        self.texture_compression_bc
+    }
+
+    /// The device's properties for one format: what it can be used for.
+    pub fn format_properties(&self, format: vk::Format) -> vk::FormatProperties {
+        unsafe {
+            self.instance
+                .get_physical_device_format_properties(self.physical, format)
+        }
+    }
+
+    /// True when `format` can be sampled with linear filtering on this device. Block-compressed
+    /// formats are not required to support it; a pipeline that samples them uses the result to
+    /// choose the linear or the nearest sampler, instead of getting a validation error.
+    pub fn supports_linear_filter(&self, format: vk::Format) -> bool {
+        self.format_properties(format)
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
     }
 
     /// Every validation-layer message seen so far. Tests assert this is empty.
@@ -760,6 +810,7 @@ impl Drop for Gpu {
             self.dev.free_memory(self.uniform_ring.memory, None);
             self.allocations.release(self.uniform_ring.memory);
             self.dev.destroy_sampler(self.sampler, None);
+            self.dev.destroy_sampler(self.nearest_sampler, None);
         }
         if let Some(reporter) = self.debug.take() {
             unsafe {
