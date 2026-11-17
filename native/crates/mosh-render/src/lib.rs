@@ -62,6 +62,7 @@ mod shaders;
 mod swapchain;
 mod target;
 mod timing;
+pub mod upload;
 mod win;
 
 pub use compositor::Compositor;
@@ -71,6 +72,7 @@ pub use pipeline::{FrameRecorder, Pipeline};
 pub use swapchain::{MonitorId, PresentResult, Stage, SwapchainAction, SwapchainPolicy};
 pub use target::{LayerTarget, OutputImage};
 pub use timing::{FrameTicket, GpuTimings};
+pub use upload::{CoverPass, VideoTexture};
 
 /// Everything this crate can fail at.
 #[derive(Debug, Clone, PartialEq, Eq)]
