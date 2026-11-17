@@ -162,6 +162,16 @@ impl BeatGrid {
     }
 }
 
+/// Live's bar number (0-based) for a bar starting at `bar_start_ppq`, assuming the current bar
+/// length held since the start of the song. Exact for a constant meter; after a meter change it is
+/// the bar count in the current meter, which keeps every-N-bar rules regular.
+fn live_bar_index(bar_start_ppq: f64, bar_len: f64) -> i64 {
+    if bar_len <= 0.0 {
+        return 0;
+    }
+    (bar_start_ppq / bar_len).round() as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,14 +186,4 @@ mod tests {
         // A nonsense signature never divides by zero.
         assert!(bar_len_ppq(0, 0) >= 0.25);
     }
-}
-
-/// Live's bar number (0-based) for a bar starting at `bar_start_ppq`, assuming the current bar
-/// length held since the start of the song. Exact for a constant meter; after a meter change it is
-/// the bar count in the current meter, which keeps every-N-bar rules regular.
-fn live_bar_index(bar_start_ppq: f64, bar_len: f64) -> i64 {
-    if bar_len <= 0.0 {
-        return 0;
-    }
-    (bar_start_ppq / bar_len).round() as i64
 }
