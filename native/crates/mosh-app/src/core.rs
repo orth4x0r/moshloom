@@ -84,6 +84,8 @@ pub trait ControlSource: Send {
     /// Append the events that arrived since the last poll. Never blocks.
     fn poll(&mut self, out: &mut Vec<ControlEvent>);
     fn label(&self) -> &'static str;
+    /// Light a pad at `(x, y)`, `y` from the top row. Only a pad controller does anything here.
+    fn set_pad(&mut self, _x: u8, _y: u8, _colour: mosh_midi::PadColor) {}
 }
 
 /// The tap plugin's audio ring, with Ableton's transport.
@@ -208,6 +210,10 @@ impl ControlSource for ApcInput {
 
     fn label(&self) -> &'static str {
         "apc"
+    }
+
+    fn set_pad(&mut self, x: u8, y: u8, colour: mosh_midi::PadColor) {
+        self.controller.set_pad(x, y, colour);
     }
 }
 
@@ -430,6 +436,18 @@ impl Controls {
         }
     }
 
+    /// Whether a pad controller (the APC mini) is attached.
+    pub fn has_pads(&self) -> bool {
+        !self.missing("apc")
+    }
+
+    /// Light a pad on every pad controller.
+    pub fn set_pad(&mut self, x: u8, y: u8, colour: mosh_midi::PadColor) {
+        for source in &mut self.sources {
+            source.set_pad(x, y, colour);
+        }
+    }
+
     fn missing(&self, label: &str) -> bool {
         !self.sources.iter().any(|source| source.label() == label)
     }
@@ -457,6 +475,12 @@ pub struct Frame {
     pub mode: ShowMode,
     /// The arrangement song the playhead is in, once a marker has been crossed.
     pub song: Option<usize>,
+    /// What the session grid is doing, layer by layer (the control window and the pad LEDs).
+    pub grid: GridState,
+    /// Follow actions and intensity-driven launches are frozen.
+    pub locked: bool,
+    /// An APC mini is attached.
+    pub pads: bool,
 }
 
 /// The show without its pixels: audio in, one plan out.
@@ -481,6 +505,13 @@ pub struct AppCore {
     /// The input the analyzer was last fed from; a change starts a fresh analyzer.
     analyzed_source: Option<SourceKind>,
     analyzer_resets: u64,
+    /// Launches and stops on their way to a bar line, and the scene each layer plays.
+    grid: GridState,
+    /// Bar lines a queued launch has waited, so one the show dropped cannot blink forever.
+    queued_bars: [u8; GRID_LAYERS],
+    /// The pad LEDs as last sent, and when the whole grid was last sent.
+    leds: Option<crate::leds::PadGrid>,
+    leds_sent_at: Option<Instant>,
 }
 
 impl AppCore {
@@ -501,7 +532,21 @@ impl AppCore {
             frames: 0,
             analyzed_source: None,
             analyzer_resets: 0,
+            grid: GridState::default(),
+            queued_bars: [0; GRID_LAYERS],
+            leds: None,
+            leds_sent_at: None,
         }
+    }
+
+    /// Change the show's mode now. The show drops its queued launches with the mode they were
+    /// asked in, so the grid's "queued" marks go with them.
+    pub fn set_mode(&mut self, mode: ShowMode) {
+        if mode != self.show.mode() {
+            self.grid.queued = [None; GRID_LAYERS];
+            self.grid.stopping = 0;
+        }
+        self.show.set_mode(mode);
     }
 
     /// Times the analyzer was started fresh because the input changed.
@@ -562,20 +607,76 @@ impl AppCore {
         self.blocks.clear();
 
         let analysis = self.analyzer.take_frame();
+        // What the performer asked for this frame is "queued" until the show plays it.
+        self.grid
+            .note_requests(&self.show.project().session, &self.events);
+        let bar = crossed_bar(self.last.as_ref(), &analysis);
         // An edited project lands on a bar line, before the show reads the analysis, so the new
         // project's first frame is the one the playhead is on.
         self.apply_pending_project(&analysis);
         let plan = self.show.update(&analysis, &self.events);
         self.playing = plan.layers.iter().map(|layer| layer.clip).collect();
+        self.grid
+            .settle(&self.show.project().session, &self.playing);
+        self.expire_queued(bar);
         self.last = Some(analysis);
         self.frames += 1;
+        self.send_leds(now);
         Frame {
             analysis,
             plan,
             source,
             mode: self.show.mode(),
             song: self.song,
+            grid: self.grid,
+            locked: self.show.locked(),
+            pads: self.controls.has_pads(),
         }
+    }
+
+    /// A launch the show never played (a scene that was removed, a mode change inside the show)
+    /// stops blinking after [`QUEUE_PATIENCE_BARS`] bar lines.
+    fn expire_queued(&mut self, bar: bool) {
+        for layer in 0..GRID_LAYERS {
+            let waiting =
+                self.grid.queued[layer].is_some() || self.grid.stopping & (1 << layer) != 0;
+            if !waiting {
+                self.queued_bars[layer] = 0;
+                continue;
+            }
+            if bar {
+                self.queued_bars[layer] = self.queued_bars[layer].saturating_add(1);
+            }
+            if self.queued_bars[layer] > QUEUE_PATIENCE_BARS {
+                self.grid.queued[layer] = None;
+                self.grid.stopping &= !(1 << layer);
+                self.queued_bars[layer] = 0;
+            }
+        }
+    }
+
+    /// Mirror the session grid on the APC mini's pads: only the pads that changed, and the whole
+    /// grid every [`LED_REFRESH`] so a controller plugged in mid-rehearsal lights up.
+    fn send_leds(&mut self, now: Instant) {
+        if !self.controls.has_pads() {
+            self.leds = None;
+            return;
+        }
+        let next = crate::leds::pad_grid(&self.show.project().session, &self.grid);
+        let refresh = self
+            .leds_sent_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= LED_REFRESH);
+        let changes = match (&self.leds, refresh) {
+            (Some(previous), false) => crate::leds::pad_changes(previous, &next),
+            _ => {
+                self.leds_sent_at = Some(now);
+                crate::leds::pad_changes(&crate::leds::unknown_grid(), &next)
+            }
+        };
+        for (x, y, colour) in changes {
+            self.controls.set_pad(x, y, colour);
+        }
+        self.leds = Some(next);
     }
 
     /// Give the show an edited project. It is swapped in on the next bar line, never mid-phrase.
@@ -636,6 +737,142 @@ impl AppCore {
             self.analyzer.song_start();
             self.song_starts += 1;
         }
+    }
+}
+
+/// The layers the grid state tracks: the compositor's stack, and the APC mini's pad columns.
+pub const GRID_LAYERS: usize = 8;
+
+/// Bar lines a queued launch may wait before its mark is dropped (a phrase is four bars).
+pub const QUEUE_PATIENCE_BARS: u8 = 8;
+
+/// How often the whole pad grid is sent again.
+pub const LED_REFRESH: Duration = Duration::from_secs(2);
+
+/// What the session grid is doing, per layer: for the control window's cells and the pad LEDs.
+///
+/// `mosh-show` keeps its queue to itself, so this is rebuilt from what goes in (the launch and
+/// stop events of a frame) and what comes out (the clip each layer draws): a launch is *queued*
+/// from the frame it is asked for until the layer draws that slot's clip.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GridState {
+    /// The clip each layer draws.
+    pub playing: [Option<ClipId>; GRID_LAYERS],
+    /// The scene row each layer's clip was launched from, when the grid has it.
+    pub scene: [Option<u16>; GRID_LAYERS],
+    /// The scene row waiting for its bar line on each layer.
+    pub queued: [Option<u16>; GRID_LAYERS],
+    /// Bit per layer: a stop is waiting for its bar line.
+    pub stopping: u8,
+}
+
+impl GridState {
+    /// Record this frame's launch and stop requests.
+    pub fn note_requests(&mut self, grid: &SessionGrid, events: &[ControlEvent]) {
+        let cell = |layer: usize, scene: usize| {
+            grid.scenes
+                .get(scene)
+                .and_then(|row| row.cells.get(layer).copied().flatten())
+        };
+        for event in events {
+            match *event {
+                ControlEvent::LaunchClip { layer, scene }
+                    if layer < GRID_LAYERS && cell(layer, scene).is_some() =>
+                {
+                    self.queued[layer] = Some(scene as u16);
+                    self.stopping &= !(1 << layer);
+                }
+                ControlEvent::LaunchScene(scene) => {
+                    for layer in 0..GRID_LAYERS {
+                        if cell(layer, scene).is_some() {
+                            self.queued[layer] = Some(scene as u16);
+                            self.stopping &= !(1 << layer);
+                        }
+                    }
+                }
+                ControlEvent::StopLayer(layer) if layer < GRID_LAYERS => {
+                    self.queued[layer] = None;
+                    if self.playing[layer].is_some() {
+                        self.stopping |= 1 << layer;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Fold in what each layer drew this frame: a queued slot whose clip is now on its layer is
+    /// playing, a stopped layer that is empty has stopped.
+    pub fn settle(&mut self, grid: &SessionGrid, playing: &[Option<ClipId>]) {
+        let cell = |layer: usize, scene: u16| {
+            grid.scenes
+                .get(usize::from(scene))
+                .and_then(|row| row.cells.get(layer).copied().flatten())
+        };
+        for layer in 0..GRID_LAYERS {
+            let now = playing.get(layer).copied().flatten();
+            self.playing[layer] = now;
+            if let Some(scene) = self.queued[layer]
+                && now.is_some()
+                && cell(layer, scene) == now
+            {
+                self.scene[layer] = Some(scene);
+                self.queued[layer] = None;
+            }
+            if now.is_none() {
+                self.stopping &= !(1 << layer);
+                self.scene[layer] = None;
+                continue;
+            }
+            // A clip the show launched by itself (a follow action, Autopilot, the arrangement):
+            // the row it came from is the first one that holds it on this layer, if any does.
+            if self.scene[layer].is_none_or(|scene| cell(layer, scene) != now) {
+                self.scene[layer] = grid
+                    .scenes
+                    .iter()
+                    .position(|row| row.cells.get(layer).copied().flatten() == now)
+                    .map(|scene| scene as u16);
+            }
+        }
+    }
+}
+
+/// The three event lamps (BUILD, DROP, BREAKDOWN): an event lights its lamp, which then fades,
+/// so a flag that lasts one frame is visible in a window that paints ten times a second.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Lamps {
+    lit_at: [Option<Instant>; 3],
+}
+
+impl Lamps {
+    /// How long a lamp takes to fade out.
+    pub const FADE: Duration = Duration::from_millis(1_500);
+
+    /// Light the lamps of this frame's events. A drop ends the build it resolves.
+    pub fn note(&mut self, events: EventFlags, now: Instant) {
+        if events.contains(EventFlags::BUILD_START) {
+            self.lit_at[0] = Some(now);
+        }
+        if events.contains(EventFlags::DROP) {
+            self.lit_at[1] = Some(now);
+            self.lit_at[0] = None;
+        }
+        if events.contains(EventFlags::BREAKDOWN) {
+            self.lit_at[2] = Some(now);
+        }
+    }
+
+    /// Each lamp's brightness, 1 when just lit down to 0, in steps of a tenth so an idle window
+    /// is not repainted for a change nobody can see.
+    pub fn levels(&self, now: Instant) -> [f32; 3] {
+        self.lit_at.map(|at| match at {
+            Some(at) => {
+                let age = now.saturating_duration_since(at).as_secs_f32();
+                let level = (1.0 - age / Self::FADE.as_secs_f32()).clamp(0.0, 1.0);
+                (level * 10.0).ceil() / 10.0
+            }
+            None => 0.0,
+        })
     }
 }
 
@@ -830,6 +1067,67 @@ pub struct Status {
     pub level: u8,
     pub gpu_ms: f32,
     pub cpu_ms: f32,
+    /// The playhead in beats: Live's when the plugin is the source, the tracker's otherwise.
+    pub ppq: f64,
+    /// Live's transport is running.
+    pub transport: bool,
+    /// Continuous intensity, 0..1.
+    pub intensity: f32,
+    /// BUILD, DROP, BREAKDOWN lamps, 0..1 each (see [`Lamps`]).
+    pub lamps: [f32; 3],
+    /// The song marker the playhead is in.
+    pub song: Option<u16>,
+    /// The clip each layer draws.
+    pub playing: [Option<ClipId>; GRID_LAYERS],
+    /// The scene row each layer's clip came from.
+    pub scene: [Option<u16>; GRID_LAYERS],
+    /// The scene row queued on each layer.
+    pub queued: [Option<u16>; GRID_LAYERS],
+    /// Bit per layer: a stop is queued.
+    pub stopping: u8,
+    /// Automation is frozen (`ControlEvent::Lock`).
+    pub locked: bool,
+    /// An APC mini is attached.
+    pub pads: bool,
+}
+
+impl Status {
+    /// The status line of one frame. The frame times are rounded to a tenth of a millisecond and
+    /// the playhead to a sixteenth of a beat, so two frames that would paint the same window
+    /// compare equal and the control window is left alone.
+    pub fn from_frame(frame: &Frame, gpu_ms: f32, cpu_ms: f32, lamps: [f32; 3]) -> Status {
+        let round = |value: f32, steps: f32| (value * steps).round() / steps;
+        Status {
+            mode: frame.mode.into(),
+            source: SourceName(frame.source),
+            tempo_bpm: round(frame.analysis.tempo_bpm, 10.0),
+            bar: frame.analysis.bar_index,
+            bar_phase: round(frame.analysis.bar_phase, 16.0),
+            level: frame.analysis.level,
+            gpu_ms: round(gpu_ms, 10.0),
+            cpu_ms: round(cpu_ms, 10.0),
+            ppq: (frame.analysis.ppq * 16.0).round() / 16.0,
+            transport: frame.analysis.playing,
+            intensity: round(frame.analysis.intensity, 50.0),
+            lamps,
+            song: frame.song.map(|song| song as u16),
+            playing: frame.grid.playing,
+            scene: frame.grid.scene,
+            queued: frame.grid.queued,
+            stopping: frame.grid.stopping,
+            locked: frame.locked,
+            pads: frame.pads,
+        }
+    }
+}
+
+/// The control window's title: the app, the show's file and whether it has unsaved edits.
+pub fn window_title(path: Option<&str>, modified: bool) -> String {
+    let name = path
+        .map(|path| path.rsplit(['/', '\\']).next().unwrap_or(path))
+        .filter(|name| !name.is_empty())
+        .unwrap_or("untitled show");
+    format!("ilanaVisual - {name}{}", if modified { " *" } else { "" })
 }
 
 /// `ShowMode` as the title spells it.

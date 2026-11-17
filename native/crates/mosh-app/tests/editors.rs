@@ -16,7 +16,8 @@
 //! * `preset_save_and_apply` — params and seed go into a preset and come back.
 //! * `edits_reach_the_running_show_at_next_bar` — `AppCore` keeps drawing the old project mid-bar
 //!   and switches on the bar line, without restarting.
-//! * `control_window_idle_frame_costs_a_number` — the egui frame's CPU cost, measured headless.
+//! * the views themselves (layout, shortcuts, hit-testing, frame cost) are in `tests/ui.rs`, and
+//!   the commands behind them in `tests/commands.rs`.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -31,7 +32,7 @@ use flate2::write::GzEncoder;
 use mosh_app::core::{
     AppCore, AudioSource, Controls, InputMux, arrangement_project, simple_clip,
 };
-use mosh_app::editor::{Command, EditorError, EditorModel, Screen, ui};
+use mosh_app::editor::{Command, EditorError, EditorModel, View};
 use mosh_core::{
     AudioBlock, EffectKind, FollowAction, LaunchQuantize, Layer, ParamRange, Project, SceneRow,
     SessionGrid, ShowMode, SigChange, Transport, Transition, TransitionKind,
@@ -230,7 +231,7 @@ fn transport_block(ppq: f64) -> AudioBlock {
 #[test]
 fn editing_a_clip_updates_the_project() {
     let mut model = EditorModel::new(clip_project());
-    assert_eq!(model.screen(), Screen::Session);
+    assert_eq!(model.view(), View::Session);
     assert_eq!(model.selected(), Some(7));
     model.apply(Command::SelectClip(Some(7))).expect("select");
 
@@ -625,68 +626,4 @@ fn preview_launch_reaches_the_show() {
         }),
         Err(EditorError::BadCell { layer: 4, scene: 0 })
     );
-}
-
-/// What one idle frame of the editor's egui tree costs on this machine, with no window.
-///
-/// The control window paints only when something changed (see `window.rs`), so this is the cost
-/// *when* it paints, not what it costs while the performer is not touching anything. It is the UI
-/// half only: no GL, no swapchain, no stage frame. Run with `--nocapture` for the numbers.
-#[test]
-fn control_window_idle_frame_costs_a_number() {
-    let ctx = egui::Context::default();
-    let mut state = ui::EditorUi::default();
-    let mut model = EditorModel::new(clip_project());
-
-    // The Session grid is the screen the window opens on; the clip editor is the heaviest one
-    // (eight sliders, the effect list, the transition and follow rows). Measure both.
-    let session_ms = measure_idle_frame(&ctx, &mut state, &model);
-    model
-        .apply(Command::SelectScreen(Screen::Clip))
-        .expect("the clip screen");
-    let clip_ms = measure_idle_frame(&ctx, &mut state, &model);
-
-    println!(
-        "control window idle frame, 900x620, headless egui: session {session_ms:.3} ms, clip {clip_ms:.3} ms"
-    );
-    let worst = session_ms.max(clip_ms);
-    assert!(
-        worst < 8.0,
-        "one editor frame took {worst:.3} ms: too much to sit next to the stage loop"
-    );
-}
-
-/// Milliseconds per idle frame: no input, no commands, layout and tessellation included.
-fn measure_idle_frame(ctx: &egui::Context, state: &mut ui::EditorUi, model: &EditorModel) -> f64 {
-    let mut frame = |seconds: f64| {
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(900.0, 620.0),
-            )),
-            time: Some(seconds),
-            max_texture_side: Some(8192),
-            ..Default::default()
-        };
-        let mut commands = Vec::new();
-        let output = ctx.run_ui(input, |root| {
-            commands = ui::draw(root, state, model);
-        });
-        let mut textures = output.textures_delta;
-        textures.clear();
-        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
-        assert!(commands.is_empty(), "an untouched screen emits no command");
-        assert!(!primitives.is_empty(), "the editor drew nothing at all");
-    };
-
-    // Warm up: fonts, layout caches and the tessellator's buffers.
-    for i in 0..5 {
-        frame(f64::from(i) * 0.033);
-    }
-    let runs = 120;
-    let started = Instant::now();
-    for i in 0..runs {
-        frame(f64::from(5 + i) * 0.033);
-    }
-    started.elapsed().as_secs_f64() * 1_000.0 / f64::from(runs)
 }

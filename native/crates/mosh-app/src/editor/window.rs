@@ -27,14 +27,16 @@ use glutin::display::GetGlDisplay;
 use glutin::prelude::*;
 use glutin::surface::{Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::window::{Window, WindowAttributes};
 
 use crate::editor::model::{Command, EditorModel};
+use crate::editor::theme;
 use crate::editor::ui::{self, EditorUi};
+use crate::monitor::Area;
 
 /// The control window never paints more often than this, however loudly egui asks.
 pub const MAX_PERIOD: Duration = Duration::from_millis(33);
@@ -43,8 +45,8 @@ pub const MAX_PERIOD: Duration = Duration::from_millis(33);
 /// up a minute later for a frame nothing asked for.
 const IDLE_AFTER: Duration = Duration::from_secs(1);
 
-/// The editor's background, matching egui's dark theme.
-const CLEAR: [f32; 4] = [0.055, 0.055, 0.07, 1.0];
+/// The editor's background: `theme::BG`, as the linear floats the clear takes.
+const CLEAR: [f32; 4] = [0.063, 0.071, 0.086, 1.0];
 
 /// The control window and everything needed to paint it.
 pub struct EditorWindow {
@@ -65,8 +67,15 @@ impl EditorWindow {
     ///
     /// The window is created through glutin's builder so the config it gets is the one the
     /// context is made with; that is why the shell does not create it with `create_window`.
-    pub fn new(event_loop: &ActiveEventLoop, title: &str) -> Result<EditorWindow, Box<dyn std::error::Error>> {
-        let attributes = control_attributes(title);
+    ///
+    /// `place` is where the window goes: a monitor's top-left corner in desktop coordinates and
+    /// the area on it (`crate::monitor::window_plan`), or `None` to let the OS decide.
+    pub fn new(
+        event_loop: &ActiveEventLoop,
+        title: &str,
+        place: Option<(PhysicalPosition<i32>, Area)>,
+    ) -> Result<EditorWindow, Box<dyn std::error::Error>> {
+        let attributes = control_attributes(title, place);
         let template = ConfigTemplateBuilder::new()
             .with_alpha_size(8)
             .with_depth_size(0)
@@ -114,7 +123,7 @@ impl EditorWindow {
         let painter = egui_glow::Painter::new(Arc::new(gl), "", None, true)?;
 
         let egui = egui::Context::default();
-        egui.set_visuals(egui::Visuals::dark());
+        theme::apply(&egui);
         let state = egui_winit::State::new(
             egui.clone(),
             ViewportId::ROOT,
@@ -139,6 +148,24 @@ impl EditorWindow {
 
     pub fn window(&self) -> &Window {
         &self.window
+    }
+
+    /// The egui context, for the shell to hand pictures to (thumbnails, the stage preview).
+    pub fn ctx(&self) -> &egui::Context {
+        &self.egui
+    }
+
+    /// Bring the control window back in front (after the stage leaves fullscreen).
+    pub fn bring_to_front(&self) {
+        if self.window.is_minimized().unwrap_or(false) {
+            self.window.set_minimized(false);
+        }
+        self.window.focus_window();
+    }
+
+    /// Whether the window is minimised: it paints nothing and asks for no preview.
+    pub fn is_hidden(&self) -> bool {
+        self.hidden()
     }
 
     /// Ask for a frame (after a window event, a status line, or an applied command).
@@ -255,9 +282,17 @@ impl Drop for EditorWindow {
 }
 
 /// Kept out of `new` so the text does not fight the GL setup.
-fn control_attributes(title: &str) -> WindowAttributes {
-    Window::default_attributes()
+fn control_attributes(
+    title: &str,
+    place: Option<(PhysicalPosition<i32>, Area)>,
+) -> WindowAttributes {
+    let attributes = Window::default_attributes()
         .with_title(title)
-        .with_inner_size(PhysicalSize::new(1000, 700))
-        .with_min_inner_size(PhysicalSize::new(560, 360))
+        .with_min_inner_size(PhysicalSize::new(800, 560));
+    match place {
+        Some((origin, area)) => attributes
+            .with_inner_size(PhysicalSize::new(area.width, area.height))
+            .with_position(PhysicalPosition::new(origin.x + area.x, origin.y + area.y)),
+        None => attributes.with_inner_size(PhysicalSize::new(1280, 800)),
+    }
 }

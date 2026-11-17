@@ -350,6 +350,7 @@ fn control_title_changes_only_when_the_numbers_change() {
         level: 3,
         gpu_ms: 4.25,
         cpu_ms: 0.8,
+        ..Status::default()
     };
     let title = title_for(None, &status).expect("first title");
     for expected in [
