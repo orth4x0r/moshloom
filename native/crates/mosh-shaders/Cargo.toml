@@ -5,6 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+build = "build.rs"
 
 [dependencies]
 mosh-core = { path = "../mosh-core" }
+bytemuck = { version = "1.25", features = ["derive"] }
+naga = { version = "30.0", features = ["wgsl-in", "spv-out"] }
+
+[build-dependencies]
+# The same naga and the same options as runtime.rs, so build-time and runtime SPIR-V match word
+# for word (tests/compile.rs: every_wgsl_file_compiles).
+naga = { version = "30.0", features = ["wgsl-in", "spv-out"] }
