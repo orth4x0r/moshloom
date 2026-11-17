@@ -323,7 +323,8 @@ fn run_analysis(
     Ok(())
 }
 
-/// `--dump`: one line per bar, then a `#` summary line the parser may skip.
+/// `--dump`: one line per bar, the section table, the unsupervised checks, then a `#` summary
+/// line the parser may skip.
 #[cfg(feature = "live-analysis")]
 fn dump_rows(run: &offline::AnalysisRun) {
     use mosh_core::EventFlags;
@@ -343,26 +344,42 @@ fn dump_rows(run: &offline::AnalysisRun) {
             .filter(|(_, flag)| row.update.events.contains(*flag))
             .map(|(name, _)| *name)
             .collect();
-        let events = if names.is_empty() {
+        let mut events = if names.is_empty() {
             "-".to_string()
         } else {
             names.join("+")
         };
+        if row.drop && !row.update.events.contains(EventFlags::DROP) {
+            // The mid-bar pass fired this drop on the downbeat, a bar earlier than the close.
+            events = if events == "-" {
+                "drop(downbeat)".to_string()
+            } else {
+                format!("{events}+drop(downbeat)")
+            };
+        }
         println!(
-            "  bar {:>4}  db {:>8.2}  loud {:.3}  low {:.3}  onset {:.3}  bright {:.3}  int {:.3}  read {:.3}  level {}  {events}",
-            row.bar.bar_index,
-            row.bar.loudness_db,
+            "  bar {:>4}  db {:>8.2}  lvl {:>6.2}  early {:>6.2}  loud {:.3}  low {:.3}  onset {:.3}  bright {:.3}  int {:.3}  read {:.3}  level {}  sec {}  {:.3}  tgt {:.3}  nov {:.3}  {events}",
+            row.stats.bar_index,
+            row.stats.loudness_db,
+            row.raw.level_db,
+            row.raw.early_db,
             row.update.terms.loudness,
             row.update.terms.low,
             row.update.terms.onset,
             row.update.terms.brightness,
             row.update.intensity,
             row.update.reading,
-            row.update.level
+            row.update.level,
+            row.section.index,
+            row.section.energy,
+            row.section.target,
+            row.section.novelty,
         );
         let slot = usize::from(row.update.level.clamp(1, 4)) - 1;
         counts[slot] += 1;
     }
+    print!("{}", run.eval.sections_report());
+    print!("{}", run.eval.report());
     println!(
         "# levels l1={} l2={} l3={} l4={} bars={}",
         counts[0],
