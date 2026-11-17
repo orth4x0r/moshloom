@@ -234,15 +234,14 @@ fn ignores_automation_outside_the_master_track() {
 fn decodes_time_signature_enum() {
     assert_eq!(decode_time_signature(201), Some((4, 4)));
     assert_eq!(decode_time_signature(302), Some((6, 8)));
-    assert_eq!(decode_time_signature(101), Some((2, 4)));
-    assert_eq!(decode_time_signature(151), Some((3, 4)));
-    assert_eq!(decode_time_signature(251), Some((5, 4)));
-    assert_eq!(decode_time_signature(352), Some((7, 8)));
-    assert_eq!(decode_time_signature(602), Some((12, 8)));
+    assert_eq!(decode_time_signature(200), Some((3, 4)));
+    assert_eq!(decode_time_signature(198), Some((1, 4)));
+    assert_eq!(decode_time_signature(202), Some((5, 4)));
+    assert_eq!(decode_time_signature(303), Some((7, 8)));
+    assert_eq!(decode_time_signature(308), Some((12, 8)));
     assert_eq!(decode_time_signature(100), Some((2, 2)));
-    // Not an index this decoder knows: never guessed.
-    assert_eq!(decode_time_signature(0), None);
-    assert_eq!(decode_time_signature(198), None);
+    assert_eq!(decode_time_signature(396), Some((1, 16)));
+    assert_eq!(decode_time_signature(495), None);
 }
 
 #[test]
@@ -257,7 +256,7 @@ fn undecodable_time_signature_events_are_dropped() {
             <EnvelopeTarget><PointeeId Value="1" /></EnvelopeTarget>
             <Automation><Events>
               <EnumEvent Id="0" Time="-63072000" Value="201" />
-              <EnumEvent Id="1" Time="32" Value="198" />
+              <EnumEvent Id="1" Time="32" Value="495" />
             </Events></Automation>
           </AutomationEnvelope>
         </Envelopes>

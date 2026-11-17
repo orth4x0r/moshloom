@@ -143,33 +143,19 @@ pub fn read_als<P: AsRef<Path>>(path: P) -> Result<AlsInfo, AlsError> {
 
 /// Decode Live's `TimeSignature` enum index into `(numerator, denominator)`.
 ///
-/// Live writes the master signature as an enum index, not as two numbers. The index is
-/// `numerator * 50 + denominator_code`, where the denominator code counts up in powers of two
-/// from `/2`: `0 -> /2`, `1 -> /4`, `2 -> /8`, `3 -> /16`.
-///
-/// This reproduces the two values observed in Live 11.0.1 sets on the reference machine:
-/// `201 -> 4/4` and `302 -> 6/8` (the only set with a non-4/4 master held 6/8 clips). The other
-/// entries of the table above are the same arithmetic and are covered by unit tests, but they
-/// have not been seen in a real set. Code `4` is also read as `/16`: that is what the
-/// "denominator / 4" reading of the same numbers gives, `/16` is the largest denominator Live's
-/// UI offers, and both readings agree on the two confirmed values.
-///
-/// An index this decoder does not recognise returns `None`; the caller drops the point rather
-/// than guessing a meter.
+/// Live writes the master signature as one enum index:
+/// `index = (numerator - 1) + 99 * log2(denominator)`, numerator 1..=99, denominator 1..=16.
+/// So `201 -> 4/4`, `302 -> 6/8`, `200 -> 3/4`, `198 -> 1/4` (all four occur in real sets;
+/// 201 and 302 were seen on the reference machine, and 198 is the value an earlier
+/// `numerator * 50 + code` reading could not explain). An index past 16ths returns `None`;
+/// the caller drops the point rather than guessing a meter.
 pub fn decode_time_signature(value: u32) -> Option<(u16, u16)> {
-    let num = value / 50;
-    let code = value % 50;
-    let den: u16 = match code {
-        0 => 2,
-        1 => 4,
-        2 => 8,
-        3 | 4 => 16,
-        _ => return None,
-    };
-    if num == 0 || num > u32::from(u16::MAX) {
+    let num = value % 99 + 1;
+    let pow = value / 99;
+    if pow > 4 {
         return None;
     }
-    Some((num as u16, den))
+    Some((num as u16, 1u16 << pow))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
