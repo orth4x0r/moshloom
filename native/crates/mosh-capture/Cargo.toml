@@ -8,3 +8,5 @@ publish.workspace = true
 
 [dependencies]
 mosh-core = { path = "../mosh-core" }
+rtrb = "0.4.1"
+wasapi = "0.27.0"
