@@ -10,6 +10,7 @@
 //! | `effects`, `transitions` | V-fx | 2.3 |
 //! | `fluid` | V-fluid | 2.4 |
 //! | `overlay` | V-overlay | 2.8 |
+//! | `stack` (the whole layer stack: Adjustment and Mask layers) | L-stack | wave 3 |
 //! | `styles::cyber`, `styles::aero` (style packs) | S-cyber, S-aero | wave 3 |
 //! | `camera`, `text`, `particles` (layer visualizers) | L-camera, L-text, L-particles | wave 3 |
 //!
@@ -37,6 +38,7 @@ pub mod mosh;
 pub mod overlay;
 pub mod particles;
 pub mod scenes;
+pub mod stack;
 pub mod styles;
 pub mod text;
 pub mod transitions;

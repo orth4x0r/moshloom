@@ -56,6 +56,19 @@
 //!   buffer instead of a one-shot submission the CPU waits on (V-perf, Task 2.8's follow-up).
 //! - `submission_count()` (device) counts `vkQueueSubmit` calls process-wide, so a test can prove
 //!   that a per-frame pass did not add one.
+//!
+//! ## Adjustment and Mask layers (L-stack, wave 3)
+//!
+//! - `CompositeTarget` is where a composite pass writes: an `OutputImage` (unchanged), a
+//!   `LayerTarget` (an `Adjustment` layer's intermediate), or a caller-owned view with its format
+//!   and extent (the stage's acquired swapchain image, whose layout the caller owns).
+//! - `StackInput` is one layer for the mask- and base-capable passes: the picture, its blend and
+//!   opacity, and the `Mask` layer's picture below it, whose luminance multiplies that opacity.
+//! - `Compositor::composite_over`/`composite_into` are `composite` with a base image to start from
+//!   and/or a mask per layer, in the same single pass. `composite` itself is the plain path,
+//!   unchanged down to its uniform writes.
+//! - `Compositor::supports_masks()` says whether the adapter has room for the masked pass (17
+//!   sampled images in one stage, one more than Vulkan guarantees).
 
 use std::fmt;
 
@@ -71,7 +84,7 @@ mod timing;
 pub mod upload;
 mod win;
 
-pub use compositor::Compositor;
+pub use compositor::{CompositeTarget, Compositor, StackInput};
 pub use device::submission_count;
 pub use device::{Gpu, GpuPreference};
 pub use flash::{FlashLimiter, FLASH_INTERVAL};
