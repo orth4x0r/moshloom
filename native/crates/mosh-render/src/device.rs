@@ -22,9 +22,11 @@ use crate::RenderError;
 /// semaphore. Never more: the stage is a 60 fps fullscreen window, not a throughput benchmark.
 pub const FRAMES_IN_FLIGHT: usize = 2;
 
-/// Draws recorded into one frame. 3 visualizer layers + an overlay is 4; effects and overlays
-/// that need more passes are recorded into their own targets, not into more slots of one frame.
-pub const MAX_DRAWS_PER_FRAME: usize = 64;
+/// Draws recorded into one frame, shared by every layer. A layer is several passes (a scene, its
+/// helpers such as 12 reaction-diffusion steps, mosh 2-3, effects 1, transition 1-2), and a fluid
+/// layer alone is 9 + up to 30 pressure iterations; 256 fits three heavy layers plus the overlay
+/// and the compositor with room to spare (the uniform ring is 256 x 2 x stride, a few hundred KB).
+pub const MAX_DRAWS_PER_FRAME: usize = 256;
 
 /// Upper bound on a per-draw uniform block. The web app's per-layer uniform block (T, hue,
 /// vari, dens, aux0..2, l0..l2, mel[24], palT/caT/melT/rdT, p0..p7) is 192 bytes.

@@ -226,7 +226,7 @@ pub const VISUALIZERS: &[VisualizerInfo] = &[
     VisualizerInfo {
         id: "fluid",
         name: "Fluid",
-        params: ["step (dt)", "viscosity", "hue", "vorticity", "kick impulse", "dye gain", "beat swirl", "reserved"],
+        params: ["viscosity", "dye amount", "force scale", "swirl", "colour cycle", "vorticity", "jacobi iterations", "dye fade"],
     },
 ];
 
