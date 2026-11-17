@@ -8,3 +8,12 @@ publish.workspace = true
 
 [dependencies]
 mosh-core = { path = "../mosh-core" }
+
+# Media Foundation source reader (Task 1.11). Every call lives in `src/win.rs`.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Media_MediaFoundation",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+] }

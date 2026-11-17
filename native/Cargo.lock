@@ -481,6 +481,7 @@ name = "mosh-video"
 version = "0.1.0"
 dependencies = [
  "mosh-core",
+ "windows",
 ]
 
 [[package]]
