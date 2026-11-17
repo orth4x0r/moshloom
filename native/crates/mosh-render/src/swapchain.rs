@@ -1,9 +1,9 @@
-//! The stage output: a surface on a window, a swapchain, and the recovery policy that keeps the
+﻿//! The stage output: a surface on a window, a swapchain, and the recovery policy that keeps the
 //! show running when the swapchain goes out of date or the surface is lost (a monitor unplugged
 //! mid-set, Review Focus item 5).
 //!
 //! The recovery logic lives in `SwapchainPolicy`, which takes Vulkan results and never touches a
-//! window — `tests/offscreen.rs::surface_lost_recreates_swapchain` drives it directly. `Stage`
+//! window â€” `tests/offscreen.rs::surface_lost_recreates_swapchain` drives it directly. `Stage`
 //! wraps it around real swapchain objects, which need a window and are therefore exercised by
 //! the app (Task 2.6) rather than here.
 //!
@@ -14,10 +14,9 @@ use ash::vk;
 use mosh_core::show::BlendMode;
 use raw_window_handle::RawWindowHandle;
 
-use crate::compositor::{Compositor, COMPOSITOR_UNIFORM_SIZE};
+use crate::compositor::Compositor;
 use crate::device::{Gpu, FRAMES_IN_FLIGHT};
-use crate::pipeline::Pipeline;
-use crate::target::{cmd_barrier, Barrier, LayerTarget, OutputImage};
+use crate::target::{cmd_barrier, Barrier, LayerTarget};
 use crate::timing::GpuTimings;
 use crate::win::module_handle;
 use crate::RenderError;
@@ -26,6 +25,10 @@ use crate::RenderError;
 /// only carries the choice, it does not switch display modes (Task 2.6 owns the window).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MonitorId(pub u32);
+
+/// The colour format the stage asks a surface for (the first one in this format wins, then the
+/// surface's own). It is the format the compositor writes, and the budget bench measures.
+pub const STAGE_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 
 /// What the stage reports after a frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -201,18 +204,12 @@ pub struct Stage {
     swapchain: Option<Swapchain>,
     policy: SwapchainPolicy,
     monitor: Option<MonitorId>,
-    present_pipeline: Option<Pipeline>,
+    /// Built for the swapchain's colour format: it composites straight into the presented image.
     compositor: Option<Compositor>,
-    output: Option<OutputImage>,
     image_available: [vk::Semaphore; FRAMES_IN_FLIGHT],
     render_finished: Vec<vk::Semaphore>,
-    present_pool: vk::DescriptorPool,
-    present_uniforms: Option<vk::DeviceMemory>,
-    present_uniform_buffer: vk::Buffer,
-    present_uniform_ptr: *mut u8,
     cmd_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
-    fence: vk::Fence,
     frame_index: usize,
     timings: GpuTimings,
     last_error: Option<String>,
@@ -267,18 +264,11 @@ impl Stage {
             swapchain: None,
             policy: SwapchainPolicy::new(),
             monitor: fullscreen_monitor,
-            present_pipeline: None,
             compositor: None,
-            output: None,
             image_available: [vk::Semaphore::null(); FRAMES_IN_FLIGHT],
             render_finished: Vec::new(),
-            present_pool: vk::DescriptorPool::null(),
-            present_uniforms: None,
-            present_uniform_buffer: vk::Buffer::null(),
-            present_uniform_ptr: std::ptr::null_mut(),
             cmd_pool: vk::CommandPool::null(),
             cmd: vk::CommandBuffer::null(),
-            fence: vk::Fence::null(),
             frame_index: 0,
             timings: GpuTimings::default(),
             last_error: None,
@@ -288,39 +278,6 @@ impl Stage {
             unsafe { gpu.dev.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)? },
             unsafe { gpu.dev.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)? },
         ];
-        stage.compositor = Some(Compositor::new(gpu)?);
-
-        let pool_sizes = [
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
-                .descriptor_count(1),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(1),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::SAMPLER)
-                .descriptor_count(1),
-        ];
-        stage.present_pool = unsafe {
-            gpu.dev.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1)
-                    .pool_sizes(&pool_sizes),
-                None,
-            )?
-        };
-        let (buffer, memory) = crate::device::create_buffer(
-            &gpu.dev,
-            &gpu.memory,
-            256,
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        stage.present_uniform_buffer = buffer;
-        stage.present_uniforms = Some(memory);
-        stage.present_uniform_ptr = unsafe {
-            gpu.dev.map_memory(memory, 0, 256, vk::MemoryMapFlags::empty())?
-        } as *mut u8;
 
         stage.cmd_pool = unsafe {
             gpu.dev.create_command_pool(
@@ -338,8 +295,6 @@ impl Stage {
                     .command_buffer_count(1),
             )?
         }[0];
-        stage.fence =
-            unsafe { gpu.dev.create_fence(&vk::FenceCreateInfo::default(), None)? };
 
         if !stage.recreate(gpu) {
             let error = stage
@@ -366,6 +321,12 @@ impl Stage {
         }
     }
 
+    /// The size the compositor works at: the swapchain's. Kept for the stats overlay and for
+    /// callers that need to know what the presented frame's size is.
+    pub fn composite_extent(&self) -> [u32; 2] {
+        self.extent()
+    }
+
     /// Timings of the last presented frame.
     pub fn timings(&self) -> &GpuTimings {
         &self.timings
@@ -384,7 +345,10 @@ impl Stage {
     /// Composites `recorder`'s layers and presents one frame.
     ///
     /// The recorder's GPU work is submitted and waited for first, so the layers are readable
-    /// when the compositor samples them.
+    /// when the compositor samples them. The composite itself is the first pass of the present
+    /// submission and writes the acquired swapchain image directly: no offscreen copy of the
+    /// frame is made, so a four-layer frame writes the output once (V-budget: it used to be a
+    /// full 16F composite plus a blit, 1.2 ms at 1080p).
     pub fn present(&mut self, recorder: crate::pipeline::FrameRecorder<'_>) -> PresentResult {
         let gpu = recorder.gpu();
         let layers: Vec<(&LayerTarget, BlendMode, f32)> = recorder.layers().to_vec();
@@ -406,26 +370,7 @@ impl Stage {
             }
         };
 
-        // Composite into the offscreen output, then draw that into the swapchain image: the
-        // swapchain format is the window's, the compositor always works in RGBA16F.
-        let composited = match (self.compositor.as_mut(), self.output.as_ref()) {
-            (Some(compositor), Some(output)) => match compositor.composite(&layers, output) {
-                Ok(()) => true,
-                Err(error) => {
-                    self.last_error = Some(error.to_string());
-                    false
-                }
-            },
-            _ => false,
-        };
-
-        // Present even when compositing failed: an acquired image that is never presented
-        // eventually starves the swapchain, and the stage must not show a frozen window while
-        // the app recovers. With no output image the pass is a plain black clear.
-        let output = if composited { self.output.take() } else { None };
-        let presented = self.present_image(image_index, output.as_ref());
-        self.output = output;
-        if let Err(error) = presented {
+        if let Err(error) = self.present_image(image_index, &layers) {
             self.last_error = Some(error.to_string());
         }
         self.frame_index = (self.frame_index + 1) % FRAMES_IN_FLIGHT;
@@ -479,7 +424,7 @@ impl Stage {
             };
             let format = formats
                 .iter()
-                .find(|format| format.format == vk::Format::B8G8R8A8_SRGB)
+                .find(|format| format.format == STAGE_FORMAT)
                 .or_else(|| formats.first())
                 .copied()
                 .ok_or(RenderError::SurfaceUnsupported)?;
@@ -596,25 +541,20 @@ impl Stage {
         }
         self.render_finished = render_finished;
 
-        // Present pipeline for this swapchain's format, and the output image at its size.
+        // The compositor writes this swapchain's colour format, so the composite pass is the
+        // present pass: no offscreen copy of the frame.
         let format = swapchain.format;
         let extent = [swapchain.extent.width, swapchain.extent.height];
         self.swapchain = Some(swapchain);
 
-        let pipeline_matches = self
-            .present_pipeline
+        let compositor_matches = self
+            .compositor
             .as_ref()
-            .map(|pipeline| pipeline.color_format() == format)
+            .map(|compositor| compositor.format() == format)
             .unwrap_or(false);
-        if !pipeline_matches {
-            match Pipeline::fullscreen_with_format(
-                gpu,
-                crate::shaders::COMPOSITOR_FRAG,
-                COMPOSITOR_UNIFORM_SIZE,
-                1,
-                format,
-            ) {
-                Ok(pipeline) => self.present_pipeline = Some(pipeline.with_name("stage.present")),
+        if !compositor_matches {
+            match Compositor::new_for_format(gpu, format) {
+                Ok(compositor) => self.compositor = Some(compositor),
                 Err(error) => {
                     self.last_error = Some(error.to_string());
                     self.destroy_swapchain();
@@ -622,14 +562,6 @@ impl Stage {
                     return false;
                 }
             }
-        }
-        let needs_output = self
-            .output
-            .as_ref()
-            .map(|output| output.width() != extent[0] || output.height() != extent[1])
-            .unwrap_or(true);
-        if needs_output {
-            self.output = Some(OutputImage::new(gpu, extent[0], extent[1]));
         }
         self.policy.complete_recreate(extent)
     }
@@ -656,82 +588,27 @@ impl Stage {
         None
     }
 
-    /// Draws the composited output into the acquired image and presents it.
+    /// Composites `layers` into the acquired image and presents it.
     ///
-    /// `output` is `None` when compositing failed: the image is cleared to black and presented
-    /// anyway, so an acquired image never starves the swapchain.
+    /// Compositing failed (or there is no compositor): the image is cleared to black and
+    /// presented anyway, so an acquired image never starves the swapchain and the stage never
+    /// freezes while the app recovers.
     fn present_image(
         &mut self,
         image_index: u32,
-        output: Option<&OutputImage>,
+        layers: &[(&LayerTarget, BlendMode, f32)],
     ) -> Result<(), RenderError> {
-        let (handle, extent, view, old_layout) = {
+        let (handle, extent, view, image, old_layout) = {
             let swapchain = self.swapchain.as_ref().ok_or(RenderError::ZeroSized)?;
             let index = image_index as usize;
             (
                 swapchain.handle,
                 swapchain.extent,
                 *swapchain.views.get(index).ok_or(RenderError::ZeroSized)?,
+                *swapchain.images.get(index).ok_or(RenderError::ZeroSized)?,
                 swapchain.layouts.get(index).copied().unwrap_or(vk::ImageLayout::UNDEFINED),
             )
         };
-        let pipeline = self
-            .present_pipeline
-            .as_ref()
-            .ok_or(RenderError::MissingFeature("present pipeline"))?;
-
-        // Present uniform block: opacity 1, no keying.
-        {
-            let mut block = [0u8; COMPOSITOR_UNIFORM_SIZE];
-            block[0..4].copy_from_slice(&1.0f32.to_le_bytes());
-            unsafe {
-                std::ptr::write_bytes(self.present_uniform_ptr, 0, 256);
-                std::ptr::copy_nonoverlapping(
-                    block.as_ptr(),
-                    self.present_uniform_ptr,
-                    block.len(),
-                );
-            }
-        }
-
-        let mut presented_set = None;
-        if let Some(output) = output {
-            let set = unsafe {
-                self.device.reset_descriptor_pool(
-                    self.present_pool,
-                    vk::DescriptorPoolResetFlags::empty(),
-                )?;
-                let set_layouts = [pipeline.set_layout()];
-                self.device.allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(self.present_pool)
-                        .set_layouts(&set_layouts),
-                )?[0]
-            };
-            let buffer_info = [vk::DescriptorBufferInfo::default()
-                .buffer(self.present_uniform_buffer)
-                .offset(0)
-                .range(COMPOSITOR_UNIFORM_SIZE as u64)];
-            let image_info = [vk::DescriptorImageInfo::default()
-                .image_view(output.view())
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let writes = [
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
-                    .buffer_info(&buffer_info),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(&image_info),
-            ];
-            unsafe {
-                self.device.update_descriptor_sets(&writes, &[]);
-            }
-            presented_set = Some(set);
-        }
 
         unsafe {
             self.device
@@ -742,11 +619,6 @@ impl Stage {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
 
-            let image = self
-                .swapchain
-                .as_ref()
-                .and_then(|swapchain| swapchain.images.get(image_index as usize).copied())
-                .ok_or(RenderError::ZeroSized)?;
             cmd_barrier(
                 &self.device,
                 self.cmd,
@@ -760,13 +632,19 @@ impl Stage {
                     dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
                 },
             );
+        }
 
-            let render_area = vk::Rect2D::default().extent(extent);
-            let viewport = vk::Viewport::default()
-                .width(extent.width as f32)
-                .height(extent.height as f32)
-                .min_depth(0.0)
-                .max_depth(1.0);
+        // The composite pass writes the swapchain image directly, cleared to black first.
+        let composited = match self.compositor.as_ref() {
+            Some(compositor) => compositor
+                .record_into(self.cmd, layers, view, extent)
+                .inspect_err(|error| self.last_error = Some(error.to_string()))
+                .is_ok(),
+            None => false,
+        };
+        if !composited {
+            // A black clear beats a frozen window: one dynamic-rendering pass with a clear and no
+            // draw. It uses the layout the image is already in.
             let clear = vk::ClearValue {
                 color: vk::ClearColorValue {
                     float32: [0.0, 0.0, 0.0, 1.0],
@@ -779,33 +657,19 @@ impl Stage {
                 .store_op(vk::AttachmentStoreOp::STORE)
                 .clear_value(clear);
             let attachments = [attachment];
-            self.device.cmd_begin_rendering(
-                self.cmd,
-                &vk::RenderingInfo::default()
-                    .render_area(render_area)
-                    .layer_count(1)
-                    .color_attachments(&attachments),
-            );
-            if let Some(set) = presented_set {
-                self.device.cmd_bind_pipeline(
+            unsafe {
+                self.device.cmd_begin_rendering(
                     self.cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline.raw(),
+                    &vk::RenderingInfo::default()
+                        .render_area(vk::Rect2D::default().extent(extent))
+                        .layer_count(1)
+                        .color_attachments(&attachments),
                 );
-                self.device.cmd_set_viewport(self.cmd, 0, &[viewport]);
-                self.device.cmd_set_scissor(self.cmd, 0, &[render_area]);
-                self.device.cmd_bind_descriptor_sets(
-                    self.cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline.pipeline_layout(),
-                    0,
-                    &[set],
-                    &[0],
-                );
-                self.device.cmd_draw(self.cmd, 3, 1, 0, 0);
+                self.device.cmd_end_rendering(self.cmd);
             }
-            self.device.cmd_end_rendering(self.cmd);
+        }
 
+        unsafe {
             cmd_barrier(
                 &self.device,
                 self.cmd,
@@ -872,8 +736,6 @@ impl Stage {
                     .destroy_swapchain(swapchain.handle, None);
             }
         }
-        // The output image is sized like the swapchain; drop it so a rebuild makes a new one.
-        self.output = None;
         self.destroy_render_finished();
     }
 
@@ -890,24 +752,12 @@ impl Stage {
             let _ = self.device.device_wait_idle();
         }
         self.destroy_swapchain();
-        self.present_pipeline = None;
         self.compositor = None;
         unsafe {
             for semaphore in self.image_available {
                 if semaphore != vk::Semaphore::null() {
                     self.device.destroy_semaphore(semaphore, None);
                 }
-            }
-            if self.present_pool != vk::DescriptorPool::null() {
-                self.device.destroy_descriptor_pool(self.present_pool, None);
-            }
-            if let Some(memory) = self.present_uniforms.take() {
-                self.device.unmap_memory(memory);
-                self.device.destroy_buffer(self.present_uniform_buffer, None);
-                self.device.free_memory(memory, None);
-            }
-            if self.fence != vk::Fence::null() {
-                self.device.destroy_fence(self.fence, None);
             }
             if self.cmd_pool != vk::CommandPool::null() {
                 self.device.destroy_command_pool(self.cmd_pool, None);

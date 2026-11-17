@@ -12,8 +12,12 @@
 //! State is keyed by the `layer` index `apply` is given and created lazily, at the internal size
 //! passed to [`MoshPass::new`]:
 //!
-//! * `previous`: a copy of last frame's input. A `LayerTarget` is a ping-pong pair whose readable
-//!   image is this frame's, so block matching needs its own previous frame.
+//! * `grid`: the analysis-grid copy of the picture, two `LayerTarget`s alternating, so one holds
+//!   this frame and the other last frame. Block matching runs on the web's fixed 320x180 grid
+//!   whatever the layer's internal size, so a 320x180 copy is all it needs: one cheap pass per
+//!   layer per frame (`mosh_grid.wgsl`) and then cache-resident reads, instead of sampling a
+//!   4-8 MB picture at grid coordinates and keeping a full-size previous frame (V-budget: the
+//!   motion pass measured 4.1 ms per frame at 1080p, and the previous-frame copy 0.46 ms).
 //! * `motion`: 40x23 vectors, one per 8x8 block of the analysis grid (the web's `mvT`), so it
 //!   costs the same at every internal size.
 //! * the feedback buffer is `dst`'s own previous image: the mosh stage is the only writer of
@@ -75,11 +79,13 @@ const MIN_REFRESH: f32 = 0.004;
 const MOTION_UNIFORM_BYTES: usize = 16;
 const FEEDBACK_UNIFORM_BYTES: usize = 32;
 const COPY_UNIFORM_BYTES: usize = 16;
+const GRID_UNIFORM_BYTES: usize = 16;
 
 pub struct MoshPass {
     width: u32,
     height: u32,
     copy: Pipeline,
+    grid: Pipeline,
     motion: Pipeline,
     feedback: Pipeline,
     /// Bound in the feedback pass's fourth texture slot when no fluid layer is running.
@@ -89,8 +95,10 @@ pub struct MoshPass {
 
 /// One layer's feedback state. Created on the first `apply` for that layer.
 struct LayerState {
-    /// Last frame's input, for block matching (`previous.front`).
-    previous: LayerTarget,
+    /// The analysis-grid picture, this frame and last frame (see `grid_front`).
+    grids: [LayerTarget; 2],
+    /// Which of `grids` holds last frame's picture.
+    grid_front: usize,
     /// 40x23 displacement field, RG = grid pixels per frame, forward.
     motion: LayerTarget,
     last_time_s: f64,
@@ -99,9 +107,13 @@ struct LayerState {
 }
 
 impl LayerState {
-    fn new(gpu: &Gpu, width: u32, height: u32) -> LayerState {
+    fn new(gpu: &Gpu) -> LayerState {
         LayerState {
-            previous: LayerTarget::new(gpu, width, height),
+            grids: [
+                LayerTarget::new(gpu, GRID[0] as u32, GRID[1] as u32),
+                LayerTarget::new(gpu, GRID[0] as u32, GRID[1] as u32),
+            ],
+            grid_front: 0,
             motion: LayerTarget::new(gpu, MOTION_WIDTH, MOTION_HEIGHT),
             last_time_s: f64::NAN,
             valid: false,
@@ -130,14 +142,19 @@ impl MoshPass {
     /// keyed by the layer index passed to `apply`.
     pub fn new(gpu: &Gpu, width: u32, height: u32) -> Result<MoshPass, RenderError> {
         assert!(width > 0 && height > 0, "mosh pass needs a non-zero size");
-        let motion_shader = spirv("mosh_motion").ok_or(RenderError::EmptyShader)?;
+        // `mosh_motion_fast` is `mosh_motion` with a 4x4 block subsample (see the shader): the
+        // exhaustive +-6 search stays, the sample count drops 4x.
+        let motion_shader = spirv("mosh_motion_fast").ok_or(RenderError::EmptyShader)?;
         let feedback_shader = spirv("mosh_feedback").ok_or(RenderError::EmptyShader)?;
         let copy_shader = spirv("mosh_copy").ok_or(RenderError::EmptyShader)?;
+        let grid_shader = spirv("mosh_grid").ok_or(RenderError::EmptyShader)?;
         Ok(MoshPass {
             width,
             height,
             copy: Pipeline::fullscreen(gpu, copy_shader, COPY_UNIFORM_BYTES, 1)?
                 .with_name("mosh copy"),
+            grid: Pipeline::fullscreen(gpu, grid_shader, GRID_UNIFORM_BYTES, 1)?
+                .with_name("mosh grid"),
             motion: Pipeline::fullscreen(gpu, motion_shader, MOTION_UNIFORM_BYTES, 2)?
                 .with_name("mosh motion"),
             feedback: Pipeline::fullscreen(gpu, feedback_shader, FEEDBACK_UNIFORM_BYTES, 4)?
@@ -170,7 +187,7 @@ impl MoshPass {
         }
         let (width, height) = (self.width, self.height);
         if self.layers[layer].is_none() {
-            self.layers[layer] = Some(LayerState::new(rec.gpu(), width, height));
+            self.layers[layer] = Some(LayerState::new(rec.gpu()));
         }
         debug_assert_eq!(
             (dst.width(), dst.height()),
@@ -180,14 +197,20 @@ impl MoshPass {
 
         // Fields are borrowed one by one: the pipelines are immutable and the layer state is
         // mutable, and the recorder needs `&mut` for the duration.
-        let (copy, motion, feedback, no_flow) =
-            (&self.copy, &self.motion, &self.feedback, &self.no_flow);
+        let (copy, grid, motion, feedback, no_flow) =
+            (&self.copy, &self.grid, &self.motion, &self.feedback, &self.no_flow);
         let state = self.layers[layer]
             .as_mut()
             .expect("layer state just created");
         let res = [width as f32, height as f32];
         let iframe = iframe_due(state.valid, state.last_time_s, frame);
         let copy_uniform = copy_uniform(res);
+        let grid_uniform = motion_uniform(GRID);
+
+        // This frame's analysis grid, then block matching against last frame's grid: the copy is
+        // 320x180 whatever the layer size, so the motion pass reads a cache-resident pair.
+        let next_grid = 1 - state.grid_front;
+        rec.draw(grid, &state.grids[next_grid], &grid_uniform, &[src])?;
 
         if iframe {
             rec.draw(copy, dst, &copy_uniform, &[src])?;
@@ -197,7 +220,7 @@ impl MoshPass {
                 motion,
                 &state.motion,
                 &motion_uniform,
-                &[src, &state.previous],
+                &[&state.grids[next_grid], &state.grids[state.grid_front]],
             )?;
             let feedback_uniform = feedback_uniform(res, amount, GRID);
             let flow = extra_flow.unwrap_or(no_flow);
@@ -208,8 +231,7 @@ impl MoshPass {
                 &[src, dst, &state.motion, flow],
             )?;
         }
-        // Last frame's input for the next call, after the motion pass has read the old one.
-        rec.draw(copy, &state.previous, &copy_uniform, &[src])?;
+        state.grid_front = next_grid;
 
         state.valid = true;
         state.last_time_s = frame.time_s;

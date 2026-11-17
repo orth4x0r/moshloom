@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ash::vk;
 
 use crate::RenderError;
-use crate::device::{FRAMES_IN_FLIGHT, Gpu, MappedBuffer, create_buffer};
+use crate::device::{FRAMES_IN_FLIGHT, Gpu, MappedBuffer};
 use crate::pipeline::{FrameRecorder, Pipeline};
 use crate::target::LayerTarget;
 
@@ -72,6 +72,7 @@ fn count_allocation() {
 /// flight, and the layout the image is in between copies.
 pub struct VideoTexture {
     device: ash::Device,
+    allocations: crate::device::Allocations,
     width: u32,
     height: u32,
     image: vk::Image,
@@ -99,6 +100,7 @@ impl VideoTexture {
         let staging = mapped_staging(gpu, texels(width, height) * 4)?;
         Ok(VideoTexture {
             device: gpu.dev.clone(),
+            allocations: gpu.allocations(),
             width,
             height,
             image,
@@ -224,10 +226,12 @@ impl VideoTexture {
                 self.device.destroy_image_view(self.view, None);
                 self.device.destroy_image(self.image, None);
                 self.device.free_memory(self.memory, None);
+                self.allocations.release(self.memory);
                 for staging in &self.staging {
                     self.device.unmap_memory(staging.memory);
                     self.device.destroy_buffer(staging.buffer, None);
                     self.device.free_memory(staging.memory, None);
+                    self.allocations.release(staging.memory);
                 }
                 self.staging.clear();
                 self.view = vk::ImageView::null();
@@ -325,9 +329,7 @@ fn texels(width: u32, height: u32) -> u64 {
 fn mapped_staging(gpu: &Gpu, bytes: u64) -> Result<Vec<MappedBuffer>, RenderError> {
     let mut buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
     for _ in 0..FRAMES_IN_FLIGHT {
-        let (buffer, memory) = create_buffer(
-            &gpu.dev,
-            &gpu.memory,
+        let (buffer, memory) = gpu.new_buffer(
             bytes,
             vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,

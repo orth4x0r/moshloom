@@ -21,6 +21,12 @@ pub enum Stage {
 }
 
 /// Per-layer GPU state: one scene target and three post targets at the layer's internal size.
+///
+/// The scene target and the transition target hold one image each: no pass samples them while
+/// writing them (the scene pass reads the palette, the mel history and the reaction-diffusion
+/// state, never its own previous frame; the transition blends its saved "from" picture with the
+/// previous stage's output). The mosh and effects targets keep a ping-pong pair because that is
+/// where the feedback and echo history live.
 pub struct LayerSlot {
     pub layer: usize,
     pub scene: LayerTarget,
@@ -38,11 +44,11 @@ impl LayerSlot {
     pub fn new(gpu: &Gpu, layer: usize, width: u32, height: u32) -> LayerSlot {
         LayerSlot {
             layer,
-            scene: LayerTarget::new(gpu, width, height),
+            scene: LayerTarget::new_single(gpu, width, height),
             post: [
                 LayerTarget::new(gpu, width, height),
                 LayerTarget::new(gpu, width, height),
-                LayerTarget::new(gpu, width, height),
+                LayerTarget::new_single(gpu, width, height),
             ],
             output_stage: Stage::Scene,
             last_output_stage: Stage::Scene,

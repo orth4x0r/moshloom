@@ -334,10 +334,13 @@ fn velocity_available_after_draw() {
 
     render(&gpu, &mut fluid, &dst, &quiet(), &params, 0.0);
     let velocity = fluid.velocity().expect("field after one draw");
+    // The field used to be a target at the layer's size; it is written at the solver grid now
+    // (V-budget: 0.15 ms and 8 MB per layer became 0.006 ms and 0.9 MB). Its *units* are still
+    // the layer's pixels per draw, which is what the mosh shader divides by its own resolution.
     assert_eq!(
         (velocity.width(), velocity.height()),
-        (TEST_WIDTH, TEST_HEIGHT),
-        "the field is at the layers' internal size"
+        (GRID_WIDTH, GRID_HEIGHT),
+        "the field is at the solver grid"
     );
     let still = gpu.read_back(velocity);
     assert!(

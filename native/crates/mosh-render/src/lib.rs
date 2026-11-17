@@ -62,6 +62,7 @@ use std::fmt;
 mod compositor;
 mod device;
 mod flash;
+pub mod pace;
 mod pipeline;
 mod shaders;
 mod swapchain;
@@ -74,8 +75,11 @@ pub use compositor::Compositor;
 pub use device::submission_count;
 pub use device::{Gpu, GpuPreference};
 pub use flash::{FlashLimiter, FLASH_INTERVAL};
+pub use pace::{FramePacer, WaitTimer, DEFAULT_MAX_FPS};
 pub use pipeline::{FrameRecorder, Pipeline};
-pub use swapchain::{MonitorId, PresentResult, Stage, SwapchainAction, SwapchainPolicy};
+pub use swapchain::{
+    MonitorId, PresentResult, Stage, SwapchainAction, SwapchainPolicy, STAGE_FORMAT,
+};
 pub use target::{LayerTarget, OutputImage};
 pub use timing::{FrameTicket, GpuTimings};
 pub use upload::{CoverPass, VideoTexture};

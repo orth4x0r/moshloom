@@ -25,7 +25,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use mosh_core::{AnalysisFrame, Clip, ControlEvent, Layer, Project, RenderPlan, ShowMode};
-use mosh_render::{FrameRecorder, Gpu, GpuPreference, RenderError, Stage};
+use mosh_render::{FramePacer, FrameRecorder, Gpu, GpuPreference, RenderError, Stage, WaitTimer};
 use mosh_visuals::{LayerSlot, Visuals};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -320,6 +320,13 @@ struct RenderThread {
     rx: Receiver<Command>,
     proxy: EventLoopProxy<UserEvent>,
     budget: BudgetWatch,
+    /// The frame rate cap: the stage renders at most this many frames a second whatever the
+    /// display's refresh is (the reference panel is 120 Hz).
+    pacer: FramePacer,
+    /// The wait the pacer's deadlines use: a high-resolution waitable timer, because the system
+    /// tick would turn a 16.6 ms wait into 31 ms.
+    timer: WaitTimer,
+    paced_frames: u64,
     started: Instant,
     last_status: Option<Instant>,
     last_error: Option<(Instant, String)>,
@@ -327,6 +334,7 @@ struct RenderThread {
 }
 
 impl RenderThread {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         project: Project,
         handle: Option<WindowHandle>,
@@ -334,6 +342,7 @@ impl RenderThread {
         monitor: Option<u32>,
         rx: Receiver<Command>,
         proxy: EventLoopProxy<UserEvent>,
+        fps: u32,
     ) -> RenderThread {
         let project_layers = project.session.layers.clone();
         RenderThread {
@@ -347,6 +356,9 @@ impl RenderThread {
             rx,
             proxy,
             budget: BudgetWatch::new(),
+            pacer: FramePacer::new(fps),
+            timer: WaitTimer::new(),
+            paced_frames: 0,
             started: Instant::now(),
             last_status: None,
             last_error: None,
@@ -418,8 +430,21 @@ impl RenderThread {
         }
     }
 
-    /// One frame: analyse, decide, draw, present, report.
+    /// One frame: wait for its slot, analyse, decide, draw, present, report.
+    ///
+    /// The wait is the frame rate cap. `Stage::present` presents in FIFO, so the display paces
+    /// the loop: at 120 Hz a free-running loop draws 120 frames a second, twice the rate the
+    /// budget is written for and twice the GPU time per second. The pacer waits out the rest of
+    /// the frame's interval (16.67 ms at 60 fps) with a high-resolution timer, never a spin.
     fn frame(&mut self) {
+        if self.pacer.is_capped() {
+            let wait = self.pacer.wait_for(Instant::now());
+            if !wait.is_zero() {
+                self.timer.wait(wait);
+                self.pacer.resync_if_stalled(Instant::now());
+                self.paced_frames += 1;
+            }
+        }
         let frame_start = Instant::now();
         let frame = self.core.step(frame_start);
 
@@ -617,6 +642,9 @@ struct Shell {
     monitor_list: Vec<MonitorInfo>,
     placement: Option<StagePlacement>,
     render: Option<RenderHandle>,
+    /// The stage's frame rate cap (`--fps`, default 60): a 120 Hz panel would otherwise draw
+    /// twice the frames the budget is written for.
+    fps: u32,
     title: Option<String>,
     last_title_at: Option<Instant>,
     last_status_paint: Option<Instant>,
@@ -625,7 +653,12 @@ struct Shell {
 }
 
 impl Shell {
-    fn new(project: Project, note: Option<String>, proxy: EventLoopProxy<UserEvent>) -> Shell {
+    fn new(
+        project: Project,
+        note: Option<String>,
+        proxy: EventLoopProxy<UserEvent>,
+        fps: u32,
+    ) -> Shell {
         Shell {
             model: EditorModel::new(project),
             editor_ui: EditorUi::default(),
@@ -637,6 +670,7 @@ impl Shell {
             monitor_list: Vec::new(),
             placement: None,
             render: None,
+            fps,
             title: None,
             last_title_at: None,
             last_status_paint: None,
@@ -847,10 +881,12 @@ impl Shell {
         let project = self.model.project().clone();
         let monitor = self.placement.and_then(StagePlacement::monitor);
         let proxy = self.proxy.clone();
+        let fps = self.fps;
         match std::thread::Builder::new()
             .name("mosh-render".into())
-            .spawn(move || render_main(RenderThread::new(project, handle, size, monitor, rx, proxy)))
-        {
+            .spawn(move || {
+                render_main(RenderThread::new(project, handle, size, monitor, rx, proxy, fps))
+            }) {
             Ok(thread) => {
                 self.render = Some(RenderHandle {
                     tx,
@@ -940,6 +976,15 @@ impl ApplicationHandler<UserEvent> for Shell {
         if let Some(note) = self.note.clone() {
             self.log(note);
         }
+        self.log(if self.fps == 0 {
+            "stage frame rate: uncapped (FIFO, the panel's refresh)".to_string()
+        } else {
+            format!(
+                "stage frame rate: at most {} fps (--fps, default {}), whatever the panel's refresh",
+                self.fps,
+                mosh_render::DEFAULT_MAX_FPS
+            )
+        });
         self.refresh_monitors(event_loop);
         self.create_control_window(event_loop);
         self.create_stage(event_loop);
@@ -1094,7 +1139,8 @@ impl ApplicationHandler<UserEvent> for Shell {
 
 /// Run the app: the project from the first argument, or the default Autopilot show.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args().nth(1);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (path, fps) = parse_args(&args);
     let (project, note) = match path.as_deref() {
         None => (default_project(), None),
         Some(path) => match mosh_show::io::load(path) {
@@ -1111,8 +1157,63 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
-    let mut shell = Shell::new(project, note, proxy);
+    let mut shell = Shell::new(project, note, proxy, fps);
     event_loop.run_app(&mut shell)?;
     shell.shutdown();
     Ok(())
+}
+
+/// The command line: `ilanaVisual [project.ron] [--fps <n>]`.
+///
+/// `--fps` is the stage's frame rate cap, `0` for no cap; absent means
+/// [`mosh_render::DEFAULT_MAX_FPS`]. A cap is what keeps a 120 Hz panel from drawing 120 frames a
+/// second, which is twice the GPU time per second the design's budget is written for.
+pub fn parse_args(args: &[String]) -> (Option<String>, u32) {
+    let mut path = None;
+    let mut fps = mosh_render::DEFAULT_MAX_FPS;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--fps" => {
+                if let Some(value) = args.get(index + 1).and_then(|value| value.parse().ok()) {
+                    fps = value;
+                }
+                index += 2;
+            }
+            other => {
+                if path.is_none() {
+                    path = Some(other.to_string());
+                }
+                index += 1;
+            }
+        }
+    }
+    (path, fps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn the_frame_cap_is_a_setting_that_defaults_to_sixty() {
+        assert_eq!(parse_args(&args(&[])), (None, 60));
+        assert_eq!(parse_args(&args(&["show.ron"])), (Some("show.ron".into()), 60));
+        assert_eq!(
+            parse_args(&args(&["show.ron", "--fps", "30"])),
+            (Some("show.ron".into()), 30)
+        );
+        assert_eq!(
+            parse_args(&args(&["--fps", "120", "show.ron"])),
+            (Some("show.ron".into()), 120)
+        );
+        // 0 is the uncapped setting, and a missing or unreadable value leaves the default.
+        assert_eq!(parse_args(&args(&["--fps", "0"])), (None, 0));
+        assert_eq!(parse_args(&args(&["--fps"])), (None, 60));
+        assert_eq!(parse_args(&args(&["--fps", "fast"])), (None, 60));
+    }
 }

@@ -9,7 +9,7 @@ use std::cell::Cell;
 
 use ash::vk;
 
-use crate::device::{create_buffer, Gpu};
+use crate::device::{Allocations, create_buffer, Gpu};
 
 /// Layer targets are half float: a feedback chain that adds a few percent per frame bands badly
 /// in 8 bits, and the compositor has the bandwidth for it at these resolutions.
@@ -119,11 +119,18 @@ struct ImagePair {
 
 /// A layer's render target: two RGBA16F images that alternate, so a fragment shader can read
 /// the previous frame (feedback, mosh, motion) while writing the current one.
+///
+/// A target that no pass reads while writing it (a scene's picture before its post chain, a
+/// transition's own output) can be [`LayerTarget::new_single`]: one image, half the memory. At
+/// 2560x1600 with four layers that is 62 MB of the budget.
 pub struct LayerTarget {
     device: ash::Device,
+    allocations: Allocations,
     pair: ImagePair,
     layouts: [Cell<vk::ImageLayout>; 2],
     front: Cell<usize>,
+    /// One image instead of a ping-pong pair: `back_*` is `front_*` and `swap` does nothing.
+    single: bool,
     width: u32,
     height: u32,
 }
@@ -135,6 +142,17 @@ impl LayerTarget {
     /// target cannot render the show either, so this panics rather than threading a `Result`
     /// through every caller. Layer sizes come from the project, not from user input.
     pub fn new(gpu: &Gpu, width: u32, height: u32) -> LayerTarget {
+        LayerTarget::new_with_images(gpu, width, height, 2)
+    }
+
+    /// A target with one image: for a stage whose output no pass samples while writing it (a
+    /// scene's picture before its post chain, a transition's own output). Half the memory of a
+    /// ping-pong pair, which at 2560x1600 is 7.8 MB per target.
+    pub fn new_single(gpu: &Gpu, width: u32, height: u32) -> LayerTarget {
+        LayerTarget::new_with_images(gpu, width, height, 1)
+    }
+
+    fn new_with_images(gpu: &Gpu, width: u32, height: u32, count: usize) -> LayerTarget {
         assert!(width > 0 && height > 0, "layer target needs a non-zero size");
         let extent = vk::Extent2D { width, height };
         let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
@@ -145,7 +163,7 @@ impl LayerTarget {
         let mut images = [vk::Image::null(); 2];
         let mut memories = [vk::DeviceMemory::null(); 2];
         let mut views = [vk::ImageView::null(); 2];
-        for index in 0..2 {
+        for index in 0..count {
             let (image, memory) = gpu
                 .create_image(extent, OFFSCREEN_FORMAT, usage)
                 .expect("allocate layer target image");
@@ -161,13 +179,14 @@ impl LayerTarget {
             Cell::new(vk::ImageLayout::UNDEFINED),
             Cell::new(vk::ImageLayout::UNDEFINED),
         ];
-        clear_pair(gpu, &images);
-        for layout in &layouts {
+        clear_pair(gpu, &images[..count]);
+        for layout in layouts.iter().take(count) {
             layout.set(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         }
 
         LayerTarget {
             device: gpu.dev.clone(),
+            allocations: gpu.allocations(),
             pair: ImagePair {
                 images,
                 memories,
@@ -175,6 +194,7 @@ impl LayerTarget {
             },
             layouts,
             front: Cell::new(0),
+            single: count == 1,
             width,
             height,
         }
@@ -186,6 +206,11 @@ impl LayerTarget {
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    /// True when this target has one image (see [`LayerTarget::new_single`]).
+    pub fn is_single(&self) -> bool {
+        self.single
     }
 
     pub fn format(&self) -> vk::Format {
@@ -204,21 +229,32 @@ impl LayerTarget {
         self.layouts[self.front.get()].get()
     }
 
+    /// The index a pass writes: the other image, or the same one for a single-image target.
+    fn back_index(&self) -> usize {
+        if self.single {
+            self.front.get()
+        } else {
+            1 - self.front.get()
+        }
+    }
+
     pub(crate) fn back_image(&self) -> vk::Image {
-        self.pair.images[1 - self.front.get()]
+        self.pair.images[self.back_index()]
     }
 
     pub(crate) fn back_view(&self) -> vk::ImageView {
-        self.pair.views[1 - self.front.get()]
+        self.pair.views[self.back_index()]
     }
 
     pub(crate) fn set_back_layout(&self, layout: vk::ImageLayout) {
-        self.layouts[1 - self.front.get()].set(layout);
+        self.layouts[self.back_index()].set(layout);
     }
 
-    /// Makes the image just written the readable one.
+    /// Makes the image just written the readable one (nothing to do with a single image).
     pub(crate) fn swap(&self) {
-        self.front.set(1 - self.front.get());
+        if !self.single {
+            self.front.set(1 - self.front.get());
+        }
     }
 }
 
@@ -226,28 +262,47 @@ impl Drop for LayerTarget {
     fn drop(&mut self) {
         unsafe {
             for index in 0..2 {
+                if self.pair.images[index] == vk::Image::null() {
+                    continue;
+                }
                 self.device.destroy_image_view(self.pair.views[index], None);
                 self.device.destroy_image(self.pair.images[index], None);
                 self.device.free_memory(self.pair.memories[index], None);
+                self.allocations.release(self.pair.memories[index]);
             }
         }
     }
 }
 
-/// The compositor's destination, and the stage's source: one RGBA16F image, sized like the
-/// output. `Stage` owns one at swapchain size; tests own small ones.
+/// The compositor's destination: one image in a colour format, sized like the composite.
+/// `Stage` composites straight into a swapchain image and does not own one of these; tests and
+/// the budget bench do.
 pub struct OutputImage {
     device: ash::Device,
+    allocations: Allocations,
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
+    format: vk::Format,
     layout: Cell<vk::ImageLayout>,
     width: u32,
     height: u32,
 }
 
 impl OutputImage {
+    /// An offscreen RGBA16F output (what the tests and the budget bench read back).
     pub fn new(gpu: &Gpu, width: u32, height: u32) -> OutputImage {
+        OutputImage::new_with_format(gpu, width, height, OFFSCREEN_FORMAT)
+    }
+
+    /// An output in `format`: the stage's swapchain format, so a composite can be measured
+    /// writing the same 8-bit target it writes on screen.
+    pub fn new_with_format(
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    ) -> OutputImage {
         assert!(width > 0 && height > 0, "output image needs a non-zero size");
         let extent = vk::Extent2D { width, height };
         let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
@@ -255,17 +310,19 @@ impl OutputImage {
             | vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::TRANSFER_DST;
         let (image, memory) = gpu
-            .create_image(extent, OFFSCREEN_FORMAT, usage)
+            .create_image(extent, format, usage)
             .expect("allocate output image");
         let view = gpu
-            .create_image_view(image, OFFSCREEN_FORMAT)
+            .create_image_view(image, format)
             .expect("create output view");
         clear_pair(gpu, &[image]);
         OutputImage {
             device: gpu.dev.clone(),
+            allocations: gpu.allocations(),
             image,
             memory,
             view,
+            format,
             layout: Cell::new(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
             width,
             height,
@@ -278,6 +335,11 @@ impl OutputImage {
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    /// The colour format this image was created with.
+    pub fn format(&self) -> vk::Format {
+        self.format
     }
 
     pub(crate) fn image(&self) -> vk::Image {
@@ -303,6 +365,7 @@ impl Drop for OutputImage {
             self.device.destroy_image_view(self.view, None);
             self.device.destroy_image(self.image, None);
             self.device.free_memory(self.memory, None);
+            self.allocations.release(self.memory);
         }
     }
 }
@@ -391,6 +454,7 @@ impl Gpu {
         let (buffer, memory) = create_buffer(
             &self.dev,
             &self.memory,
+            &self.allocations,
             bytes,
             vk::BufferUsageFlags::TRANSFER_DST,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
@@ -472,6 +536,7 @@ impl Gpu {
             self.dev.unmap_memory(memory);
             self.dev.destroy_buffer(buffer, None);
             self.dev.free_memory(memory, None);
+            self.allocations.release(memory);
         }
         out
     }

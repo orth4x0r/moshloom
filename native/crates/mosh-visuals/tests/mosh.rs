@@ -603,6 +603,112 @@ fn apply_cost_per_frame() {
     assert_no_validation_messages(&gpu);
 }
 
+/// The 4x4 subsample `mosh_motion_fast` compares instead of the full 8x8 block (V-budget): the
+/// same exhaustive search, a quarter of the samples. This test drives both shaders over the same
+/// moving pictures and reports how far the vectors move.
+///
+/// `mosh_motion.wgsl` stays in the tree as the reference (and as the definition of the search);
+/// `MoshPass` uses `mosh_motion_fast`.
+#[test]
+fn motion_subsample_matches_the_full_search() {
+    let gpu = gpu();
+    let (width, height) = (960u32, 540u32);
+    let grid = (320u32, 180u32);
+    let pattern = pipeline(&gpu, PATTERN_WGSL, 16, 0);
+    let motion_uniform_bytes = vec4_uniform([grid.0 as f32, grid.1 as f32, 0.0, 0.0]);
+    let full = Pipeline::fullscreen(
+        &gpu,
+        mosh_shaders::spirv("mosh_motion").expect("mosh_motion"),
+        16,
+        2,
+    )
+    .expect("full search pipeline");
+    let fast = Pipeline::fullscreen(
+        &gpu,
+        mosh_shaders::spirv("mosh_motion_fast").expect("mosh_motion_fast"),
+        16,
+        2,
+    )
+    .expect("subsampled search pipeline");
+    let current = LayerTarget::new(&gpu, width, height);
+    let previous = LayerTarget::new(&gpu, width, height);
+    let full_vectors = LayerTarget::new(&gpu, 40, 23);
+    let fast_vectors = LayerTarget::new(&gpu, 40, 23);
+
+    let mut identical = 0usize;
+    let mut compared = 0usize;
+    let mut worst = 0.0f32;
+    let mut moved = 0usize;
+    // A bar moving 4 px a frame, and a second run moving diagonal stripes so the match is not
+    // only ever a single horizontal edge.
+    for step in 0..6u32 {
+        let x0 = 200.0 + 4.0 * step as f32;
+        let bar = vec4_uniform([x0, x0 + 20.0, 0.0, 0.0]);
+        let mut rec = FrameRecorder::new(&gpu);
+        rec.draw(&pattern, &current, &bar, &[]).expect("pattern");
+        rec.draw(
+            &full,
+            &full_vectors,
+            &motion_uniform_bytes,
+            &[&current, &previous],
+        )
+        .expect("full motion");
+        rec.draw(
+            &fast,
+            &fast_vectors,
+            &motion_uniform_bytes,
+            &[&current, &previous],
+        )
+        .expect("fast motion");
+        rec.draw(&pattern, &previous, &bar, &[]).expect("previous");
+        gpu.wait_frame(rec.submit());
+
+        // Read one row of vectors from the middle of the field: the bar crosses it.
+        let full_row = red_row(&gpu.read_back(&full_vectors), 40, 11);
+        let fast_row = red_row(&gpu.read_back(&fast_vectors), 40, 11);
+        for (a, b) in full_row.iter().zip(&fast_row) {
+            compared += 1;
+            let difference = f32::from(*a) - f32::from(*b);
+            if difference.abs() < 0.5 {
+                identical += 1;
+            }
+            worst = worst.max(difference.abs());
+            if *a != 0 || *b != 0 {
+                moved += 1;
+            }
+        }
+    }
+    println!(
+        "motion vectors, {compared} compared (row 11 of a 40x23 field over 6 frames): {identical} \
+         identical, {} differ, {moved} non-zero, worst readback difference {worst:.0}/255",
+        compared - identical
+    );
+    assert!(
+        compared > 0 && moved > 0,
+        "the bar has to move a vector for this to compare anything"
+    );
+    // The vector is stored as `clamp(-offset)` per channel, so the readback cannot tell one
+    // negative offset from another: a "difference" here is either a one-grid-pixel move or the
+    // sign of a zero crossing, never the 8-pixel miss a broken search would show.
+    assert!(
+        identical * 100 >= compared * 95,
+        "{} of {compared} vectors differ between the full and the subsampled search",
+        compared - identical
+    );
+    assert_no_validation_messages(&gpu);
+}
+
+/// `mosh_motion_fast` has to fit `mosh-render`'s layout and uniform size like the shader it
+/// replaces, or `MoshPass` would bind the wrong things.
+#[test]
+fn the_subsampled_motion_shader_matches_the_layout() {
+    let reflected = bindings("mosh_motion_fast").expect("mosh_motion_fast");
+    assert_eq!(reflected.len(), 1 + 2 * 2, "uniform plus two (image, sampler) pairs");
+    assert_eq!(uniform_bytes("mosh_motion_fast"), Some(16));
+    assert_eq!(uniform_bytes("mosh_grid"), Some(16), "the grid pass");
+    assert_eq!(bindings("mosh_grid").expect("mosh_grid").len(), 1 + 2);
+}
+
 /// `invalidate` (called by the facade on a clip change) makes the next frame an I-frame.
 #[test]
 fn invalidate_refreshes_the_buffer() {
