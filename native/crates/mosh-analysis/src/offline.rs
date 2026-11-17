@@ -601,6 +601,34 @@ pub fn tempo_from_name(name: &str) -> Option<f64> {
     marked.or(plain)
 }
 
+/// A tempo map: `"<file name>" = 93.0`, as in `C:\Users\ilanf\moshloom-tracks\tempos.toml`.
+pub type TempoMap = std::collections::BTreeMap<String, f64>;
+
+/// Parse a `tempos.toml`: one `"<file name>" = <bpm>` per track, comments allowed.
+pub fn parse_tempos(text: &str) -> Result<TempoMap, LabelError> {
+    toml::from_str(text).map_err(|e| LabelError::Parse(e.to_string()))
+}
+
+/// The tempo for `path` from a [`TempoMap`], matching on the file name, then on the stem.
+pub fn tempo_for(tempos: &TempoMap, path: impl AsRef<Path>) -> Option<f64> {
+    let path = path.as_ref();
+    let name = path.file_name().and_then(|name| name.to_str())?;
+    tempos.get(name).copied().or_else(|| {
+        let stem = path.file_stem().and_then(|stem| stem.to_str())?;
+        tempos.get(stem).copied()
+    })
+}
+
+/// Read a `tempos.toml` from disk.
+pub fn load_tempos(path: impl AsRef<Path>) -> Result<TempoMap, LabelError> {
+    let path = path.as_ref();
+    let text = fs::read_to_string(path).map_err(|source| LabelError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    parse_tempos(&text).map_err(|e| e.with_path(path))
+}
+
 // ---------------------------------------------------------------------------------------------
 // The whole run, once the live analysis is on main
 // ---------------------------------------------------------------------------------------------
@@ -611,10 +639,18 @@ pub use live::{AnalysisRun, analyze};
 #[cfg(feature = "live-analysis")]
 mod live {
     use super::*;
+    use mosh_core::BarStats;
     // `intensity` lives in its own module (Task 1.4, already on main). `Analyzer` and
     // `AnalysisConfig` are Task 1.3, which owns `lib.rs` and re-exports them from the crate root.
-    use crate::intensity::IntensityModel;
+    use crate::intensity::{IntensityModel, IntensityUpdate};
     use crate::{AnalysisConfig, Analyzer};
+
+    /// One finished bar as the intensity model saw it, and what the model did with it.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct BarRow {
+        pub bar: BarStats,
+        pub update: IntensityUpdate,
+    }
 
     /// What one file produced.
     #[derive(Clone, Debug, Default)]
@@ -623,6 +659,8 @@ mod live {
         pub labels: Labels,
         /// Completed bars, i.e. how many `BarStats` the intensity model saw.
         pub bars: usize,
+        /// Every completed bar in order, with its intensity terms, level and events.
+        pub rows: Vec<BarRow>,
         /// Audio actually played through the analyzer (`floor(frames / BLOCK_FRAMES)` blocks).
         pub duration_s: f64,
     }
@@ -635,13 +673,12 @@ mod live {
         bpm: f64,
         offset_s: f64,
     ) -> AnalysisRun {
-        let mut analyzer = Analyzer::new(AnalysisConfig {
-            fft_size: 2048,
-            phrase_bars: 8,
-            history_bars: 16,
-        });
-        let mut model = IntensityModel::new(8, 16);
+        // The plan's defaults, so a tuning run sees the window the live app sees.
+        let config = AnalysisConfig::default();
+        let mut analyzer = Analyzer::new(config);
+        let mut model = IntensityModel::new(config.phrase_bars, config.history_bars);
         let mut events: Vec<(i64, EventFlags)> = Vec::new();
+        let mut rows: Vec<BarRow> = Vec::new();
         let mut bars = 0usize;
         let mut played = 0usize;
 
@@ -653,6 +690,7 @@ mod live {
             for bar in analyzer.drain_bars() {
                 let update = model.push_bar(&bar);
                 events.push((bar.bar_index, update.events));
+                rows.push(BarRow { bar, update });
                 bars += 1;
             }
         }
@@ -660,6 +698,7 @@ mod live {
         AnalysisRun {
             labels: Labels::new(propose_from_events(events).marks),
             bars,
+            rows,
             duration_s: if rate == 0 {
                 0.0
             } else {
