@@ -488,6 +488,8 @@ number — it is the same work minus presentation.
 | Strobe at 16 requests/s for 1 s | 3 flash starts (limiter) and 3 luminance jumps (read back) |
 | overlay video, 1080p (debug, integrated GPU) | recorded inside the frame (1 submission per frame): 0.12-0.22 ms CPU per frame (was 1.7-2.6 ms of waiting); 0 new GPU allocations over 600 frames |
 | compositor, 4 layers, 1920x1080 (V-budget) | one pass instead of one per layer: 1.02 -> 0.69 ms, and it writes the swapchain image directly, so the 16F copy of the frame and its blit are gone (1.2 ms and 16 MB at 1080p) |
+| Adjustment and Mask layers (L-stack, 1080p, offscreen) | plain stack 1.02 ms (unchanged: same pass, 0/6144 pixels differ); a Mask adds 0.009 ms; an Adjustment adds 2.7 ms (composite below, then its mosh and effects; 63 MB of intermediates, allocated on the first adjustment only). Negative 1.0 over two layers inverts both (worst error 0) |
+| overlay CPU per 1080p video frame (release) | recording 0.058 ms; the `set_frame` memcpy of the decoded BGRA frame 0.76-1.0 ms, the larger cost with full-HD video (HAP, in progress, uploads compressed frames instead) |
 | stage frame rate cap | `--fps` (default 60): at most 60 frames a second on a 120 Hz panel, one high-resolution wait per frame, no spin; a stale deadline resyncs instead of bursting |
 
 Intensity (since #46): levels now follow the music. "reza pedia" from 0:00: level 2 through the
