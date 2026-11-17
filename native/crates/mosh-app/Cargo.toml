@@ -29,7 +29,7 @@ mosh-als = { path = "../mosh-als" }
 winit = "0.30"
 # Control window only (Task 2.7): immediate-mode editors on their own OpenGL context, so the
 # stage's Vulkan device, queue and frame pacing are untouched. See `editor_window.rs`.
-egui = "0.37"
+egui = { version = "0.37", features = ["default_fonts"] }
 egui-winit = { version = "0.37", default-features = false }
 egui_glow = "0.37"
 glow = "0.17"

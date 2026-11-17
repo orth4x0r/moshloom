@@ -438,7 +438,7 @@ interfaces and tests: `docs/superpowers/plans/2026-11-17-native-port.md`.
 | `mosh-shaders` | the web app's WGSL (34 modules) compiled to SPIR-V; the layer uniform layout |
 | `mosh-render` | Vulkan core (ash): device on the integrated GPU, targets, pipelines, compositor, swapchain, flash limiter |
 | `mosh-visuals` | one layer = scene / fluid / video -> datamosh -> effects (one pass) -> transition; all five stages in |
-| `mosh-app` | the app, `ilanaVisual.exe`: input fallback (plugin -> loopback after 2 s), Autopilot by default, stage + control windows, budgets, self-recovery; `mosh-feed` streams a file into shared memory as the Tap plugin would |
+| `mosh-app` | the app, `ilanaVisual.exe`: control window with editors (Session grid, Arrangement timeline with Live-set import, Clip editor with ranges per intensity level, Presets, Project open/save) on its own OpenGL context with egui, painted only on change at <= 30 fps; edits reach the running show at the next bar; input fallback (plugin -> loopback after 2 s), Autopilot by default, stage + control windows, budgets, self-recovery; `mosh-feed` streams a file into shared memory as the Tap plugin would |
 
 ### Build and test
 
@@ -465,6 +465,7 @@ Vulkan SDK (1.4.363.0 on the reference machine). `cargo test --workspace` is the
 | what | number |
 | --- | --- |
 | **Ableton -> app** (Live 12, Tap on the master, by the performer) | works: the app switches to plugin mode and follows the set |
+| control window idle frame (egui layout + tessellation, release, no paint) | Session 0.047 ms, Clip editor 0.338 ms |
 | **first app run**, loopback, nothing playing (release, integrated GPU, laptop screen only) | GPU 0.70-0.75 ms, render thread 0.05-0.11 ms per frame; process about 5.5% of one core; 322 MB |
 | **app + mosh-feed**, "reza pedia" (93 BPM) from 0:30 for 54 s | plugin mode, 93.0 BPM, bars advancing, Autopilot changed scenes; GPU 0.77-1.53 ms, render thread 0.08-0.19 ms; process about 5.6% of one core; 285 MB |
 | `IpcWriter::push_block`, 256 stereo frames | median 200 ns, p99 500 ns, 0 allocations / 10 000 |

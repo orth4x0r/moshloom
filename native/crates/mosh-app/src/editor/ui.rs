@@ -176,7 +176,7 @@ fn session(ui: &mut egui::Ui, model: &EditorModel, out: &mut Vec<Command>) {
                 ui.end_row();
 
                 for (scene, row) in grid.scenes.iter().enumerate() {
-                    if ui.button(format!("▶ {}", row.name)).clicked() {
+                    if ui.button(format!("> {}", row.name)).clicked() {
                         out.push(Command::LaunchScene(scene));
                     }
                     for (layer, cell) in row.cells.iter().enumerate() {
@@ -199,7 +199,7 @@ fn session(ui: &mut egui::Ui, model: &EditorModel, out: &mut Vec<Command>) {
                             out.push(Command::SelectScene(scene));
                         }
                         if ui
-                            .add(egui::Button::new("▶").small())
+                            .add(egui::Button::new(">").small())
                             .on_hover_text("launch this cell on the next bar")
                             .clicked()
                         {
