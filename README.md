@@ -21,7 +21,7 @@ Files
 - `test.mjs`        CPU harness: synthetic features, full render, determinism replay
 - `gpu_test.mjs`    headless-Chromium harness: renders through WebGPU to an offscreen texture
 - `scripts/make-fixtures.mjs`  regenerates the committed test fixtures (not part of `npm test`)
-- `scripts/gate.mjs`  reduces an `npm test` log to the gate line; `scripts/zip.mjs` builds the reviewer zip
+- `scripts/gate.mjs`  reduces an `npm test` log to the gate line
 
 ## Setup
 
@@ -320,20 +320,6 @@ Two changes removed the dependence on the window: since X2 (#7) every export, ma
 renders into the offscreen texture and reads it back, and since H4 (#10) the harness decodes
 exported files in a separate headless Chromium (`--use-angle=swiftshader`, so the decoded numbers
 match the SwiftShader run) instead of inside the headed window.
-
-### Milestone zip
-
-No longer a required step (2026-11-15): there is no external reviewer zip in the milestone flow.
-The tool still works:
-
-    npm run zip -- --sha <rev> [--out <path>] [--check-pack] <log> [<log> ...]
-
-Builds `out/moshloom-<shortsha>.zip` for the external reviewer: the tree at `<rev>` from
-`git archive`, the given logs under `logs/`, and `MANIFEST.txt` (full SHA, commit subject, each
-log's size and sha256). It reads the finished zip back, fails on a missing or empty log, on any
-`node_modules` or `out` path segment, and leaves no zip behind on failure. `--check-pack` rebuilds
-`index.html` in a temporary worktree of `<rev>` and requires it byte-identical.
-`node scripts/zip.mjs --self-test` checks the entry-name rules.
 
 ### Builds, goldens and what "same pixels" means
 

@@ -39,7 +39,7 @@ Up to **four** workers at once, one lane each, never two workers in the same lan
 | **A · UI / worker** | `index.src.html`, `gpu.js`, `pack.py` | T1d (parked, see State) |
 | **B · harness** | `gpu_test.mjs`, `test.mjs` | (empty) |
 | **C · gates** | `scripts/gate*`, `scripts/testdata/**` | (empty) |
-| **D · tooling** | `scripts/zip.mjs`, `package.json`, `package-lock.json` | (empty) |
+| **D · tooling** | `package.json`, `package-lock.json` | (empty) |
 | **E · docs** | `README.md`, `lab/*/README.md`, `.github/workflows/ci.yml` | coordinator |
 | **frozen** | `AGENTS.md`, `fixtures/**`, `engine.c`, `engine.wasm`, `build.*`, `lab/`, `index.html` | coordinator only |
 

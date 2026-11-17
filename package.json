@@ -12,7 +12,6 @@
     "test:gpu": "node gpu_test.mjs",
     "test:gpu:hw": "node gpu_test.mjs --hardware",
     "golden:record": "node gpu_test.mjs --record",
-    "zip": "node scripts/zip.mjs",
     "pretest": "python pack.py"
   },
   "dependencies": {
