@@ -3,3 +3,4 @@ out/
 __pycache__/
 *.ppm
 !fixtures/golden/*.ppm
+native/target/

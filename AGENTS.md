@@ -56,7 +56,43 @@ Two rules that make this survivable:
   Chromium at all. Software-adapter runs of `npm test` in four worktrees is the outer edge of
   what the fixed timeouts in `gpu_test.mjs` tolerate.
 
-## Definition of done
+## Native lanes (`native/`, the Rust port)
+
+Design: `docs/superpowers/specs/2026-11-17-native-port-design.md`. Plan, with every lane's
+interfaces and tests: `docs/superpowers/plans/2026-11-17-native-port.md`. The human asked for as
+many parallel workers as possible here, so the four-worker cap above applies to the web lanes only.
+Native lanes are one crate each, one worker each.
+
+| lane | owns | task |
+| --- | --- | --- |
+| **N-core** | `native/Cargo.toml`, `native/rust-toolchain.toml`, `native/crates/mosh-core/**` | coordinator only (the contract) |
+| **N-ipc** | `native/crates/mosh-ipc/**` | 1.1 |
+| **N-tap** | `native/crates/mosh-tap/**` | 1.2 |
+| **N-features** | `mosh-analysis`: `lib.rs`, `features.rs`, `grid.rs`, `loudness.rs`, their tests | 1.3 |
+| **N-intensity** | `mosh-analysis`: `intensity.rs`, `tests/intensity.rs` | 1.4 |
+| **N-harness** | `mosh-analysis`: `src/bin/**`, `offline.rs`, `tests/offline.rs` | 1.5 |
+| **N-capture** | `native/crates/mosh-capture/**` | 1.6 |
+| **N-render** | `native/crates/mosh-render/**` | 1.7 |
+| **N-show** | `native/crates/mosh-show/**` | 1.8 |
+| **N-als** | `native/crates/mosh-als/**` | 1.9 |
+| **N-midi** | `native/crates/mosh-midi/**` | 1.10 |
+| **N-video** | `native/crates/mosh-video/**` | 1.11 |
+| **N-shaders** | `native/crates/mosh-shaders/**`, `scripts/extract_wgsl.mjs` | 1.12 |
+| **N-app** | `native/crates/mosh-app/**` | 2.6, 2.7 |
+
+Rules for native lanes:
+
+- `mosh-core` is the contract. A lane that needs a change to it stops and reports; it never edits it.
+- **`native/Cargo.lock` is generated.** On a merge conflict, take either side and run
+  `cargo generate-lockfile` then `cargo test --workspace`; never hand-merge it.
+- The gate for a native lane is `cargo test -p <crate>` and `cargo clippy -p <crate> -- -D warnings`
+  in `native/`, plus `cargo test --workspace` after merge. The web gate (`npm test`) still runs on
+  every merge, because one repo has one main.
+- Workers may run short offscreen Vulkan tests. Windowed runs, Ableton, budget measurements and
+  battery runs are coordinator-only, on the primary checkout.
+- Audio for tuning lives in `C:\Users\ilanf\moshloom-tracks` and is never committed.
+- `index.src.html`, `gpu.js`, `engine.c`, `fixtures/**` are read-only for native lanes.
+
 
 - one task = one branch = one PR = one worker
 - PR body: what changed, the test numbers, and what is *not* verified

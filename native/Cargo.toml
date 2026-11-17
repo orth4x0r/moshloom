@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/mosh-core",
+  "crates/mosh-ipc",
+  "crates/mosh-tap",
+  "crates/mosh-capture",
+  "crates/mosh-analysis",
+  "crates/mosh-show",
+  "crates/mosh-shaders",
+  "crates/mosh-render",
+  "crates/mosh-video",
+  "crates/mosh-midi",
+  "crates/mosh-als",
+  "crates/mosh-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "UNLICENSED"
+publish = false
+
+[profile.release]
+debug = 1
