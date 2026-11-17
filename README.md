@@ -9,6 +9,11 @@ Audio-reactive datamosh visualizer with a block timeline.
 - If WebGPU is missing or the device is lost, the app falls back to the CPU renderer in the
   same wasm (`render(f)`), which has the first 8 visuals only.
 
+**In progress: Moshloom Native** (`native/`), a Rust + Vulkan port for playing live next to
+Ableton Live: two VST3 plugins feed it the master audio and Live's transport, and it runs
+hands-free on the integrated GPU. See [Moshloom Native](#moshloom-native-rust-in-progress) below.
+The web app stays as the reference implementation.
+
 Files
 - `engine.c`        engine (freestanding C, no libc); `build.sh` / `build.bat` build `engine.wasm`
 - `gpu.js`          WGSL shaders and the WebGPU frame loop
@@ -391,6 +396,89 @@ mid, high, pulse, vari, dens, beat, mel[24], line colours l0..l2; helpers `lut()
 `mel()`, `melh()`, `ca()`), add its name/colour to `SCENES` in index.src.html, and a
 default palette to `DEFPAL` in engine.c (raise the scene limit there and in `pack_scene`).
 
+## Moshloom Native (Rust, in progress)
+
+A native Windows rebuild for live shows: the performer presses play on backing tracks in Ableton
+Live and sings; nothing is touched during the set, so the visuals follow Live by themselves.
+Design: `docs/superpowers/specs/2026-11-17-native-port-design.md`. Plan, with every task's
+interfaces and tests: `docs/superpowers/plans/2026-11-17-native-port.md`.
+
+    Ableton master ---> [Moshloom Tap VST3] ----shared memory---> mosh-app
+    Ableton MIDI track -> [Moshloom Control VST3] -shared memory--> mosh-app
+    APC mini (rehearsal) ----MIDI-------------------------------> mosh-app
+    (fallback) WASAPI loopback ---------------------------------> mosh-app
+
+    mosh-app: input -> analysis (beat grid, intensity 1-4, build/drop/breakdown)
+              -> show (Arrangement / Session / Autopilot) -> visuals (Vulkan) -> stage window
+
+- **Two ways to play**, like Ableton: Arrangement (one timeline in beats that follows Live's
+  playhead, tempo automation and meter changes included) and Session (a clip grid: columns are
+  layers, rows are scenes), plus Autopilot, which launches clips on drops and level changes.
+- **Intensity decides when and how hard; clips decide what.** Each clip has parameter ranges per
+  intensity level; the beat pulse moves values inside them.
+- **Visuals**: 2-3 visualizer layers plus an overlay/video layer, each drawn as
+  scene -> datamosh -> effects (one pass) -> transition, then composited. Fluid is its own
+  visualizer. Full-frame flashes are at least 400 ms apart, with no opt-out.
+- **Budgets** (integrated AMD Radeon, on battery): plugin < 20 us per 256-sample block with no
+  allocations; app < 2 ms CPU and < 6 ms GPU per frame at 1080p60 with 3 layers + overlay.
+
+### Workspace
+
+| crate | what |
+| --- | --- |
+| `mosh-core` | the shared contract: transport, shared-memory layout, analysis output, show model, control events |
+| `mosh-ipc` | shared-memory rings, per-slot seqlock |
+| `mosh-tap` | the VST3 plugins **Moshloom Tap** (master, pass-through) and **Moshloom Control** (MIDI) |
+| `mosh-capture` | WASAPI loopback fallback |
+| `mosh-analysis` | causal features, beat grid, intensity model, tempo tracker, `mosh-analyze` CLI |
+| `mosh-show` | Session, Arrangement, Autopilot, follow actions, seeded procedural looks, RON projects |
+| `mosh-als` | Live set import: locators, time signatures, tempo automation |
+| `mosh-midi` | APC mini mk1/mk2, MIDI learn, Control-plugin notes |
+| `mosh-video` | Media Foundation overlay decoding |
+| `mosh-shaders` | the web app's WGSL (34 modules) compiled to SPIR-V; the layer uniform layout |
+| `mosh-render` | Vulkan core (ash): device on the integrated GPU, targets, pipelines, compositor, swapchain, flash limiter |
+| `mosh-visuals` | scenes, mosh, effects, transitions, fluid, overlays (Phase 2, in progress) |
+| `mosh-app` | the app (Phase 2, in progress) |
+
+### Build and test
+
+```
+cd native
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo run --manifest-path crates/mosh-tap/xtask/Cargo.toml -- bundle mosh-tap --release
+#   -> native/target/bundled/mosh-tap.vst3 (Live lists Moshloom Tap and Moshloom Control)
+```
+
+Needs Rust 1.99 (MSVC; `native/rust-toolchain.toml`) and, for GPU tests with validation, the
+Vulkan SDK (1.4.363.0 on the reference machine). `cargo test --workspace` is the native gate;
+`npm test` stays the web gate.
+
+### Measured so far
+
+| what | number |
+| --- | --- |
+| `IpcWriter::push_block`, 256 stereo frames | median 200 ns, p99 500 ns, 0 allocations / 10 000 |
+| Tap + Control callback without the shared-memory write (release) | median 400 ns per 256-frame block, 0 allocations / 10 000 |
+| plugin -> shared memory -> app reader | one block + transport + MIDI note round-trip exact (test) |
+| `Analyzer::push`, 256 frames (release) | median 25.4 us, p95 33.1 us, 0 allocations after warm-up |
+| Vulkan device | "AMD Radeon(TM) Graphics" picked by default; 0 validation messages in every GPU test |
+| loopback capture | 185-187 blocks/s at 48 kHz, within one block of wall time |
+| overlay decode (160x90 fixture, debug) | 0.18 ms/frame |
+
+Not measured yet: anything in Ableton, the app's frame times on battery, latency from audio to
+picture. Those are coordinator runs on the reference machine once the app lands.
+
+### Tuning audio
+
+The intensity rules are tuned on 16 of the performer's tracks, kept outside the repo in
+`C:\Users\ilanf\moshloom-tracks` (never committed). Tempos come from Ableton's `.asd` files:
+each holds the warp markers as (seconds, beat) pairs, and every track starts on beat 1 at 0:00;
+the two tracks with a tempo in the file name match exactly (140 and 87). They are listed in
+`tempos.toml` in that folder. `mosh-analyze <file> --bpm <n> --propose` writes proposed marks;
+the first run on four tracks proposed too many drops (6-8 per track, some on consecutive bars), so
+the rules are not tuned yet: that waits for hand-placed marks.
+
 ## Added in this version
 
 - Offline export (`exportVideo` in index.src.html): renders frame by frame, encodes with
@@ -449,4 +537,5 @@ default palette to `DEFPAL` in engine.c (raise the scene limit there and in `pac
   compileShader, probe, reset, dispose). `setProject` and `loadFeatures` were added in R1: the
   feature-loading sequence (arrays, mel, then `set_grid`) exists once, in `gpuLoadFeatures`, used by the
   page and the render worker. The 13 goldens were unchanged by the T1a refactor and by R1.
-- Not built: live audio input, MIDI, desktop packaging.
+- Not built in the web app: live audio input, MIDI, desktop packaging. Moshloom Native (above) is
+  where those are being built.
