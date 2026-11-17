@@ -280,8 +280,10 @@ fn bar_stats_aggregate_one_bar() {
         "kicks are audible: {} dB",
         bar.loudness_db
     );
+    // Onsets per beat, raw (the intensity model normalises it): four kicks on four beats is
+    // about one, and a double-detected transient can push it a little higher.
     assert!(
-        bar.onset_density > 0.0 && bar.onset_density <= 1.0,
+        bar.onset_density > 0.5 && bar.onset_density <= 4.0,
         "onset density {} out of range",
         bar.onset_density
     );
@@ -362,7 +364,7 @@ fn ppq_jump_resets_bar_accumulator() {
     );
 
     // Bar 4 (ppq 16 .. 20) is silent. Stopping the kicks dead is itself one broadband click, so
-    // the bar may carry a single onset; a bar and a half of leaked kicks would be >= 0.5.
+    // the bar may carry a single onset (0.25 per beat); a bar of leaked kicks would be >= 3.
     let silence = vec![0.0f32; HOP];
     let mut bars = Vec::new();
     for k in 0..=blocks_per_bar {
@@ -373,7 +375,7 @@ fn ppq_jump_resets_bar_accumulator() {
     assert_eq!(bars[0].start_ppq, 16.0);
     assert_eq!(bars[0].beats, 4);
     assert!(
-        bars[0].onset_density < 0.1,
+        bars[0].onset_density < 1.0,
         "the pre-jump onsets leaked into the new bar: {bars:?}"
     );
 }

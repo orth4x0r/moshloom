@@ -3,27 +3,43 @@
 //!
 //! Task 1.4 of `docs/superpowers/plans/2026-11-17-native-port.md`.
 //!
-//! Input contract. `BarStats` comes from the feature stage (Task 1.3), which normalises
-//! `loudness`, `low` and `brightness` to 0..1 against a causal window of the last
-//! `history_bars` bars. `onset_density` is *not* normalised there: it is spectral-flux
-//! peaks per beat, so this model divides it by the largest value in its own window of
-//! the last `history_bars` bars, floored at one onset per beat. `loudness_db` is the raw
-//! short-term level and decides silence, because a normalised feature of a noise floor
-//! can be anything.
+//! Two causal stages, both against recent bars:
+//!
+//! 1. **Intensity** is the weighted mean of the four terms (loudness 0.45, low 0.25, onset 0.18,
+//!    brightness 0.12; the plan's starting point was 0.35 / 0.30 / 0.20 / 0.15 and the change is
+//!    explained at `W_LOUDNESS`). `loudness`, `low` and `brightness` arrive already normalised to
+//!    0..1 by the feature stage, which blends a fixed typical range with the bar's rank over the
+//!    last `history_bars` bars; `onset_density` arrives raw, as onsets per beat, and this model
+//!    normalises it the same way. `loudness_db` is the raw short-term level and decides silence,
+//!    because a normalised feature of a noise floor can be anything.
+//! 2. **Level** is where that intensity sits in the recent dynamic range (its 5th-95th percentile
+//!    over the last `history_bars` bars), through the plan's thresholds (0.25 / 0.5 / 0.75) with
+//!    its hysteresis band and at most one step per bar. Reading a position in the range is what
+//!    makes the levels usable: the weighted mean of four correlated terms sits in a narrow band,
+//!    so thresholds on the mean itself put almost every bar in one or two levels. A section that
+//!    does not change reads the middle; a drop reads the top; a breakdown reads the bottom.
 //!
 //! Everything here is causal and per bar: `push_bar` is the only way in, so a level
-//! never changes in the middle of a bar and the same bar sequence always produces the
-//! same events. `reset` is for song markers.
+//! never changes in the middle of a bar, never moves more than one step per bar, and the same
+//! bar sequence always produces the same events. `reset` is for song markers.
 
 use std::collections::VecDeque;
 
 use mosh_core::{BarStats, EventFlags};
 
+use crate::RollingRange;
+
 /// Weights of the four normalised terms. They sum to 1, so the intensity is 0..1.
-const W_LOUDNESS: f32 = 0.35;
-const W_LOW: f32 = 0.30;
-const W_ONSET: f32 = 0.20;
-const W_BRIGHTNESS: f32 = 0.15;
+///
+/// The plan's starting point was 0.35 / 0.30 / 0.20 / 0.15. Loudness carries more of it after
+/// measurement on the 16 tuning tracks: brightness and onset density move with timbre and
+/// arrangement within a bar, so at equal weight they could outvote the level of the music, and a
+/// sparse bar in the loudest part of a track read lower than a busy bar in a quiet one. Loudness
+/// is the term the four levels are about; the others colour it.
+const W_LOUDNESS: f32 = 0.45;
+const W_LOW: f32 = 0.25;
+const W_ONSET: f32 = 0.18;
+const W_BRIGHTNESS: f32 = 0.12;
 
 /// Level boundaries: below 0.25 is level 1, at or above 0.75 is level 4.
 const LEVEL_THRESHOLDS: [f32; 3] = [0.25, 0.5, 0.75];
@@ -31,6 +47,12 @@ const LEVEL_THRESHOLDS: [f32; 3] = [0.25, 0.5, 0.75];
 /// rises 0.04 above the boundary and falls only 0.04 below it.
 const LEVEL_HYSTERESIS: f32 = 0.08;
 const LEVEL_BAND: f32 = LEVEL_HYSTERESIS * 0.5;
+
+/// The level reads where the bar's intensity sits in the recent dynamic range: its 5th-95th
+/// percentile over the last `history_bars` bars. A range narrower than this has nothing to place a
+/// bar in, so the reading is the middle: a steady loop settles at level 2 or 3 instead of being
+/// ranked by its own noise.
+const LEVEL_MIN_SPAN: f32 = 0.1;
 
 /// A breakdown needs a level this high first.
 const BREAKDOWN_LEVEL: u8 = 3;
@@ -55,32 +77,52 @@ const BUILD_RISE: f32 = 0.15;
 /// A build stays open for at most this many bars when no drop arrives.
 const BUILD_MAX_BARS: u32 = 8;
 
-/// Onset densities are read against the window maximum, but never against less than
-/// one onset per beat, so a lone onset in a quiet bar cannot look maximal.
-const ONSET_REF_FLOOR: f32 = 1.0;
+/// Onset densities are ranked against their own causal window, as onsets per beat: the fallback
+/// covers the first bars of a show, and a window whose 10th-90th percentile spread is under
+/// `ONSET_FULL_SPAN` (nothing is changing) keeps the term near the middle instead of ranking by
+/// noise.
+const ONSET_FALLBACK: (f32, f32) = (1.0, 4.0);
+const ONSET_FULL_SPAN: f32 = 1.5;
+
+/// The four normalised terms of one bar, as the model used them. Diagnostic: `mosh-analyze
+/// --dump` prints them, the show reads only `intensity`, `level` and `events`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct IntensityTerms {
+    pub loudness: f32,
+    pub low: f32,
+    pub onset: f32,
+    pub brightness: f32,
+}
 
 /// What one bar did to the model.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IntensityUpdate {
-    /// Continuous intensity 0..1.
+    /// Continuous intensity 0..1: the weighted mean of the four normalised terms.
     pub intensity: f32,
+    /// The intensity through the level machine's calibration (0..1). Diagnostic: this is what
+    /// the thresholds saw.
+    pub reading: f32,
     /// 1..=4, changing only here, on a bar boundary.
     pub level: u8,
     /// PHRASE / BUILD_START / DROP / BREAKDOWN / LEVEL_UP / LEVEL_DOWN for this bar.
     /// BEAT, BAR and SONG_START belong to the grid and app layers, not to this model.
     pub events: EventFlags,
+    /// The normalised inputs this bar's intensity was built from.
+    pub terms: IntensityTerms,
 }
 
 /// Turns the per-bar features of a song into intensity, level and events.
 #[derive(Debug)]
 pub struct IntensityModel {
     phrase_bars: u32,
-    history_bars: usize,
     level: u8,
     intensity: f32,
     phrase_pos: u32,
-    /// Onset densities of the last `history_bars` bars, current bar included.
-    onsets: VecDeque<f32>,
+    /// Onset densities of the last `history_bars` bars.
+    onsets: RollingRange,
+    /// Intensities of the last `history_bars` bars: the range the level reads a bar against.
+    /// Intensities of the last \history_bars\ bars: the range the level places a bar in.
+    scale: RollingRange,
     /// Intensities of the last `BUILD_BARS` bars, current bar excluded, oldest first.
     recent: VecDeque<f32>,
     /// Consecutive bars with a strictly rising intensity.
@@ -101,15 +143,15 @@ pub struct IntensityModel {
 
 impl IntensityModel {
     /// `phrase_bars` is the PHRASE period (clamped to at least 1), `history_bars` the
-    /// length of the onset window (clamped to at least 1).
+    /// length of the onset window (clamped to at least 2).
     pub fn new(phrase_bars: u32, history_bars: u32) -> Self {
         IntensityModel {
             phrase_bars: phrase_bars.max(1),
-            history_bars: history_bars.max(1) as usize,
             level: 1,
             intensity: 0.0,
             phrase_pos: 0,
-            onsets: VecDeque::new(),
+            scale: RollingRange::new((0.0, 1.0), history_bars, LEVEL_MIN_SPAN),
+            onsets: RollingRange::new(ONSET_FALLBACK, history_bars, ONSET_FULL_SPAN),
             recent: VecDeque::new(),
             rising_bars: 0,
             build_active: false,
@@ -166,20 +208,49 @@ impl IntensityModel {
             self.clear_state();
         }
 
-        // The window includes this bar: everything used is already known.
-        self.onsets.push_back(onset_density);
-        while self.onsets.len() > self.history_bars {
-            self.onsets.pop_front();
-        }
-        let onset_ref = self.onsets.iter().copied().fold(ONSET_REF_FLOOR, f32::max);
-        let onset = (onset_density / onset_ref).clamp(0.0, 1.0);
+        // The window includes this bar: everything used is already known. `normalize` folds the
+        // value into its own window, so the push after it is the same set either way.
+        let onset = self.onsets.normalize(onset_density);
+        self.onsets.push(onset_density);
 
+        // A silent bar is not normalised at all: its terms are zero because that is what the
+        // intensity used, so `terms` always explains `intensity`.
+        let terms = if silent {
+            IntensityTerms::default()
+        } else {
+            IntensityTerms {
+                loudness,
+                low,
+                onset,
+                brightness,
+            }
+        };
+
+        // The level reads the intensity itself: the four terms already mix an absolute range
+        // with a local rank, so a quiet section stays low and a loud one high even when either
+        // lasts longer than the window.
         let intensity = if silent {
             0.0
         } else {
-            (W_LOUDNESS * loudness + W_LOW * low + W_ONSET * onset + W_BRIGHTNESS * brightness)
+            (W_LOUDNESS * terms.loudness
+                + W_LOW * terms.low
+                + W_ONSET * terms.onset
+                + W_BRIGHTNESS * terms.brightness)
                 .clamp(0.0, 1.0)
         };
+
+        // The level places this bar in the recent dynamic range (see `LEVEL_MIN_SPAN`), which is
+        // what makes the four levels cover a section instead of hugging the middle of a weighted
+        // mean. The window includes this bar; `position` folds it in. `intensity` stays the plain
+        // weighted mean: the show modulates with it.
+        let reading = if silent {
+            0.0
+        } else {
+            self.scale
+                .position(intensity, LEVEL_MIN_SPAN)
+                .unwrap_or(0.5)
+        };
+        self.scale.push(intensity);
 
         let previous_level = self.level;
         let mut events = EventFlags::empty();
@@ -190,7 +261,7 @@ impl IntensityModel {
             self.track_breakdown(previous_level, low, onset, &mut events);
         }
 
-        self.level = next_level(previous_level, intensity);
+        self.level = next_level(previous_level, reading);
         if self.level > previous_level {
             events |= EventFlags::LEVEL_UP;
         } else if self.level < previous_level {
@@ -212,8 +283,10 @@ impl IntensityModel {
 
         IntensityUpdate {
             intensity,
+            reading,
             level: self.level,
             events,
+            terms,
         }
     }
 
@@ -263,6 +336,10 @@ impl IntensityModel {
 
     /// BREAKDOWN: low and normalised onsets both under 0.25 for a full bar, once the
     /// level had reached 3. Silence is a song gap, not a breakdown, and never gets here.
+    ///
+    /// Re-arming needs a bar that is *not* quiet as well as a level of 3: with the level taking
+    /// one step per bar, a collapse spends two bars above level 3, and without this guard a
+    /// breakdown would fire on every one of them.
     fn track_breakdown(
         &mut self,
         previous_level: u8,
@@ -270,10 +347,11 @@ impl IntensityModel {
         onset: f32,
         events: &mut EventFlags,
     ) {
-        if previous_level >= BREAKDOWN_LEVEL {
+        let quiet = low < BREAKDOWN_QUIET && onset < BREAKDOWN_QUIET;
+        if previous_level >= BREAKDOWN_LEVEL && !quiet {
             self.breakdown_armed = true;
         }
-        if self.breakdown_armed && low < BREAKDOWN_QUIET && onset < BREAKDOWN_QUIET {
+        if self.breakdown_armed && quiet {
             self.breakdown_armed = false;
             *events |= EventFlags::BREAKDOWN;
         }
@@ -283,6 +361,7 @@ impl IntensityModel {
         self.level = 1;
         self.intensity = 0.0;
         self.phrase_pos = 0;
+        self.scale.clear();
         self.onsets.clear();
         self.recent.clear();
         self.rising_bars = 0;
@@ -305,11 +384,13 @@ fn level_from_intensity(intensity: f32) -> u8 {
     level
 }
 
-/// Move at most as far as the hysteresis band allows: crossing a boundary by
-/// `LEVEL_BAND` is needed to leave a level, in either direction.
+/// Move at most one level per bar, and only when the hysteresis band allows it: crossing a
+/// boundary by `LEVEL_BAND` is needed to leave a level, in either direction. A collapse from
+/// level 4 to level 1 therefore takes three bars, which is what keeps a breakdown from
+/// snapping the show's parameters in a single bar.
 fn next_level(level: u8, intensity: f32) -> u8 {
     let candidate = level_from_intensity(intensity);
-    if candidate > level {
+    let target = if candidate > level {
         let boundary = LEVEL_THRESHOLDS[usize::from(level).saturating_sub(1)];
         if intensity >= boundary + LEVEL_BAND {
             candidate
@@ -325,6 +406,11 @@ fn next_level(level: u8, intensity: f32) -> u8 {
         }
     } else {
         level
+    };
+    match target.cmp(&level) {
+        std::cmp::Ordering::Greater => level + 1,
+        std::cmp::Ordering::Less => level - 1,
+        std::cmp::Ordering::Equal => level,
     }
 }
 
@@ -343,5 +429,61 @@ fn onset_density(value: f32) -> f32 {
         value.max(0.0)
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The published thresholds and the hysteresis band, as the plan states them.
+    #[test]
+    fn level_from_intensity_uses_the_published_thresholds() {
+        let cases = [
+            (0.0, 1),
+            (0.249, 1),
+            (0.25, 2),
+            (0.499, 2),
+            (0.5, 3),
+            (0.749, 3),
+            (0.75, 4),
+            (1.0, 4),
+        ];
+        for (intensity, level) in cases {
+            assert_eq!(
+                level_from_intensity(intensity),
+                level,
+                "intensity {intensity}"
+            );
+        }
+    }
+
+    /// Entering a level needs `threshold + LEVEL_BAND`, leaving it needs `threshold - LEVEL_BAND`,
+    /// and the level never moves more than one step per bar.
+    #[test]
+    fn next_level_needs_the_band_and_moves_one_step() {
+        // From level 1: 0.28 is above 0.25 but inside the band, so nothing happens.
+        assert_eq!(next_level(1, 0.28), 1);
+        assert_eq!(next_level(1, 0.29), 2);
+        // From level 2: down needs 0.25 - 0.04, up needs 0.5 + 0.04.
+        assert_eq!(next_level(2, 0.22), 2);
+        assert_eq!(next_level(2, 0.21), 1);
+        assert_eq!(next_level(2, 0.53), 2);
+        assert_eq!(next_level(2, 0.54), 3);
+        // A jump of three levels is taken one step at a time.
+        assert_eq!(next_level(1, 0.99), 2);
+        assert_eq!(next_level(4, 0.01), 3);
+        // Staying put.
+        assert_eq!(next_level(3, 0.5), 3);
+        assert_eq!(next_level(4, 0.75), 4);
+        assert_eq!(next_level(4, 0.7), 3);
+    }
+
+    /// The band is the plan's, and the boundary table is what the two functions above assume.
+    #[test]
+    fn the_band_and_the_thresholds_are_the_published_ones() {
+        assert_eq!(LEVEL_THRESHOLDS, [0.25, 0.5, 0.75]);
+        assert!((LEVEL_HYSTERESIS - 0.08).abs() < 1e-6);
+        assert!((LEVEL_BAND - 0.04).abs() < 1e-6);
     }
 }

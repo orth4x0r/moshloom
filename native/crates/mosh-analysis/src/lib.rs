@@ -9,6 +9,12 @@
 //! pushed to it, and the frame carries its `intensity`, `level` and events (PHRASE, BUILD_START,
 //! DROP, BREAKDOWN, LEVEL_UP, LEVEL_DOWN). Call [`Analyzer::song_start`] at a song marker.
 //!
+//! `BarStats` carries `loudness`, `low` and `brightness` normalised to 0..1 by [`RollingRange`]
+//! (a fixed typical range blended with the bar's rank over the last `history_bars` bars) and
+//! `onset_density` as raw onset peaks per beat, which the intensity model normalises itself,
+//! because onset density is per beat and the model is the only place that knows the window it
+//! should be read against.
+//!
 //! Loopback mode (Task 2.5, `tempo.rs`) has audio but no transport. A block whose
 //! [`AudioBlock::transport`] is `None` feeds the [`tempo::TempoTracker`], and once it locks the
 //! analyzer synthesises a 4/4 transport from it: the frame's `source` becomes
@@ -35,8 +41,10 @@ use tempo::TempoTracker;
 pub const DEFAULT_FFT_SIZE: usize = 2048;
 /// A phrase is eight bars.
 pub const DEFAULT_PHRASE_BARS: u32 = 8;
-/// Normalisation looks back this many bars (a phrase's worth and then some).
-pub const DEFAULT_HISTORY_BARS: u32 = 16;
+/// Normalisation looks back this many bars: the top of the design's 8-32 range, because a
+/// shorter window lets one deep bar (a one-bar gap, the last bar of an intro) set the range for
+/// a whole section, and every bar after it then clips to 1.0.
+pub const DEFAULT_HISTORY_BARS: u32 = 32;
 
 /// How the analyzer is set up. The plan's defaults are [`Default`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -60,14 +68,26 @@ impl Default for AnalysisConfig {
 const HISTORY_CAP: usize = 32;
 /// Bars buffered between `drain_bars` calls. One per video frame is the intended use.
 const BAR_CAPACITY: usize = 8;
-/// Default normalisation ranges, used until the rolling window has two bars of history (the
-/// first two seconds of a show, and after a reset). They are typical ranges for the raw values,
-/// not tuned constants: once history exists, the 5th-95th percentile of the last bars wins.
+/// Typical ranges for produced music, the absolute half of each [`RollingRange`] map. They are
+/// used before the rolling window has a rank to give (the first bars of a show, and after a
+/// reset) and they anchor the rank afterwards, so a long quiet section still reads quiet.
 const DEFAULT_LOUDNESS_DB: (f32, f32) = (-45.0, -8.0);
 const DEFAULT_LOW_DB: (f32, f32) = (-60.0, -18.0);
 const DEFAULT_BRIGHTNESS: (f32, f32) = (0.02, 0.45);
-/// `BarStats::onset_density` counts onset peaks per beat, saturating at four (16th notes).
-const ONSETS_PER_BEAT_MAX: f32 = 4.0;
+/// Smallest 10th-90th percentile spread the loudness map is fully confident in, in dB. Music
+/// whose last 32 bars fit inside a 3 dB range has no dynamics to read a bar against, so that
+/// bar stays near the middle of the scale instead of being ranked by noise.
+const LOUDNESS_FULL_SPAN_DB: f32 = 3.0;
+/// The same for a band's mean power, which moves less than the summed level.
+const BAND_FULL_SPAN_DB: f32 = 4.0;
+/// The same for brightness, which is a 0..1 spectral centroid, not a dB.
+const BRIGHTNESS_FULL_SPAN: f32 = 0.08;
+/// Bars before the relative rank is trusted: with fewer, the window is a handful of bars and its
+/// top is not "the loudest in the last phrase", it is "the loudest in the last four bars".
+const RANK_WARMUP_BARS: usize = 8;
+/// `BarStats::onset_density` counts onset peaks per beat. The clamp only stops a broken
+/// detector from handing the model an absurd number; typical material is 0.5-4.
+const ONSETS_PER_BEAT_MAX: f32 = 8.0;
 /// Loopback mode has no transport, so the tracker's grid is synthesised as 4/4, the time signature
 /// the web engine assumes. A transport from the plugin always wins when one is present.
 const TRACKED_SIG_NUM: u16 = 4;
@@ -76,11 +96,21 @@ const TRACKED_SIG_DEN: u16 = 4;
 /// loop, so a re-estimate never jumps the playhead and drops a partial bar every half second.
 const TRACKED_PHASE_GAIN: f64 = 0.05;
 
-/// A causal percentile range over the last `history_bars` bars.
+/// A causal map from a raw feature to 0..1: a fixed typical range blended with a rank over the
+/// last `history_bars` bars.
 ///
-/// `normalize` maps a raw value through the 5th and 95th percentile of the bars that have already
-/// finished: the range is never widened by data the show has not heard yet, so a build does not
-/// look quiet because of a loud drop later in the song.
+/// Two things keep the map honest, and the model needs both:
+///
+/// - the **relative** half is a rank, not a min-max position: after a step up (an intro into a
+///   drop) the new bars spread across the top of the window instead of all clipping to 1.0
+///   together, which is what kept the old 5th-95th percentile map at "everything is maximal"
+///   for a whole window. Ties (a perfectly steady window) rank in the middle, not at the top,
+///   and a window with no spread at all is pulled to 0.5 rather than ranked by noise.
+/// - the **absolute** half is the fixed typical range, so a long quiet section still reads
+///   quiet when it is all the last bars contain, and a long loud one still reads loud.
+///
+/// The window never contains audio the show has not heard, so a build is not judged against a
+/// later drop.
 #[derive(Clone, Debug)]
 pub struct RollingRange {
     buf: [f32; HISTORY_CAP],
@@ -88,16 +118,20 @@ pub struct RollingRange {
     pos: usize,
     cap: usize,
     fallback: (f32, f32),
+    full_span: f32,
 }
 
 impl RollingRange {
-    pub fn new(fallback: (f32, f32), history_bars: u32) -> Self {
+    /// `fallback` covers the first bars of a show (before there is a window to rank against);
+    /// `full_span` is the 10th-90th percentile spread at which the rank is trusted completely.
+    pub fn new(fallback: (f32, f32), history_bars: u32, full_span: f32) -> Self {
         Self {
             buf: [0.0; HISTORY_CAP],
             len: 0,
             pos: 0,
             cap: (history_bars as usize).clamp(2, HISTORY_CAP),
             fallback,
+            full_span: full_span.max(1e-6),
         }
     }
 
@@ -126,34 +160,95 @@ impl RollingRange {
         self.pos = 0;
     }
 
-    /// Map `value` to 0..1 against the 5th-95th percentile of the recorded bars.
+    /// Map `value` to 0..1: half from the fixed typical range for this feature, half from the
+    /// bar's rank among the recorded bars and itself.
+    ///
+    /// The two halves answer two different questions, and the model needs both:
+    ///
+    /// - the **absolute** half says how loud, busy or bright this bar is for produced music at
+    ///   all. Without it a long quiet section (a breakdown, a quiet intro that the song then
+    ///   never beats) has nothing to be quiet *against* and settles in the middle of the scale;
+    /// - the **relative** half says whether this bar moves, against the last `history_bars`
+    ///   bars. Without it a track mastered 6 dB louder than the last one would sit a level higher
+    ///   all night, and a per-bar change of 0.3 dB would move the level as much as a drop.
     pub fn normalize(&self, value: f32) -> f32 {
-        if self.len >= 2 {
-            // Insertion sort over at most 32 floats: no allocation, and the ring is small enough
-            // that a heap sort would cost more than it saves.
-            let mut sorted = [0.0f32; HISTORY_CAP];
-            sorted[..self.len].copy_from_slice(&self.buf[..self.len]);
-            let s = &mut sorted[..self.len];
-            for i in 1..s.len() {
-                let mut j = i;
-                while j > 0 && s[j - 1] > s[j] {
-                    s.swap(j - 1, j);
-                    j -= 1;
-                }
-            }
-            let lo = percentile(s, 0.05);
-            let hi = percentile(s, 0.95);
-            if hi - lo > 1e-4 {
-                return ((value - lo) / (hi - lo)).clamp(0.0, 1.0);
+        if !value.is_finite() {
+            return 0.5;
+        }
+        let absolute = self.fallback_map(value);
+        let relative = self.relative_rank(value);
+        (0.5 * absolute + 0.5 * relative).clamp(0.0, 1.0)
+    }
+
+    /// The rank of `value` among the recorded bars and itself, blended toward 0.5 as the
+    /// window's spread falls below `full_span`, so a window with no dynamics at all reads the
+    /// middle instead of ranking by noise.
+    ///
+    /// A rank needs a handful of bars to mean anything: over three bars the loudest is the top
+    /// of the scale and the show opens at level 4. Until there are [`RANK_WARMUP_BARS`] bars the
+    /// relative half reads the middle, so the opening bars are judged by the fixed typical range
+    /// alone.
+    fn relative_rank(&self, value: f32) -> f32 {
+        if self.len < RANK_WARMUP_BARS {
+            return 0.5;
+        }
+        let (sorted, n) = self.window_with(value);
+        let s = &sorted[..n];
+        let n = n as f32;
+        let below = s.partition_point(|&other| other < value) as f32;
+        let equal = s.partition_point(|&other| other <= value) as f32 - below;
+        // Ties take the middle of their block, so a steady window ranks at 0.5.
+        let rank = (below + 0.5 * equal) / n;
+        // Full confidence when the window itself has dynamics, or when this bar is a clear
+        // departure from the window's middle (a lone drop under a steady run, which the
+        // percentiles alone cannot see).
+        let median = percentile(s, 0.5);
+        let span = percentile(s, 0.9) - percentile(s, 0.1);
+        let deviation = (value - median).abs();
+        let confidence = (span.max(deviation) / self.full_span).clamp(0.0, 1.0);
+        (0.5 + (rank - 0.5) * confidence).clamp(0.0, 1.0)
+    }
+
+    /// Where `value` sits between the 5th and 95th percentile of the recorded bars and itself:
+    /// 0.0 at the quiet edge, 0.5 in the middle, 1.0 at the loud edge. `None` when the window is
+    /// still too short or its percentile range is narrower than `min_span`, in which case there
+    /// is no range to place anything in and the caller should read the middle.
+    pub fn position(&self, value: f32, min_span: f32) -> Option<f32> {
+        if !value.is_finite() || self.len < 2 {
+            return None;
+        }
+        let (sorted, n) = self.window_with(value);
+        let s = &sorted[..n];
+        let lo = percentile(s, 0.05);
+        let hi = percentile(s, 0.95);
+        let span = hi - lo;
+        if span < min_span.max(1e-6) {
+            return None;
+        }
+        Some(((value - lo) / span).clamp(0.0, 1.0))
+    }
+
+    fn window_with(&self, value: f32) -> ([f32; HISTORY_CAP + 1], usize) {
+        // Insertion sort over at most 33 floats: no allocation, and the ring is small enough
+        // that a heap sort would cost more than it saves. Every value is finite.
+        let mut sorted = [0.0f32; HISTORY_CAP + 1];
+        sorted[..self.len].copy_from_slice(&self.buf[..self.len]);
+        sorted[self.len] = value;
+        let n = self.len + 1;
+        for i in 1..n {
+            let mut j = i;
+            while j > 0 && sorted[j - 1] > sorted[j] {
+                sorted.swap(j - 1, j);
+                j -= 1;
             }
         }
-        self.fallback_map(value)
+        (sorted, n)
     }
 
     fn fallback_map(&self, value: f32) -> f32 {
         let (lo, hi) = self.fallback;
         if hi - lo <= 1e-6 {
-            return 0.0;
+            return 0.5;
         }
         ((value - lo) / (hi - lo)).clamp(0.0, 1.0)
     }
@@ -245,18 +340,23 @@ impl Analyzer {
             loudness: LoudnessMeter::new(),
             grid: BeatGrid::new(config.phrase_bars),
             mono: Vec::with_capacity(config.fft_size.max(1024)),
-            low: RollingRange::new(DEFAULT_LOW_DB, history),
-            mid: RollingRange::new(DEFAULT_LOW_DB, history),
-            high: RollingRange::new(DEFAULT_LOW_DB, history),
-            loud: RollingRange::new(DEFAULT_LOUDNESS_DB, history),
-            bright: RollingRange::new(DEFAULT_BRIGHTNESS, history),
+            low: RollingRange::new(DEFAULT_LOW_DB, history, BAND_FULL_SPAN_DB),
+            mid: RollingRange::new(DEFAULT_LOW_DB, history, BAND_FULL_SPAN_DB),
+            high: RollingRange::new(DEFAULT_LOW_DB, history, BAND_FULL_SPAN_DB),
+            loud: RollingRange::new(DEFAULT_LOUDNESS_DB, history, LOUDNESS_FULL_SPAN_DB),
+            bright: RollingRange::new(DEFAULT_BRIGHTNESS, history, BRIGHTNESS_FULL_SPAN),
             acc: BarAccumulator::default(),
             bars: Vec::with_capacity(BAR_CAPACITY),
             events: EventFlags::empty(),
             intensity: intensity::IntensityModel::new(config.phrase_bars, config.history_bars),
             level: 1,
             intensity_value: 0.0,
-            frame: AnalysisFrame::default(),
+            frame: AnalysisFrame {
+                // A consumer that reads the first frame before any bar has closed must see the
+                // model's resting state, not the struct default of level 0.
+                level: 1,
+                ..AnalysisFrame::default()
+            },
             sample_rate: 48_000,
             sample_pos: 0,
             tempo: TempoTracker::new(48_000),
@@ -462,7 +562,10 @@ impl Analyzer {
         let loudness_db = (self.acc.loud_db * inv) as f32;
         let brightness = (self.acc.brightness * inv) as f32;
         let beats = completed.beats.max(1) as f32;
-        let onset_density = (self.acc.onsets as f32 / beats / ONSETS_PER_BEAT_MAX).clamp(0.0, 1.0);
+        // Onset peaks per beat, raw: the intensity model normalises it against its own window,
+        // and dividing by four here would cap the term at 1.0 for 16th-note material and make
+        // that normalisation dead code.
+        let onset_density = (self.acc.onsets as f32 / beats).clamp(0.0, ONSETS_PER_BEAT_MAX);
 
         // Normalise against the bars before this one, then let this bar into the window.
         let bar = BarStats {
@@ -507,4 +610,121 @@ impl Analyzer {
 /// Linear power to dBFS, floored at -120 dB so silence has a finite number.
 fn power_db(power: f32) -> f32 {
     10.0 * (power.max(1e-12)).log10()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FALLBACK: (f32, f32) = (-45.0, -8.0);
+    const FULL_SPAN: f32 = 3.0;
+
+    fn range() -> RollingRange {
+        RollingRange::new(FALLBACK, 32, FULL_SPAN)
+    }
+
+    /// The first bars of a show have no window to rank against, so they read the fixed typical
+    /// range blended with the middle of a rank they have not earned yet.
+    #[test]
+    fn the_first_bars_use_the_typical_range() {
+        let mut r = range();
+        assert!((r.normalize(-8.0) - 0.75).abs() < 1e-6);
+        assert!((r.normalize(-45.0) - 0.25).abs() < 1e-6);
+        assert!((r.normalize(-26.5) - 0.5).abs() < 1e-6);
+        r.push(-26.5);
+        // Still inside the warm-up: no rank yet, so the same value reads the same.
+        assert!((r.normalize(-26.5) - 0.5).abs() < 1e-6);
+        // The loud end of the typical range is still clearly above the quiet end.
+        assert!(r.normalize(-8.0) > r.normalize(-26.5));
+    }
+
+    /// A window with no spread has no rank to give, so a perfectly steady bar only reads its
+    /// absolute position: a steady loop at -20 dB reads 0.59, not the top of the scale.
+    #[test]
+    fn a_steady_window_reads_its_absolute_position() {
+        let mut r = range();
+        for _ in 0..32 {
+            r.push(-20.0);
+        }
+        let mapped = r.normalize(-20.0);
+        assert!(
+            (0.55..0.65).contains(&mapped),
+            "a steady -20 dB window mapped to {mapped}"
+        );
+    }
+
+    /// After a step up the new bars spread across the top of the window instead of clipping to
+    /// 1.0 together, which is what the old percentile map did for a whole window.
+    #[test]
+    fn a_step_up_spreads_the_ranks() {
+        let mut r = range();
+        for _ in 0..16 {
+            r.push(-30.0);
+        }
+        let first = r.normalize(-10.0);
+        r.push(-10.0);
+        for _ in 0..5 {
+            r.push(-10.0);
+        }
+        let sixth = r.normalize(-10.0);
+        assert!(
+            first > sixth,
+            "the bar that steps up ({first}) must read higher than the settled one ({sixth})"
+        );
+        assert!(
+            (0.6..0.9).contains(&sixth),
+            "the settled loud bar mapped to {sixth}"
+        );
+        // A quiet bar still reads low: its rank is the bottom of a window that is mostly quiet.
+        assert!(r.normalize(-30.0) < 0.45);
+    }
+
+    /// The absolute half is what keeps a long steady section where it belongs: the same window
+    /// shape at two listening levels maps 0.25 apart, so a breakdown is quiet relative to the
+    /// drop even once it is all the window contains.
+    #[test]
+    fn the_absolute_half_separates_quiet_from_loud() {
+        let mut quiet = range();
+        let mut loud = range();
+        for _ in 0..32 {
+            quiet.push(-30.0);
+            loud.push(-10.0);
+        }
+        let q = quiet.normalize(-30.0);
+        let l = loud.normalize(-10.0);
+        assert!(
+            l - q > 0.25,
+            "a steady -10 dB window mapped {l}, a steady -30 dB one {q}"
+        );
+        assert!(q < 0.5 && l > 0.65, "{q} and {l}");
+    }
+
+    /// A lone deep bar (a one-bar gap, a filtered bar) does not pin the bars after it at 1.0:
+    /// the ranks stay spread.
+    #[test]
+    fn one_outlier_does_not_pin_the_following_bars() {
+        let mut r = range();
+        for _ in 0..10 {
+            r.push(-20.0);
+        }
+        r.push(-40.0);
+        let top = r.normalize(-20.0);
+        let below = r.normalize(-21.0);
+        assert!(top < 0.99, "the steady level ranked {top}");
+        assert!(
+            below < top && below > 0.3,
+            "-21 dB below a -20 dB window ranked {below}, top {top}"
+        );
+    }
+
+    /// Values that are not finite never enter the window and never rank.
+    #[test]
+    fn non_finite_values_are_ignored() {
+        let mut r = range();
+        r.push(f32::NAN);
+        assert!(r.is_empty());
+        r.push(-20.0);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.normalize(f32::NAN), 0.5);
+    }
 }
