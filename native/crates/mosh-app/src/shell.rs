@@ -1,0 +1,981 @@
+//! The window shell: two windows and one render thread.
+//!
+//! The design's shape, once:
+//!
+//! - the **stage** window is a borderless fullscreen window on the first non-primary monitor, or
+//!   a borderless window on the laptop screen when that monitor is missing. It never shows UI.
+//! - the **control** window is a small window on the laptop screen. It has no scene yet (Task 2.7
+//!   builds the editors); until then its title carries the stats line and it is only updated when
+//!   the line changes, at most 30 times a second.
+//! - the **render thread** owns the analysis, the show and the GPU. It presents with a FIFO
+//!   swapchain, so the frame loop blocks on the display and never busy-waits.
+//!
+//! Nothing here is exercised by the crate's tests: windowed runs are coordinator-only on the
+//! reference machine (AGENTS.md). The decisions it implements are unit-tested in `core`,
+//! `monitor` and `budget`.
+//!
+//! Recovery, in the order it is tried: a render error rebuilds the stage (surface and swapchain);
+//! if that fails the device is recreated together with the visuals; if that fails too the app
+//! keeps ticking and tries again a second later. No dialog, no exit, no panic: a set must survive
+//! a monitor unplug, a device reset or a driver restart.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use mosh_core::{AnalysisFrame, Clip, Layer, Project, RenderPlan, ShowMode};
+use mosh_render::{FrameRecorder, Gpu, GpuPreference, RenderError, Stage};
+use mosh_visuals::{LayerSlot, Visuals};
+use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, NamedKey};
+use winit::monitor::MonitorHandle;
+use winit::raw_window_handle::HasWindowHandle;
+use winit::window::{Fullscreen, Window, WindowId};
+
+use crate::budget::BudgetWatch;
+use crate::core::{AppCore, SourceName, Status, default_project, stage_placement_label, title_for};
+use crate::monitor::{MonitorInfo, StagePlacement, monitor_choice};
+use crate::win::WindowHandle;
+
+/// How often the monitor list is re-read, so an unplugged or replugged stage is noticed without
+/// the human touching anything.
+const MONITOR_CHECK: Duration = Duration::from_secs(2);
+/// Stats are sent to the window thread at this rate; the control window's title is set at most
+/// 30 times a second regardless.
+const STATUS_INTERVAL: Duration = Duration::from_millis(100);
+const TITLE_INTERVAL: Duration = Duration::from_millis(33);
+/// Backoff after a failed rebuild.
+const RETRY_AFTER: Duration = Duration::from_millis(500);
+/// How often the same render error is logged again.
+const ERROR_REPEAT: Duration = Duration::from_secs(10);
+/// The tick when there is nothing to present, in place of a vsync wait.
+const IDLE_TICK: Duration = Duration::from_millis(16);
+
+/// The renderer and every target it needs, rebuilt as a unit.
+///
+/// Field order is the drop order: `mosh-render` says targets, pipelines and the compositor keep a
+/// clone of the device handle and must be dropped before the `Gpu`, so the device is last.
+struct Scene {
+    stage: Option<Stage>,
+    slots: Vec<LayerSlot>,
+    visuals: Option<Visuals>,
+    gpu: Option<Gpu>,
+    out: (u32, u32),
+}
+
+impl Scene {
+    /// A device, the visuals and one slot per layer. The stage is attached separately, because a
+    /// surface can fail while the show is perfectly able to keep drawing.
+    fn new(out: (u32, u32), layers: &[Layer]) -> Result<Scene, RenderError> {
+        // The reference machine's integrated GPU is the one the design budgets against. A machine
+        // without one (a development desktop) still runs the show on its only GPU, on a path that
+        // is never the reference: the log says so, once.
+        let gpu = match Gpu::new(GpuPreference::Integrated) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                static LOGGED: std::sync::Once = std::sync::Once::new();
+                LOGGED.call_once(|| {
+                    eprintln!(
+                        "moshloom: integrated GPU unavailable ({error}); falling back to the discrete GPU"
+                    )
+                });
+                Gpu::new(GpuPreference::Discrete)?
+            }
+        };
+        let (w, h) = internal_size(out, 0.5);
+        let visuals = Visuals::new(&gpu, w, h)?;
+        let mut scene = Scene {
+            stage: None,
+            slots: Vec::with_capacity(layers.len()),
+            visuals: Some(visuals),
+            gpu: Some(gpu),
+            out,
+        };
+        scene.rebuild_slots(layers);
+        Ok(scene)
+    }
+
+    fn gpu(&self) -> Result<&Gpu, RenderError> {
+        self.gpu
+            .as_ref()
+            .ok_or_else(|| RenderError::Stage("no device".into()))
+    }
+
+    fn rebuild_slots(&mut self, layers: &[Layer]) {
+        let gpu = match self.gpu.as_ref() {
+            Some(gpu) => gpu,
+            None => return,
+        };
+        self.slots.clear();
+        for (index, layer) in layers.iter().enumerate() {
+            let (w, h) = internal_size(self.out, layer.internal_scale);
+            self.slots.push(LayerSlot::new(gpu, index, w, h));
+        }
+    }
+
+    /// Resize the layer stack. The device and the window survive; only targets are rebuilt.
+    fn rescale(&mut self, out: (u32, u32), layers: &[Layer]) -> Result<(), RenderError> {
+        let gpu = self.gpu()?;
+        let (w, h) = internal_size(out, 0.5);
+        // Build the new visuals before dropping the old ones: if this fails the old scene is
+        // still intact and the next frame can try again.
+        let visuals = Visuals::new(gpu, w, h)?;
+        self.visuals = Some(visuals);
+        self.out = out;
+        self.rebuild_slots(layers);
+        if let Some(stage) = self.stage.as_mut() {
+            stage.resize(out.0, out.1);
+        }
+        Ok(())
+    }
+
+    /// Rebuild the surface and the swapchain on `handle`.
+    fn attach_stage(&mut self, handle: WindowHandle, monitor: Option<u32>) -> Result<(), RenderError> {
+        // Drop the old stage before asking for a new one: a lost surface usually means the window
+        // moved to another monitor.
+        self.stage = None;
+        let gpu = self.gpu()?;
+        let raw = handle.raw().ok_or(RenderError::UnsupportedWindow)?;
+        let stage = Stage::new(gpu, raw, monitor.map(mosh_render::MonitorId))?;
+        let extent = stage.extent();
+        if extent[0] > 0 && extent[1] > 0 {
+            self.out = (extent[0], extent[1]);
+        }
+        self.stage = Some(stage);
+        Ok(())
+    }
+
+    fn detach_stage(&mut self) {
+        self.stage = None;
+    }
+}
+
+/// The internal render size of a layer: the output size times its scale, never zero.
+fn internal_size(out: (u32, u32), scale: f32) -> (u32, u32) {
+    let scale = scale.clamp(0.125, 1.0);
+    (
+        ((out.0 as f32 * scale) as u32).max(16),
+        ((out.1 as f32 * scale) as u32).max(16),
+    )
+}
+
+/// Video for overlay layers, opened on first use and kept.
+#[derive(Default)]
+struct VideoBank {
+    sources: BTreeMap<u32, mosh_video::VideoSource>,
+    failed: BTreeSet<u32>,
+}
+
+impl VideoBank {
+    fn frame_for(&mut self, clip: &Clip, t_s: f64) -> Option<&mosh_video::VideoFrame> {
+        let path = clip.video.as_ref()?;
+        if !self.sources.contains_key(&clip.id) {
+            if self.failed.contains(&clip.id) {
+                return None;
+            }
+            match mosh_video::VideoSource::open(path) {
+                Ok(source) => {
+                    self.sources.insert(clip.id, source);
+                }
+                Err(error) => {
+                    eprintln!("moshloom: overlay video {} ({path}): {error}", clip.id);
+                    self.failed.insert(clip.id);
+                    return None;
+                }
+            }
+        }
+        self.sources.get_mut(&clip.id)?.frame_at(t_s)
+    }
+}
+
+/// What one presented frame measured.
+struct Outcome {
+    cpu_ms: f32,
+    gpu_ms: f32,
+    surface_lost: bool,
+}
+
+/// Draw every layer of `plan` and present the result. `frame_start` is when the frame's CPU work
+/// began, so `cpu_ms` covers analysis, the show and the recording but not the vsync wait.
+fn render_frame(
+    scene: &mut Scene,
+    plan: &RenderPlan,
+    analysis: &AnalysisFrame,
+    t: f32,
+    frame_start: Instant,
+    videos: &mut VideoBank,
+    project: &Project,
+) -> Result<Outcome, RenderError> {
+    let Some(gpu) = scene.gpu.as_ref() else {
+        return Err(RenderError::Stage("no device".into()));
+    };
+
+    // Overlay video goes into the layer's texture before the layer is drawn.
+    for (index, state) in plan.layers.iter().enumerate() {
+        let Some(clip_id) = state.clip else { continue };
+        let Some(clip) = project.clips.iter().find(|clip| clip.id == clip_id) else {
+            continue;
+        };
+        let Some(video) = videos.frame_for(clip, analysis.time_s) else {
+            continue;
+        };
+        let (width, height) = (video.w, video.h);
+        if let Some(visuals) = scene.visuals.as_mut() {
+            visuals
+                .overlay
+                .set_frame(gpu, index, width, height, &video.bgra)?;
+        }
+    }
+
+    // One slot per layer, with at least as many as the plan draws.
+    while scene.slots.len() < plan.layers.len() {
+        let index = scene.slots.len();
+        let (w, h) = internal_size(scene.out, 0.5);
+        scene.slots.push(LayerSlot::new(gpu, index, w, h));
+    }
+
+    let mut recorder = FrameRecorder::new(gpu);
+    {
+        let Some(visuals) = scene.visuals.as_mut() else {
+            return Err(RenderError::Stage("no visuals".into()));
+        };
+        for (index, state) in plan.layers.iter().enumerate() {
+            visuals.draw_layer(&mut recorder, &mut scene.slots[index], state, analysis, t)?;
+        }
+        for (index, state) in plan.layers.iter().enumerate() {
+            recorder.layer(scene.slots[index].output(), state.blend, state.opacity);
+        }
+    }
+
+    let cpu_ms = frame_start.elapsed().as_secs_f32() * 1_000.0;
+    let Some(stage) = scene.stage.as_mut() else {
+        // No window to present in: the layers were still drawn, so the next monitor that appears
+        // shows a current frame instead of a black one.
+        drop(recorder);
+        return Ok(Outcome {
+            cpu_ms,
+            gpu_ms: 0.0,
+            surface_lost: false,
+        });
+    };
+    let present = stage.present(recorder);
+    Ok(Outcome {
+        cpu_ms,
+        gpu_ms: stage.timings().frame_ms,
+        surface_lost: present.surface_lost,
+    })
+}
+
+/// Commands from the window thread to the render thread.
+enum Command {
+    Resize(u32, u32),
+    /// The stage window (re)appeared or moved: rebuild the surface on this handle.
+    ReplaceSurface {
+        handle: WindowHandle,
+        size: (u32, u32),
+        monitor: Option<u32>,
+    },
+    /// There is no stage window: keep the show running, present nothing.
+    DetachSurface,
+    SetMode(ShowMode),
+    Quit,
+}
+
+/// Events from the render thread to the window thread.
+#[derive(Clone, Debug)]
+pub enum UserEvent {
+    Status(Status),
+    /// The surface was lost (a monitor went away): re-place the stage window.
+    SurfaceLost,
+    /// A line for the terminal (a recovered error, a missing device).
+    Note(String),
+}
+
+struct RenderHandle {
+    tx: Sender<Command>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// The render thread's state.
+struct RenderThread {
+    core: AppCore,
+    project_layers: Vec<Layer>,
+    scene: Option<Scene>,
+    videos: VideoBank,
+    handle: Option<WindowHandle>,
+    monitor: Option<u32>,
+    size: (u32, u32),
+    rx: Receiver<Command>,
+    proxy: EventLoopProxy<UserEvent>,
+    budget: BudgetWatch,
+    started: Instant,
+    last_status: Option<Instant>,
+    last_error: Option<(Instant, String)>,
+    retry_at: Option<Instant>,
+}
+
+impl RenderThread {
+    fn new(
+        project: Project,
+        handle: Option<WindowHandle>,
+        size: (u32, u32),
+        monitor: Option<u32>,
+        rx: Receiver<Command>,
+        proxy: EventLoopProxy<UserEvent>,
+    ) -> RenderThread {
+        let project_layers = project.session.layers.clone();
+        RenderThread {
+            core: AppCore::open(project),
+            project_layers,
+            scene: None,
+            videos: VideoBank::default(),
+            handle,
+            monitor,
+            size,
+            rx,
+            proxy,
+            budget: BudgetWatch::new(),
+            started: Instant::now(),
+            last_status: None,
+            last_error: None,
+            retry_at: Some(Instant::now()),
+        }
+    }
+
+    fn apply(&mut self, command: Command) {
+        match command {
+            Command::Resize(width, height) => {
+                if width == 0 || height == 0 {
+                    return;
+                }
+                self.size = (width, height);
+                let result = match self.scene.as_mut() {
+                    Some(scene) => scene.rescale(self.size, &self.project_layers),
+                    None => Ok(()),
+                };
+                if let Err(error) = result {
+                    self.recover(&error);
+                }
+            }
+            Command::ReplaceSurface {
+                handle,
+                size,
+                monitor,
+            } => {
+                self.handle = Some(handle);
+                self.monitor = monitor;
+                if size.0 > 0 && size.1 > 0 {
+                    self.size = size;
+                }
+                if self.scene.is_none() {
+                    self.build();
+                    return;
+                }
+                let result = match self.scene.as_mut() {
+                    Some(scene) => scene
+                        .attach_stage(handle, self.monitor)
+                        .and_then(|()| scene.rescale(self.size, &self.project_layers)),
+                    None => Ok(()),
+                };
+                match result {
+                    Ok(()) => self.retry_at = None,
+                    Err(error) => self.recover(&error),
+                }
+            }
+            Command::DetachSurface => {
+                self.handle = None;
+                if let Some(scene) = self.scene.as_mut() {
+                    scene.detach_stage();
+                }
+            }
+            Command::SetMode(mode) => self.core.show_mut().set_mode(mode),
+            Command::Quit => {}
+        }
+    }
+
+    /// One frame: analyse, decide, draw, present, report.
+    fn frame(&mut self) {
+        let frame_start = Instant::now();
+        let frame = self.core.step(frame_start);
+
+        if self.scene.is_none() && self.retry_at.is_none_or(|at| frame_start >= at) {
+            self.build();
+        }
+        // A window that exists without a stage (a failed surface, a monitor change) gets its
+        // stage rebuilt on the retry interval.
+        let wants_stage = self.scene.as_ref().is_some_and(|scene| scene.stage.is_none());
+        if wants_stage && self.handle.is_some() && self.retry_at.is_none_or(|at| frame_start >= at) {
+            self.attach_stage();
+        }
+
+        let mut cpu_ms = 0.0;
+        let mut gpu_ms = 0.0;
+        let has_stage = self.scene.as_ref().is_some_and(|scene| scene.stage.is_some());
+        if has_stage {
+            if let Some(scene) = self.scene.as_mut() {
+                let t = self.started.elapsed().as_secs_f32();
+                match render_frame(
+                    scene,
+                    &frame.plan,
+                    &frame.analysis,
+                    t,
+                    frame_start,
+                    &mut self.videos,
+                    self.core.show().project(),
+                ) {
+                    Ok(outcome) => {
+                        cpu_ms = outcome.cpu_ms;
+                        gpu_ms = outcome.gpu_ms;
+                        if outcome.surface_lost {
+                            let _ = self.proxy.send_event(UserEvent::SurfaceLost);
+                        }
+                    }
+                    Err(error) => self.recover(&error),
+                }
+            }
+        } else {
+            // Nothing to present: the show keeps its clock, and the loop sleeps instead of
+            // spinning on an acquire that can never succeed.
+            std::thread::sleep(IDLE_TICK);
+        }
+
+        for line in self.budget.sample(cpu_ms, gpu_ms, Instant::now()) {
+            eprintln!("moshloom: {line}");
+        }
+
+        if self
+            .last_status
+            .is_none_or(|at| frame_start.saturating_duration_since(at) >= STATUS_INTERVAL)
+        {
+            self.last_status = Some(frame_start);
+            let status = Status {
+                mode: frame.mode.into(),
+                source: SourceName(frame.source),
+                tempo_bpm: frame.analysis.tempo_bpm,
+                bar: frame.analysis.bar_index,
+                bar_phase: frame.analysis.bar_phase,
+                level: frame.analysis.level,
+                gpu_ms,
+                cpu_ms,
+            };
+            let _ = self.proxy.send_event(UserEvent::Status(status));
+        }
+    }
+
+    fn build(&mut self) {
+        self.scene = None;
+        match Scene::new(self.size, &self.project_layers) {
+            Ok(mut scene) => {
+                if let Some(handle) = self.handle
+                    && let Err(error) = scene.attach_stage(handle, self.monitor)
+                {
+                    self.note_once(format!("stage could not be built: {error}"));
+                }
+                // The swapchain may have picked its own extent; size the layer stack to the
+                // window the app placed.
+                if let Err(error) = scene.rescale(self.size, &self.project_layers) {
+                    self.note_once(format!("layer stack could not be built: {error}"));
+                }
+                self.scene = Some(scene);
+                self.retry_at = None;
+            }
+            Err(error) => {
+                self.note_once(format!("renderer could not be built: {error}"));
+                self.retry_at = Some(Instant::now() + RETRY_AFTER);
+            }
+        }
+    }
+
+    fn attach_stage(&mut self) {
+        let Some(handle) = self.handle else { return };
+        let result = match self.scene.as_mut() {
+            Some(scene) => scene.attach_stage(handle, self.monitor),
+            None => return,
+        };
+        match result {
+            Ok(()) => self.retry_at = None,
+            Err(error) => {
+                self.note_once(format!("stage could not be built: {error}"));
+                self.retry_at = Some(Instant::now() + RETRY_AFTER);
+            }
+        }
+    }
+
+    /// Rebuild after a render error: the stage first, the device and the visuals if that fails.
+    fn recover(&mut self, error: &RenderError) {
+        let now = Instant::now();
+        self.note_once(format!("render error: {error}; rebuilding"));
+        if self.retry_at.is_some_and(|at| now < at) {
+            return;
+        }
+        self.retry_at = Some(now + RETRY_AFTER);
+
+        if self.scene.is_some() {
+            let stage_step = match (self.scene.as_mut(), self.handle) {
+                (Some(scene), Some(handle)) => scene.attach_stage(handle, self.monitor),
+                _ => Err(RenderError::Stage("no surface".into())),
+            };
+            if stage_step.is_ok() {
+                let rescale = match self.scene.as_mut() {
+                    Some(scene) => scene.rescale(self.size, &self.project_layers),
+                    None => Ok(()),
+                };
+                if rescale.is_ok() {
+                    self.retry_at = None;
+                    return;
+                }
+            }
+            // The surface could not be rebuilt on this device: assume the device is gone too.
+            self.scene = None;
+        }
+        self.build();
+    }
+
+    /// One terminal line per distinct failure per [`ERROR_REPEAT`], so a rebuild loop cannot bury
+    /// the first message in per-frame noise.
+    fn note_once(&mut self, text: String) {
+        let now = Instant::now();
+        let repeat = self
+            .last_error
+            .as_ref()
+            .is_none_or(|(at, last)| *last != text || at.elapsed() >= ERROR_REPEAT);
+        if repeat {
+            self.last_error = Some((now, text.clone()));
+            self.note(text);
+        }
+    }
+
+    fn note(&self, text: String) {
+        let _ = self.proxy.send_event(UserEvent::Note(text));
+    }
+}
+
+/// Run one frame loop until the window thread asks it to stop.
+///
+/// A panic in one frame must not end a set: the renderer is dropped, rebuilt and the loop
+/// continues. (A driver that aborts the process cannot be caught; nothing can.)
+fn render_main(mut thread: RenderThread) {
+    loop {
+        let mut quit = false;
+        while let Ok(command) = thread.rx.try_recv() {
+            if matches!(command, Command::Quit) {
+                quit = true;
+                break;
+            }
+            thread.apply(command);
+        }
+        if quit {
+            break;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| thread.frame()));
+        if result.is_err() {
+            thread.scene = None;
+            thread.note_once("render thread panicked; rebuilding the renderer".to_string());
+            thread.retry_at = Some(Instant::now() + RETRY_AFTER);
+            std::thread::sleep(RETRY_AFTER);
+        }
+    }
+}
+
+/// The window thread's state.
+struct Shell {
+    project: Project,
+    note: Option<String>,
+    proxy: EventLoopProxy<UserEvent>,
+    stage_window: Option<Window>,
+    control_window: Option<Window>,
+    monitors: Vec<MonitorHandle>,
+    monitor_list: Vec<MonitorInfo>,
+    placement: Option<StagePlacement>,
+    render: Option<RenderHandle>,
+    title: Option<String>,
+    last_title_at: Option<Instant>,
+    next_monitor_check: Option<Instant>,
+    started: bool,
+}
+
+impl Shell {
+    fn new(project: Project, note: Option<String>, proxy: EventLoopProxy<UserEvent>) -> Shell {
+        Shell {
+            project,
+            note,
+            proxy,
+            stage_window: None,
+            control_window: None,
+            monitors: Vec::new(),
+            monitor_list: Vec::new(),
+            placement: None,
+            render: None,
+            title: None,
+            last_title_at: None,
+            next_monitor_check: None,
+            started: false,
+        }
+    }
+
+    fn send(&self, command: Command) {
+        if let Some(render) = self.render.as_ref() {
+            let _ = render.tx.send(command);
+        }
+    }
+
+    fn refresh_monitors(&mut self, event_loop: &ActiveEventLoop) {
+        let primary = event_loop.primary_monitor();
+        self.monitors.clear();
+        self.monitor_list.clear();
+        for (index, monitor) in event_loop.available_monitors().enumerate() {
+            let size = monitor.size();
+            let name = monitor.name().unwrap_or_else(|| format!("monitor {index}"));
+            let is_primary = match primary.as_ref() {
+                Some(primary) => same_monitor(primary, &monitor),
+                None => index == 0,
+            };
+            self.monitor_list.push(MonitorInfo::new(
+                index as u32,
+                name,
+                is_primary,
+                size.width,
+                size.height,
+            ));
+            self.monitors.push(monitor);
+        }
+    }
+
+    fn monitor(&self, index: u32) -> Option<MonitorHandle> {
+        self.monitors.get(index as usize).cloned()
+    }
+
+    fn create_control_window(&mut self, event_loop: &ActiveEventLoop) {
+        let title = self
+            .note
+            .as_deref()
+            .unwrap_or("moshloom · control")
+            .to_string();
+        let attributes = Window::default_attributes()
+            .with_title(title)
+            .with_inner_size(PhysicalSize::new(560, 320))
+            .with_min_inner_size(PhysicalSize::new(360, 200));
+        match event_loop.create_window(attributes) {
+            Ok(window) => self.control_window = Some(window),
+            Err(error) => self.log(format!("control window could not be created: {error}")),
+        }
+    }
+
+    /// Create the stage window for the current monitor list, if there is anything to present on.
+    fn create_stage(&mut self, event_loop: &ActiveEventLoop) {
+        self.refresh_monitors(event_loop);
+        let placement = monitor_choice(&self.monitor_list);
+        self.placement = Some(placement);
+        self.log(stage_placement_label(placement, &self.monitor_list));
+        let Some(index) = placement.monitor() else {
+            // No monitor at all: leave the stage absent and keep the show running.
+            self.send(Command::DetachSurface);
+            return;
+        };
+        let Some(monitor) = self.monitor(index) else {
+            self.send(Command::DetachSurface);
+            return;
+        };
+        let size = monitor.size();
+        let mut attributes = Window::default_attributes()
+            .with_title("moshloom stage")
+            .with_decorations(false)
+            .with_visible(true);
+        if placement.is_fullscreen() {
+            attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
+        } else {
+            attributes = attributes
+                .with_inner_size(size)
+                .with_position(monitor.position());
+        }
+        match event_loop.create_window(attributes) {
+            Ok(window) => {
+                self.stage_window = Some(window);
+                self.send_replace_surface();
+            }
+            Err(error) => {
+                self.log(format!("stage window could not be created: {error}"));
+                self.send(Command::DetachSurface);
+            }
+        }
+    }
+
+    fn send_replace_surface(&mut self) {
+        let Some(window) = self.stage_window.as_ref() else {
+            self.send(Command::DetachSurface);
+            return;
+        };
+        let Ok(handle) = window.window_handle() else {
+            self.send(Command::DetachSurface);
+            return;
+        };
+        let Some(handle) = WindowHandle::from_raw(handle.as_raw()) else {
+            self.log("the stage window is not a Win32 window".to_string());
+            self.send(Command::DetachSurface);
+            return;
+        };
+        let size = window.inner_size();
+        self.send(Command::ReplaceSurface {
+            handle,
+            size: (size.width.max(1), size.height.max(1)),
+            monitor: self.placement.and_then(StagePlacement::monitor),
+        });
+    }
+
+    fn start_render(&mut self) {
+        if self.render.is_some() {
+            return;
+        }
+        let (handle, size) = match self.stage_window.as_ref() {
+            Some(window) => {
+                let handle = window
+                    .window_handle()
+                    .ok()
+                    .and_then(|handle| WindowHandle::from_raw(handle.as_raw()));
+                let size = window.inner_size();
+                (handle, (size.width.max(1), size.height.max(1)))
+            }
+            None => (None, (1920, 1080)),
+        };
+        let (tx, rx) = channel();
+        let project = self.project.clone();
+        let monitor = self.placement.and_then(StagePlacement::monitor);
+        let proxy = self.proxy.clone();
+        match std::thread::Builder::new()
+            .name("mosh-render".into())
+            .spawn(move || render_main(RenderThread::new(project, handle, size, monitor, rx, proxy)))
+        {
+            Ok(thread) => {
+                self.render = Some(RenderHandle {
+                    tx,
+                    thread: Some(thread),
+                })
+            }
+            Err(error) => self.log(format!("render thread could not start: {error}")),
+        }
+    }
+
+    /// Move the stage window to wherever `monitor_choice` now says it goes.
+    fn update_stage_placement(&mut self, event_loop: &ActiveEventLoop) {
+        let placement = monitor_choice(&self.monitor_list);
+        if Some(placement) == self.placement {
+            return;
+        }
+        self.placement = Some(placement);
+
+        if placement.is_hidden() {
+            if let Some(window) = self.stage_window.as_ref() {
+                window.set_visible(false);
+            }
+            self.send(Command::DetachSurface);
+            return;
+        }
+        if self.stage_window.is_none() {
+            self.create_stage(event_loop);
+            return;
+        }
+        let Some(index) = placement.monitor() else {
+            return;
+        };
+        let Some(monitor) = self.monitor(index) else {
+            return;
+        };
+        self.log(stage_placement_label(placement, &self.monitor_list));
+        if let Some(window) = self.stage_window.as_ref() {
+            apply_stage_placement(window, placement, &monitor);
+        }
+        self.send_replace_surface();
+    }
+
+    fn log(&self, text: String) {
+        eprintln!("moshloom: {text}");
+    }
+
+    fn shutdown(&mut self) {
+        self.send(Command::Quit);
+        if let Some(mut render) = self.render.take()
+            && let Some(thread) = render.thread.take()
+        {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Put the stage window where `placement` says it belongs.
+fn apply_stage_placement(window: &Window, placement: StagePlacement, monitor: &MonitorHandle) {
+    match placement {
+        StagePlacement::Fullscreen(_) => {
+            window.set_visible(true);
+            window.set_fullscreen(Some(Fullscreen::Borderless(Some(monitor.clone()))));
+        }
+        StagePlacement::Laptop(_) => {
+            window.set_visible(true);
+            window.set_fullscreen(None);
+            window.set_decorations(false);
+            window.set_outer_position(monitor.position());
+            let _ = window.request_inner_size(monitor.size());
+        }
+        StagePlacement::Hidden => window.set_visible(false),
+    }
+}
+
+/// `MonitorHandle` has no identity of its own, so two handles are the same monitor when they
+/// agree on the name, size and position (all the OS tells us).
+fn same_monitor(a: &MonitorHandle, b: &MonitorHandle) -> bool {
+    a.name() == b.name() && a.size() == b.size() && a.position() == b.position()
+}
+
+impl ApplicationHandler<UserEvent> for Shell {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        if let Some(note) = self.note.clone() {
+            self.log(note);
+        }
+        self.refresh_monitors(event_loop);
+        self.create_control_window(event_loop);
+        self.create_stage(event_loop);
+        self.start_render();
+        self.next_monitor_check = Some(Instant::now() + MONITOR_CHECK);
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + MONITOR_CHECK));
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let is_control = self.control_window.as_ref().map(Window::id) == Some(window_id);
+        let is_stage = self.stage_window.as_ref().map(Window::id) == Some(window_id);
+
+        match event {
+            WindowEvent::CloseRequested => {
+                if is_control {
+                    // The human closed the window they drive the app from: that is a quit.
+                    event_loop.exit();
+                }
+                // A stage window close request is never a reason to end a set: it is ignored.
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key,
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if !is_control {
+                    return;
+                }
+                match logical_key {
+                    Key::Named(NamedKey::Escape) => event_loop.exit(),
+                    // Mode keys, for rehearsing without the editors (Task 2.7 owns the real
+                    // control surface). 1 = arrangement, 2 = session, 3 = autopilot.
+                    Key::Character(key) if key.as_str() == "1" => {
+                        self.send(Command::SetMode(ShowMode::Arrangement))
+                    }
+                    Key::Character(key) if key.as_str() == "2" => {
+                        self.send(Command::SetMode(ShowMode::Session))
+                    }
+                    Key::Character(key) if key.as_str() == "3" => {
+                        self.send(Command::SetMode(ShowMode::Autopilot))
+                    }
+                    _ => {}
+                }
+            }
+            WindowEvent::Resized(size) => {
+                if is_stage && size.width > 0 && size.height > 0 {
+                    self.send(Command::Resize(size.width, size.height));
+                }
+            }
+            WindowEvent::Destroyed => {
+                if is_stage {
+                    self.stage_window = None;
+                    self.placement = None;
+                    self.send(Command::DetachSurface);
+                } else if is_control {
+                    self.control_window = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Status(status) => {
+                let Some(title) = title_for(self.title.as_deref(), &status) else {
+                    return;
+                };
+                let due = self
+                    .last_title_at
+                    .is_none_or(|at| at.elapsed() >= TITLE_INTERVAL);
+                if !due {
+                    return;
+                }
+                if let Some(window) = self.control_window.as_ref() {
+                    window.set_title(&title);
+                }
+                self.title = Some(title);
+                self.last_title_at = Some(Instant::now());
+            }
+            UserEvent::SurfaceLost => {
+                // The stage's surface went away (a monitor was unplugged): re-place the window
+                // where the monitors now say it goes, and rebuild the surface on its handle.
+                self.refresh_monitors(event_loop);
+                self.update_stage_placement(event_loop);
+                self.send_replace_surface();
+            }
+            UserEvent::Note(text) => self.log(text),
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if self.next_monitor_check.is_none_or(|at| now >= at) {
+            self.next_monitor_check = Some(now + MONITOR_CHECK);
+            self.refresh_monitors(event_loop);
+            self.update_stage_placement(event_loop);
+            if self.stage_window.is_none() && !self.placement.is_some_and(StagePlacement::is_hidden) {
+                // A monitor came back after the stage had no window at all.
+                self.create_stage(event_loop);
+                self.send_replace_surface();
+            }
+        }
+        let next = self.next_monitor_check.unwrap_or(now + MONITOR_CHECK);
+        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+    }
+}
+
+/// Run the app: the project from the first argument, or the default Autopilot show.
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::env::args().nth(1);
+    let (project, note) = match path.as_deref() {
+        None => (default_project(), None),
+        Some(path) => match mosh_show::io::load(path) {
+            Ok(project) => (project, None),
+            Err(error) => (
+                default_project(),
+                Some(format!(
+                    "project {path} could not be read ({error}); running the default show"
+                )),
+            ),
+        },
+    };
+
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let proxy = event_loop.create_proxy();
+    let mut shell = Shell::new(project, note, proxy);
+    event_loop.run_app(&mut shell)?;
+    shell.shutdown();
+    Ok(())
+}
