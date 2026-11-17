@@ -1,0 +1,11 @@
+# Bundle name for nih-plug's bundler. nih-plug reads `bundler.toml` from the *workspace* root, so
+# the coordinator needs a copy at `native/bundler.toml` for this name to take effect:
+#
+#     [mosh_tap]
+#     name = "Moshloom Tap"
+#
+# Without it the bundler falls back to the package name and produces `mosh-tap.vst3`. Either way
+# one bundle holds both plugin classes: the VST3 factory exported from this crate reports
+# "Moshloom Tap" and "Moshloom Control", and Live lists them as two plugins.
+[mosh_tap]
+name = "Moshloom Tap"
