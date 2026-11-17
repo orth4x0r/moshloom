@@ -8,3 +8,4 @@ publish.workspace = true
 
 [dependencies]
 mosh-core = { path = "../mosh-core" }
+rustfft = "6.4.1"
