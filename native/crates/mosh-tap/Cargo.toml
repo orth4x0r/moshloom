@@ -18,7 +18,7 @@ nih_plug = { git = "https://github.com/robbert-vdh/nih-plug", rev = "de421011f41
 mosh-ipc = { path = "../mosh-ipc", optional = true }
 
 [features]
-default = []
+default = ["ipc"]
 ipc = ["dep:mosh-ipc"]
 
 [lints.rust]

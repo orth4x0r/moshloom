@@ -34,6 +34,12 @@ impl IpcSink {
     }
 }
 
+impl std::fmt::Debug for IpcSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IpcSink").finish_non_exhaustive()
+    }
+}
+
 impl BlockSink for IpcSink {
     fn push_block(&mut self, transport: Option<&Transport>, interleaved: &[f32], frames: u32) {
         self.writer.push_block(transport, interleaved, frames);
