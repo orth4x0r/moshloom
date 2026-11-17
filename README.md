@@ -466,6 +466,7 @@ Vulkan SDK (1.4.363.0 on the reference machine). `cargo test --workspace` is the
 | --- | --- |
 | **Ableton -> app** (Live 12, Tap on the master, by the performer) | works: the app switches to plugin mode and follows the set |
 | control window idle frame (egui layout + tessellation, release, no paint) | Session 0.047 ms, Clip editor 0.338 ms |
+| **stress project** (3 layers: tunnel+mosh+zoom+echo, fluid+mirror, numogram+mosh+streak; video overlay) on the laptop panel, 2560x1600 at 120 Hz, layers at 1280x800, release | **over budget**: GPU 20-24 ms per frame (budget 6 ms at 1080p60), render thread 1.0-1.7 ms, process 18% of one core, 593 MB (budget 500 MB) |
 | **first app run**, loopback, nothing playing (release, integrated GPU, laptop screen only) | GPU 0.70-0.75 ms, render thread 0.05-0.11 ms per frame; process about 5.5% of one core; 322 MB |
 | **app + mosh-feed**, "reza pedia" (93 BPM) from 0:30 for 54 s | plugin mode, 93.0 BPM, bars advancing, Autopilot changed scenes; GPU 0.77-1.53 ms, render thread 0.08-0.19 ms; process about 5.6% of one core; 285 MB |
 | `IpcWriter::push_block`, 256 stereo frames | median 200 ns, p99 500 ns, 0 allocations / 10 000 |
@@ -494,6 +495,11 @@ is at most one step per bar. The app also starts a fresh analyzer when the input
 Known gap: two loud sections 7 dB apart (bars 9-23 and 24-39) both read level 4; telling sections
 apart is what the hand-placed marks are for. The first second after start logs one budget
 line (shader compilation, 6-14 ms on the render thread).
+
+Known gap: the stress project is about 4x over the GPU budget on the laptop panel, which is also
+twice the pixels and twice the frame rate of the 1080p60 case the budget is written for; the stage
+needs a 60 fps cap and a per-pass profile at 1080p (in progress, V-budget). `mosh-stress-project
+out.ron <video>` writes that project.
 
 Not measured yet: anything in Ableton, a second monitor, the app on battery, latency from audio to
 picture. Those are coordinator runs on the reference machine once the app lands.
