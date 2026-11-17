@@ -470,7 +470,8 @@ fn build(gpu: &Gpu, source: &str, name: &str, uniforms: usize, textures: u32) ->
 fn palette_for(params: &ClipParams, scene: Option<usize>) -> u16 {
     match params.palette {
         1..=7 => params.palette,
-        _ => scene.map_or(1, |index| DEFPAL[index]),
+        // Style-pack scenes sit after the 16 web scenes and have no engine.c default: palette 1.
+        _ => scene.and_then(|index| DEFPAL.get(index).copied()).unwrap_or(1),
     }
 }
 

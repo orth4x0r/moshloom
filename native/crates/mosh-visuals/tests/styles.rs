@@ -64,3 +64,22 @@ fn the_catalog_lists_every_visualizer_once() {
     }
     assert_eq!(entries.len(), VISUALIZERS.len() + 4 + styles::all().count());
 }
+
+/// A new clip's palette is 0 ("the scene's default"); style scenes have no engine.c default and
+/// used to index past the 16-entry table (a panic in `Scenes::draw`).
+#[test]
+fn style_scenes_draw_with_the_default_palette() {
+    use mosh_core::{AnalysisFrame, ClipParams};
+    use mosh_render::{FrameRecorder, Gpu, GpuPreference, LayerTarget};
+    use mosh_visuals::scenes::Scenes;
+    let Some(scene) = styles::all().next() else { return };
+    let gpu = Gpu::new(GpuPreference::Integrated).expect("a Vulkan device");
+    let mut scenes = Scenes::new(&gpu).expect("scenes");
+    let dst = LayerTarget::new(&gpu, 64, 36);
+    let params = ClipParams { palette: 0, ..ClipParams::default() };
+    let mut rec = FrameRecorder::new(&gpu);
+    scenes
+        .draw(&mut rec, &dst, scene.id, &AnalysisFrame::default(), &params, 0.5)
+        .expect("draw");
+    gpu.wait_frame(rec.submit());
+}
