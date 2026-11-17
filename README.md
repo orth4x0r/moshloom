@@ -452,7 +452,11 @@ cargo run --manifest-path crates/mosh-tap/xtask/Cargo.toml -- bundle mosh-tap --
 #      under Ilana Audio)
 ```
 
-Run it: `target/release/ilanaVisual.exe [project.ron]` (no project: Autopilot over the 16 scenes).
+Run it: `target/release/ilanaVisual.exe [project.ron] [--fps 60]` (no project: Autopilot over the
+16 scenes). `--fps` caps the stage's frame rate (`0` = uncapped, default 60): the stage presents in
+FIFO, so without a cap a 120 Hz panel draws 120 frames a second, twice the rate the budget is
+written for. The wait uses a high-resolution waitable timer, not `Sleep` (Windows quantises that to
+the 15.6 ms system tick: 12 waits of 10 ms take 123.3 ms with the timer, 31 ms each without).
 Without Ableton, `target/release/mosh-feed.exe "<track>.wav" [--bpm 93] [--start-s 30]` plays a
 track into shared memory with a beat-accurate transport, silently, so the app runs in plugin mode.
 
@@ -460,13 +464,22 @@ Needs Rust 1.99 (MSVC; `native/rust-toolchain.toml`) and, for GPU tests with val
 Vulkan SDK (1.4.363.0 on the reference machine). `cargo test --workspace` is the native gate;
 `npm test` stays the web gate.
 
+The whole frame can be measured without a window:
+`cargo run --release -p mosh-visuals --bin mosh-budget` builds the stress project's layer stack and
+the compositor exactly as the app does, drives 300 synthetic frames at 1920x1080 (and then at
+2560x1600) and prints per-pass GPU milliseconds, the total's median and p95, render-thread CPU per
+frame, and the GPU memory the stack holds. No window is opened, so it is not the on-battery
+number — it is the same work minus presentation.
+
 ### Measured so far
 
 | what | number |
 | --- | --- |
 | **Ableton -> app** (Live 12, Tap on the master, by the performer) | works: the app switches to plugin mode and follows the set |
 | control window idle frame (egui layout + tessellation, release, no paint) | Session 0.047 ms, Clip editor 0.338 ms |
-| **stress project** (3 layers: tunnel+mosh+zoom+echo, fluid+mirror, numogram+mosh+streak; video overlay) on the laptop panel, 2560x1600 at 120 Hz, layers at 1280x800, release | **over budget**: GPU 20-24 ms per frame (budget 6 ms at 1080p60), render thread 1.0-1.7 ms, process 18% of one core, 593 MB (budget 500 MB) |
+| **stress project**, `mosh-budget`, offscreen release, **1920x1080 output, 960x540 layers**, 300 frames | **GPU median 4.82 ms, p95 6.05 ms** (steady frames: median 4.79, p95 4.99; 2-beat 4-layer crossfade frames: median 6.02, max 6.23) against a 6 ms budget; render-thread CPU (recording + overlay upload) median 0.82 ms; 132 MB of targets and textures |
+| **stress project**, same bench at **2560x1600** (the laptop panel, 1280x800 layers) | GPU median 9.15 ms, p95 11.57 ms (steady 8.84 / 9.99; crossfade 10.56); CPU median 1.30 ms; 232 MB |
+| stress project on the laptop panel, windowed at 120 Hz, before the frame cap and the profile (release, 2.6 Mpx panels, FIFO) | GPU 20-24 ms per frame, render thread 1.0-1.7 ms, process 18% of one core, 593 MB — twice the pixels and twice the frame rate of the budget's case |
 | **first app run**, loopback, nothing playing (release, integrated GPU, laptop screen only) | GPU 0.70-0.75 ms, render thread 0.05-0.11 ms per frame; process about 5.5% of one core; 322 MB |
 | **app + mosh-feed**, "reza pedia" (93 BPM) from 0:30 for 54 s | plugin mode, 93.0 BPM, bars advancing, Autopilot changed scenes; GPU 0.77-1.53 ms, render thread 0.08-0.19 ms; process about 5.6% of one core; 285 MB |
 | `IpcWriter::push_block`, 256 stereo frames | median 200 ns, p99 500 ns, 0 allocations / 10 000 |
@@ -482,10 +495,13 @@ Vulkan SDK (1.4.363.0 on the reference machine). `cargo test --workspace` is the
 | 16 web scenes at 960x540 (debug, integrated GPU) | all lit at 3 levels x 3 seeds (144/144 draws), 0 validation messages; 0.10-0.32 ms each; Numogram 0.63 ms (was 3.48, pixel-identical) and Swarm 0.24 ms per frame (was 2.04, 0.11/255 worst difference) since V-perf |
 | datamosh refresh (I-frame) | on a clip change, a drop, every fourth bar of Live's bars, and playback jumps; new picture 25/255 without, 255/255 with the refresh |
 | datamosh, one layer (debug, integrated GPU) | 0.88 ms at 960x540, 2.09 ms at 1280x720; a static picture stays exact (0/255), a moving bar leaves its trail behind it |
+| datamosh motion estimate, 4x4 block subsample vs the full 8x8 search (V-budget) | 236 of 240 vectors identical over 6 frames of a moving bar; the pass went 1.56 -> 0.36 ms per layer per frame at 1080p |
 | fluid visualizer, one layer at 1280x720 internal (debug) | 0.80-1.12 ms (17 passes, 8 pressure iterations); 10 000 noisy frames with no NaN |
 | effects lane, all 8 effects in one pass at 960x540 (debug, integrated GPU) | 0.91-1.01 ms; amount 0 is the exact identity (0 of 9216 pixels change) |
 | Strobe at 16 requests/s for 1 s | 3 flash starts (limiter) and 3 luminance jumps (read back) |
 | overlay video, 1080p (debug, integrated GPU) | recorded inside the frame (1 submission per frame): 0.12-0.22 ms CPU per frame (was 1.7-2.6 ms of waiting); 0 new GPU allocations over 600 frames |
+| compositor, 4 layers, 1920x1080 (V-budget) | one pass instead of one per layer: 1.02 -> 0.69 ms, and it writes the swapchain image directly, so the 16F copy of the frame and its blit are gone (1.2 ms and 16 MB at 1080p) |
+| stage frame rate cap | `--fps` (default 60): at most 60 frames a second on a 120 Hz panel, one high-resolution wait per frame, no spin; a stale deadline resyncs instead of bursting |
 
 Intensity (since #46): levels now follow the music. "reza pedia" from 0:00: level 2 through the
 intro (bars 1-8, about -27 dB), 3 then 4 when the beat comes in, 4 through the loud part, down
@@ -496,10 +512,18 @@ Known gap: two loud sections 7 dB apart (bars 9-23 and 24-39) both read level 4;
 apart is what the hand-placed marks are for. The first second after start logs one budget
 line (shader compilation, 6-14 ms on the render thread).
 
-Known gap: the stress project is about 4x over the GPU budget on the laptop panel, which is also
-twice the pixels and twice the frame rate of the 1080p60 case the budget is written for; the stage
-needs a 60 fps cap and a per-pass profile at 1080p (in progress, V-budget). `mosh-stress-project
-out.ron <video>` writes that project.
+Known gap: the stress project's *steady* 1080p frame is inside the 6 ms GPU budget (p95 4.99 ms),
+and so is a 2-beat crossfade frame on its own (median 6.02 ms), but the 300-frame run's p95 is
+6.05 ms: 20% of those frames carry a four-layer crossfade, so the p95 frame *is* one. What is left
+to cut, in the order the profile says: the compositor samples four 960x540 layers with a bilinear
+upscale at the output size (0.69 ms), then effects (0.73), the two motion estimates (0.72), the
+two datamosh feedbacks (0.65), the overlay upload (0.40) and the fluid solver plus its present pass
+(0.47). `mosh-budget` prints that table; `mosh-stress-project out.ron <video>` writes the project.
+Memory: the renderer holds 124 MB at 1080p and 217 MB at 2560x1600 with four layers, plus the
+driver's swapchain (~25 MB at 1080p, ~49 MB at 2560x1600) and the app's own heap; the windowed
+process working set was 593 MB at 2560x1600 before this pass and has not been re-measured windowed.
+Candidate for the next pass: the two remaining ping-pong pairs per layer (the scene and transition
+targets already hold one image each), ~2 MB per layer per pair at 1080p.
 
 Not measured yet: anything in Ableton, a second monitor, the app on battery, latency from audio to
 picture. Those are coordinator runs on the reference machine once the app lands.

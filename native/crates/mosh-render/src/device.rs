@@ -12,6 +12,7 @@
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -72,9 +73,52 @@ pub(crate) fn count_submission() {
     QUEUE_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Live device memory the renderer holds, in bytes and allocations.
+///
+/// Every image and buffer this crate allocates is added here and every `Drop` that frees one
+/// subtracts it again, so [`Gpu::allocated_bytes`] is a *live* figure: on an integrated GPU it is
+/// system RAM the process is holding, which is what the design's "< 500 MB" memory budget is
+/// about. The per-target numbers a budget test prints come from this same counter.
+///
+/// Keyed by the `vk::DeviceMemory` handle, so a release never has to remember a size and the
+/// figure is the driver's own aligned allocation size, not the requested byte count.
+#[derive(Clone, Default)]
+pub(crate) struct Allocations(Rc<RefCell<AllocationsInner>>);
+
+#[derive(Default)]
+struct AllocationsInner {
+    live: Vec<(vk::DeviceMemory, u64)>,
+    bytes: u64,
+}
+
+impl Allocations {
+    pub(crate) fn add(&self, memory: vk::DeviceMemory, bytes: u64) {
+        let mut inner = self.0.borrow_mut();
+        inner.live.push((memory, bytes));
+        inner.bytes += bytes;
+    }
+
+    /// A freed allocation. Releasing a handle this tracker never saw (or saw already) is a no-op:
+    /// a budget line must never turn into a wrap-around on a double drop.
+    pub(crate) fn release(&self, memory: vk::DeviceMemory) {
+        let mut inner = self.0.borrow_mut();
+        if let Some(index) = inner.live.iter().position(|(handle, _)| *handle == memory) {
+            let (_, bytes) = inner.live.swap_remove(index);
+            inner.bytes = inner.bytes.saturating_sub(bytes);
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.0.borrow().bytes
+    }
+
+    pub(crate) fn count(&self) -> u64 {
+        self.0.borrow().live.len() as u64
+    }
+}
+
 /// A mapped, host-visible buffer. Used for the per-frame uniform ring.
-pub(crate) struct MappedBuffer {
-    pub(crate) buffer: vk::Buffer,
+pub(crate) struct MappedBuffer {    pub(crate) buffer: vk::Buffer,
     pub(crate) memory: vk::DeviceMemory,
     pub(crate) ptr: *mut u8,
     pub(crate) len: u64,
@@ -188,6 +232,8 @@ pub struct Gpu {
     uniform_alignment: u64,
     pub(crate) frames: RefCell<FrameState>,
     pub(crate) one_shot: RefCell<OneShot>,
+    /// Live device memory this renderer holds (all images and buffers of the crate).
+    pub(crate) allocations: Allocations,
     debug: Option<DebugReporter>,
     /// `VK_KHR_surface` + `VK_KHR_win32_surface` were enabled, so a `Stage` can be built.
     pub(crate) surface_extensions: bool,
@@ -398,9 +444,11 @@ impl Gpu {
             .max(16);
         let uniform_stride = align_up(MAX_UNIFORM_BYTES, uniform_alignment);
         let uniform_bytes = uniform_stride * FRAMES_IN_FLIGHT as u64 * MAX_DRAWS_PER_FRAME as u64;
+        let allocations = Allocations::default();
         let (uniform_buffer, uniform_memory) = create_buffer(
             &device,
             &memory,
+            &allocations,
             uniform_bytes,
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
@@ -499,6 +547,7 @@ impl Gpu {
                 cmd: one_shot_cmd,
                 fence: one_shot_fence,
             }),
+            allocations,
             debug,
             surface_extensions,
         })
@@ -529,6 +578,26 @@ impl Gpu {
     /// Device-local memory properties of the selected GPU.
     pub fn memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
         &self.memory
+    }
+
+    /// Bytes of device memory this renderer currently holds: every image and buffer of the crate
+    /// that has not been dropped, as allocated (driver alignment included).
+    ///
+    /// On the reference machine the GPU is integrated, so this is system memory the process is
+    /// paying for: the design's "< 500 MB with 4 videos" budget is checked against it (plus the
+    /// decoded video frames and the driver's own books).
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocations.bytes()
+    }
+
+    /// How many live image and buffer allocations that is, for a budget line that says where the
+    /// bytes went.
+    pub fn allocation_count(&self) -> u64 {
+        self.allocations.count()
+    }
+
+    pub(crate) fn allocations(&self) -> Allocations {
+        self.allocations.clone()
     }
 
     /// Nanoseconds per GPU timestamp tick, from the device limits.
@@ -625,7 +694,19 @@ impl Gpu {
             .memory_type_index(memory_type);
         let memory = unsafe { self.dev.allocate_memory(&allocate, None) }?;
         unsafe { self.dev.bind_image_memory(image, memory, 0) }?;
+        self.allocations.add(memory, requirements.size);
         Ok((image, memory))
+    }
+
+    /// Creates (and counts) a buffer. The companion of [`Self::create_image`] for the crate's own
+    /// upload, uniform and staging buffers.
+    pub(crate) fn new_buffer(
+        &self,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        properties: vk::MemoryPropertyFlags,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory), RenderError> {
+        create_buffer(&self.dev, &self.memory, &self.allocations, size, usage, properties)
     }
 
     pub(crate) fn create_image_view(
@@ -677,6 +758,7 @@ impl Drop for Gpu {
             self.dev.unmap_memory(self.uniform_ring.memory);
             self.dev.destroy_buffer(self.uniform_ring.buffer, None);
             self.dev.free_memory(self.uniform_ring.memory, None);
+            self.allocations.release(self.uniform_ring.memory);
             self.dev.destroy_sampler(self.sampler, None);
         }
         if let Some(reporter) = self.debug.take() {
@@ -728,6 +810,7 @@ pub(crate) fn extension_name(properties: &vk::ExtensionProperties) -> &CStr {
 pub(crate) fn create_buffer(
     device: &ash::Device,
     memory: &vk::PhysicalDeviceMemoryProperties,
+    allocations: &Allocations,
     size: u64,
     usage: vk::BufferUsageFlags,
     properties: vk::MemoryPropertyFlags,
@@ -752,5 +835,6 @@ pub(crate) fn create_buffer(
         .memory_type_index(memory_type);
     let allocation = unsafe { device.allocate_memory(&allocate, None) }?;
     unsafe { device.bind_buffer_memory(buffer, allocation, 0) }?;
+    allocations.add(allocation, requirements.size);
     Ok((buffer, allocation))
 }
