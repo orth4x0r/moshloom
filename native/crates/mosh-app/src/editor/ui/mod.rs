@@ -230,7 +230,8 @@ impl Default for EditorUi {
             recent: Vec::new(),
             filter: String::new(),
             sections: [true, true, true],
-            folded: Vec::new(),
+            // Retro and literal looks are kept for old projects, folded away by default.
+            folded: vec![mosh_visuals::catalog::LEGACY.to_string()],
             level_tab: None,
             detail_page: DetailPage::default(),
             px_per_beat: 14.0,

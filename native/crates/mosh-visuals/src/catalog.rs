@@ -9,7 +9,7 @@ pub struct VisualizerEntry {
     pub id: &'static str,
     pub name: &'static str,
     /// Browser group: "Classic" (the web app's scenes), "Layers" (fluid, particles, camera, text,
-    /// overlay video), or a style pack's name.
+    /// overlay video), a style pack's name, or [`LEGACY`].
     pub group: &'static str,
     pub params: [&'static str; 8],
 }
@@ -24,21 +24,37 @@ const LAYER_VISUALIZERS: [(&str, &str, [&str; 8]); 4] = [
     ("overlay", "Video", NONE),
 ];
 
+/// The browser group for web scenes whose look is retro or literal (a synthwave grid, terminal
+/// glyphs, a scanline sweep, punch cards). They still draw, so a project that uses them keeps
+/// working, but they sit at the end of the browser, folded, out of the way of the abstract looks.
+pub const LEGACY: &str = "Legacy";
+
+/// The web scenes in [`LEGACY`].
+const LEGACY_SCENES: [&str; 4] = ["grid", "glyph_rain", "scan", "punch_cards"];
+
 /// Every visualizer id a clip may use, in browser order.
 pub fn catalog() -> Vec<VisualizerEntry> {
     let mut out = Vec::new();
+    let mut legacy = Vec::new();
     for info in VISUALIZERS {
         let group = if info.id == "fluid" {
             "Layers"
+        } else if LEGACY_SCENES.contains(&info.id) {
+            LEGACY
         } else {
             "Classic"
         };
-        out.push(VisualizerEntry {
+        let entry = VisualizerEntry {
             id: info.id,
             name: info.name,
             group,
             params: info.params,
-        });
+        };
+        if group == LEGACY {
+            legacy.push(entry);
+        } else {
+            out.push(entry);
+        }
     }
     for (id, name, params) in LAYER_VISUALIZERS {
         let params = crate::layer_params(id).unwrap_or(params);
@@ -57,5 +73,6 @@ pub fn catalog() -> Vec<VisualizerEntry> {
             params: scene.params,
         });
     }
+    out.extend(legacy);
     out
 }
