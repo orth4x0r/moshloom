@@ -1233,6 +1233,134 @@ fn set_text_and_draw_costs() {
     assert_no_validation_messages(&gpu);
 }
 
+/// The sigil look's marks are authored once, on the right of the block, and the shader draws the
+/// left copy mirrored about the block's centre. A build where only one half drew was caught by
+/// eye, so this measures both flanks.
+///
+/// Calibrated on `SIGIL` at size 0.15, the pair the review prototyped with. The glyph mass is the
+/// ink a 5x5 erosion keeps (the letters are filled; a mark's stroke is 2-3px wide, so an erosion
+/// deletes it), and the flanks are the columns either side of it. The assertion is that the left
+/// flank's ink **mirrors** the right flank's, pixel for pixel about the block's centre: that is
+/// what the shader is supposed to do, and thorns — which are asymmetric by design — cannot fake
+/// it. The bare "leftmost ink is a few pixels left of the mass" predicate the review prototyped
+/// does not survive here: with the left copy disabled the leftmost ink is 229 and the letters 251,
+/// so the left thorns alone sit 22px outside the mass and the predicate passes.
+///
+/// The text and size are part of the calibration on purpose: other words grow a thorn that reaches
+/// as far as a mark.
+#[test]
+fn the_mirrored_mark_draws_on_both_sides() {
+    let gpu = gpu();
+    let (width, height) = (960u32, 540u32);
+    let frame = AnalysisFrame::default();
+    let shot = draw_once(
+        &gpu,
+        "SIGIL",
+        &params(0.15, 0.45, 0.5, 0.0, 0.0, 0.3, 0.0, 0.0),
+        &frame,
+        0.0,
+        width,
+        height,
+    );
+    // The silver body, not the red glow: the glow's red never passes 90, the metal's channels sit
+    // well above 120.
+    let body = |x: u32, y: u32| {
+        shot.pixel(x, y)
+            .iter()
+            .take(3)
+            .copied()
+            .max()
+            .unwrap_or(0)
+            > 120
+    };
+    let filled = |x: u32, y: u32| {
+        (y.saturating_sub(2)..=(y + 2).min(height - 1))
+            .all(|row| (x.saturating_sub(2)..=(x + 2).min(width - 1)).all(|column| body(column, row)))
+    };
+    let mut mass_left = width;
+    let mut mass_right = 0;
+    for y in 0..height {
+        for x in 2..width - 2 {
+            if filled(x, y) {
+                mass_left = mass_left.min(x);
+                mass_right = mass_right.max(x);
+            }
+        }
+    }
+    println!(
+        "SIGIL at 0.15 on {width}x{height}: glyph mass {mass_left}..={mass_right} \
+         (centre {}), block centre {}",
+        (mass_left + mass_right) / 2,
+        width / 2
+    );
+    let leftmost = (0..width)
+        .find(|x| (0..height).any(|y| body(*x, y)))
+        .expect("ink");
+    let rightmost = (0..width)
+        .rfind(|x| (0..height).any(|y| body(*x, y)))
+        .expect("ink");
+    println!(
+        "ink {leftmost}..={rightmost}: {}px left of the mass, {}px right of it",
+        mass_left.saturating_sub(leftmost),
+        rightmost.saturating_sub(mass_right)
+    );
+    assert!(
+        mass_right > mass_left + 100,
+        "the glyph mass is {mass_left}..={mass_right}: this calibration needs the letters to fill \
+         the middle of the frame"
+    );
+
+    // Every lit column outside the mass, and how much of it the other flank mirrors.
+    let flank = 40u32;
+    let mirrored_ink = |outward: bool| -> (usize, usize) {
+        let mut ink = 0usize;
+        let mut pairs = 0usize;
+        let columns = if outward {
+            (mass_left.saturating_sub(flank)..mass_left).collect::<Vec<_>>()
+        } else {
+            (mass_right + 1..=(mass_right + flank).min(width - 1)).collect::<Vec<_>>()
+        };
+        for x in columns {
+            for y in 0..height {
+                if !body(x, y) {
+                    continue;
+                }
+                ink += 1;
+                // The block is centred at width/2, so x mirrors to width - 1 - x (a pixel centre
+                // at x + 0.5 maps to width - x - 0.5). One pixel of slack either way covers the
+                // rounding of the two sides' rasterisation.
+                let mirror = width - 1 - x;
+                let found = (y.saturating_sub(1)..=(y + 1).min(height - 1)).any(|row| {
+                    (mirror.saturating_sub(1)..=(mirror + 1).min(width - 1))
+                        .any(|column| body(column, row))
+                });
+                pairs += usize::from(found);
+            }
+        }
+        (ink, pairs)
+    };
+    let (left_ink, left_pairs) = mirrored_ink(true);
+    let (right_ink, right_pairs) = mirrored_ink(false);
+    println!(
+        "{flank} flank columns each side: left {left_ink} lit, {left_pairs} with a mirror; \
+         right {right_ink} lit, {right_pairs} with a mirror"
+    );
+    // With the mirrored copy drawn, the two marks are the same ink on both sides, so most of a
+    // flank's ink finds its reflection. With the left copy missing, only thorns are left there and
+    // almost nothing pairs.
+    assert!(
+        left_pairs * 2 > left_ink && left_ink > 100,
+        "the left flank has {left_ink} lit pixels and only {left_pairs} of them mirror the right \
+         flank: the mirrored mark is not drawing"
+    );
+    assert!(
+        right_pairs * 2 > right_ink && right_ink > 100,
+        "the right flank has {right_ink} lit pixels and only {right_pairs} of them mirror the left \
+         flank: the authored mark is not drawing"
+    );
+    assert_no_validation_messages(&gpu);
+}
+
 /// A guard, not a witness: the pair stays two letters at the current dilation, and no committed
 /// state of this layer welded them — a reviewer could not reproduce the "welded `at`" story from
 /// any revision. What the test pins is the rule the story is about: the stroke dilation is a

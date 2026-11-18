@@ -106,6 +106,10 @@ fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
 /// works in block-height units; this module works in block pixels, so the two copies scale it by
 /// the block's height. `text::tests::the_thorn_geometry_constants_match_the_shader` parses the
 /// shader's literal and compares it with this one.
+///
+/// The mirror below is test-only: the shader is what draws, and these are the copy its tests hold
+/// every authored stroke to.
+#[cfg(test)]
 pub(crate) const REACH_SLACK: f32 = 0.01;
 
 /// The radius, in block pixels, of the circle the shader's `out_of_reach` rejects a stroke by: the
@@ -113,6 +117,7 @@ pub(crate) const REACH_SLACK: f32 = 0.01;
 /// slack. The chord `|c-a|` is shorter than the path whenever the stroke bends, and a bound built
 /// from it skips pixels near the bend: `W`, `I I I` and `THE LOOM IS US` each lost part of a mark
 /// barb that way (two or three baked pixels per stroke).
+#[cfg(test)]
 pub fn reach_radius(stroke: &Stroke, block_h: f32) -> f32 {
     distance(stroke.a, stroke.b)
         + distance(stroke.b, stroke.c)
@@ -122,6 +127,7 @@ pub fn reach_radius(stroke: &Stroke, block_h: f32) -> f32 {
 
 /// True when the shader's early-out would discard `p` for `stroke`: `p` is farther from the
 /// stroke's root than the bound above allows. This mirrors `out_of_reach` in `text.wgsl`.
+#[cfg(test)]
 pub fn out_of_reach(p: [f32; 2], stroke: &Stroke, block_h: f32) -> bool {
     distance(p, stroke.a) > reach_radius(stroke, block_h)
 }
