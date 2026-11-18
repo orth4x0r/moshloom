@@ -482,3 +482,20 @@ fn stem_taps_feed_the_analyzer_only_beside_the_plugin() {
     }
     assert_eq!(fallback.stems_mut().fed(), 0);
 }
+
+// The app opens on abstract looks: the retro web scenes stay loadable but are not in the
+// default grid Autopilot plays through.
+#[test]
+fn the_default_project_has_no_legacy_scene() {
+    let legacy: Vec<&str> = mosh_visuals::catalog::catalog()
+        .into_iter()
+        .filter(|entry| entry.group == mosh_visuals::catalog::LEGACY)
+        .map(|entry| entry.id)
+        .collect();
+    assert_eq!(legacy.len(), 4);
+    let known: Vec<&str> = mosh_visuals::catalog::catalog().into_iter().map(|e| e.id).collect();
+    for clip in default_project().clips {
+        assert!(!legacy.contains(&clip.visualizer.as_str()), "{} is legacy", clip.visualizer);
+        assert!(known.contains(&clip.visualizer.as_str()), "{} is not in the catalog", clip.visualizer);
+    }
+}

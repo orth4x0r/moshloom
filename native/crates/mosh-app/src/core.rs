@@ -1035,9 +1035,9 @@ fn restore_cells(show: &Show, playing: &[Option<ClipId>]) -> Vec<ControlEvent> {
 }
 
 /// The project the app runs with when it is started without one: an empty show in Autopilot over
-/// a 16-scene grid of the 16 ported scenes, so pressing play on nothing still draws something.
+/// a 16-scene grid, so pressing play on nothing still draws something. Twelve web scenes and four
+/// abstract style scenes; the retro web scenes (`catalog::LEGACY`) are left out.
 pub fn default_project() -> Project {
-    // `VISUALIZERS` order, without `fluid` (a visualizer of its own, not a scene).
     const SCENES: [&str; 16] = [
         "tunnel",
         "loom",
@@ -1047,13 +1047,13 @@ pub fn default_project() -> Project {
         "moire",
         "spectrum",
         "cells",
-        "punch_cards",
+        "aura-mesh",
         "vortex",
         "kaleido",
         "reaction",
-        "grid",
-        "glyph_rain",
-        "scan",
+        "contour-field",
+        "glass-refract",
+        "silk-ribbon",
         "swarm",
     ];
 

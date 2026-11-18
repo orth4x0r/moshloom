@@ -877,6 +877,12 @@ fn browser_groups_fold_away() {
             .sum()
     };
     let mut harness = Harness::new((1280.0, 1400.0));
+    // The retro looks start folded away; everything else starts open.
+    assert_eq!(
+        harness.state.folded,
+        vec![mosh_visuals::catalog::LEGACY.to_string()]
+    );
+    assert_eq!(groups.last().copied(), Some(mosh_visuals::catalog::LEGACY));
     harness.idle(&model);
     let open = vertices(&harness.idle(&model));
 
@@ -886,7 +892,10 @@ fn browser_groups_fold_away() {
     harness.pointer(&model, heading, None);
     harness.pointer(&model, heading, Some(true));
     harness.pointer(&model, heading, Some(false));
-    assert_eq!(harness.state.folded, vec![groups[0].to_string()]);
+    assert_eq!(
+        harness.state.folded,
+        vec![mosh_visuals::catalog::LEGACY.to_string(), groups[0].to_string()]
+    );
     harness.idle(&model);
     let folded = vertices(&harness.idle(&model));
     assert!(folded < open, "{folded} vertices folded, {open} open");
