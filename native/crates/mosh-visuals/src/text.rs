@@ -15,8 +15,14 @@
 //! | `p1` | look | face | treatment |
 //! | --- | --- | --- | --- |
 //! | 0 | Chrome | Unbounded | liquid chrome: environment reflection, iridescent rim, soft specular |
-//! | 1 | Sigil | Grenze Gotisch | blackletter polished silver, thorn barbs, blood-red glow |
+//! | 1 | Sigil | Grenze Gotisch | blackletter polished silver, thorns grown out of its contour, a thin blood-red glow |
 //! | 2 | Clean | Space Grotesk | crisp minimal, soft shadow, thin cool rim |
+//!
+//! The sigil look raises the words to uppercase before it bakes them: Grenze Gotisch's lowercase is
+//! a polite book serif with none of the look's character, and the look is a sigil, not a caption.
+//! Its thorns are geometry grown from the block's outer contour (`text/thorn.rs`), uploaded with
+//! the pass's uniforms: sharp tapered spikes where the silhouette turns hardest, sparse, each one
+//! its own sweep and bend, and never one that touches the ink.
 //!
 //! Only the face the layer last *drew* is baked. A text change costs one face's bake, not three;
 //! the look that is not in use is baked on the next `set_text` after `draw` asks for it, which is
@@ -54,6 +60,7 @@
 
 mod layout;
 mod sheet;
+mod thorn;
 
 use mosh_core::{AnalysisFrame, ClipParams};
 use mosh_render::upload::VideoTexture;
@@ -61,6 +68,7 @@ use mosh_render::{FrameRecorder, Gpu, LayerTarget, Pipeline, RenderError};
 
 use layout::Face;
 use sheet::Sheet;
+use thorn::Thorn;
 
 /// What `p0..p7` mean for `text` (shown in the clip editor).
 pub const PARAMS: [&str; 8] = [
@@ -68,8 +76,12 @@ pub const PARAMS: [&str; 8] = [
 ];
 
 /// Bytes of the pass's uniform block. Keep in sync with `text/text.wgsl` (a unit test reflects the
-/// shader and compares).
-const UNIFORM_BYTES: usize = 96;
+/// shader and compares): 96 bytes of scalar block, then [`thorn::MAX_THORNS`] thorns at 32 bytes.
+const UNIFORM_BYTES: usize = 96 + thorn::MAX_THORNS * 32;
+
+/// Bytes of one thorn in the uniform block: `base`, `bend` and `tip` as two `vec2` each, then the
+/// base half-width and a padding float.
+const THORN_BYTES: usize = 32;
 
 /// A show has far fewer layers than this; the cap only stops a bogus index from growing the
 /// per-layer vector without bound.
@@ -77,6 +89,9 @@ const MAX_LAYERS: usize = 32;
 
 /// How many looks `p1` has, one per face.
 const LOOKS: usize = 3;
+
+/// The sigil look's index: the one that forces uppercase and grows thorns.
+const SIGIL: usize = 1;
 
 /// The pass, compiled once in [`TextLayer::new`] with the same naga options as every other shader.
 const SHADER: &str = include_str!("text/text.wgsl");
@@ -101,6 +116,10 @@ struct TextSheet {
     height: u32,
     inset_min: [f32; 2],
     inset_max: [f32; 2],
+    /// The sigil look's thorns, in the shader's block space: `base.xy`, `bend.xy` and `tip.xy`
+    /// followed by the base half-width, each divided by the block's height so the shader's
+    /// `block_uv`-derived local space reads them directly.
+    thorns: Vec<[f32; 4]>,
     /// The BGRA bytes of the last bake. Kept so a text change reuses the allocation instead of
     /// creating a few megabytes on the render thread.
     pixels: Vec<u8>,
@@ -137,7 +156,7 @@ impl TextLayer {
             Pipeline::fullscreen(gpu, &words, UNIFORM_BYTES, 1)?.with_name("text.glyphs");
         let faces = [
             Face::new(FACE_CHROME, true),
-            Face::new(FACE_SIGIL, true),
+            Face::new(FACE_SIGIL, true).map(|face| face.with_thorns(true)),
             Face::new(FACE_CLEAN, false),
         ];
         let capacities = std::array::from_fn(|index| {
@@ -160,7 +179,8 @@ impl TextLayer {
     ///
     /// Only the face of the look last drawn is baked; a look this layer has not drawn yet is baked
     /// on the next call after `draw` asks for it. Repeating the same text is free. Empty or
-    /// whitespace-only text drops the sheets, and the layer then draws transparent black.
+    /// whitespace-only text leaves every look's sheet stale — none is dropped — and the layer then
+    /// draws transparent black, because a stale look is never chosen without fresh words.
     pub fn set_text(&mut self, gpu: &Gpu, layer: usize, text: &str) {
         if layer >= MAX_LAYERS {
             return;
@@ -190,8 +210,12 @@ impl TextLayer {
     }
 
     /// Bakes the look's face with `text` into the layer's sheet for that look, reusing the texture
-    /// it already holds. Empty or whitespace-only text drops the sheet's freshness, and the layer
-    /// then draws transparent black.
+    /// it already holds. Empty or whitespace-only text leaves the sheet stale, and the layer then
+    /// draws transparent black.
+    ///
+    /// The sigil look shouts: Grenze Gotisch's lowercase is a polite book serif with none of the
+    /// look's character, so that sheet alone is baked from the raised words. The other two looks
+    /// draw the text exactly as typed.
     fn bake(
         face: Option<&Face>,
         capacity: (u32, u32),
@@ -211,6 +235,13 @@ impl TextLayer {
             entry.fresh[look] = false;
             return;
         };
+        let raised;
+        let drawn = if look == SIGIL {
+            raised = text.to_uppercase();
+            raised.as_str()
+        } else {
+            text
+        };
         let (width, height) = capacity;
         let held = entry.sheets[look].get_or_insert_with(|| TextSheet {
             texture: None,
@@ -218,6 +249,7 @@ impl TextLayer {
             height,
             inset_min: [0.0; 2],
             inset_max: [1.0; 2],
+            thorns: Vec::new(),
             pixels: Vec::new(),
             written_rows: 0,
         });
@@ -230,13 +262,14 @@ impl TextLayer {
             held.pixels = Vec::new();
         }
         let Some(baked) =
-            Sheet::bake_into(face, text, width, height, &mut held.pixels, held.written_rows)
+            Sheet::bake_into(face, drawn, width, height, &mut held.pixels, held.written_rows)
         else {
             entry.fresh[look] = false;
             return;
         };
         held.written_rows = baked.mask_h;
         let (inset_min, inset_max) = baked.inset_in(width, height);
+        let thorns = thorn_words(&baked.thorns, baked.block_h);
         let uploaded = match held.texture.as_mut() {
             Some(texture) => texture.upload(gpu, width, height, &held.pixels),
             None => match VideoTexture::new(gpu, width, height) {
@@ -252,6 +285,7 @@ impl TextLayer {
         };
         held.inset_min = inset_min;
         held.inset_max = inset_max;
+        held.thorns = thorns;
         entry.fresh[look] = uploaded.is_ok();
         if baked.dropped > 0 {
             // Logged once per text change, not per frame: the app repeats the same text every
@@ -259,7 +293,7 @@ impl TextLayer {
             eprintln!(
                 "text: dropped the last {} of {} characters (cap: {} lines, {} characters)",
                 baked.dropped,
-                text.chars().count(),
+                drawn.chars().count(),
                 layout::MAX_LINES,
                 layout::MAX_CHARS
             );
@@ -326,6 +360,7 @@ impl TextLayer {
             sheet.height,
             sheet.inset_min,
             sheet.inset_max,
+            &sheet.thorns,
             params,
             frame,
             t,
@@ -343,6 +378,7 @@ fn uniforms(
     height: u32,
     inset_min: [f32; 2],
     inset_max: [f32; 2],
+    thorns: &[[f32; 4]],
     params: &ClipParams,
     frame: &AnalysisFrame,
     t: f32,
@@ -367,8 +403,41 @@ fn uniforms(
         frame.bands[2],
         frame.intensity,
     ]);
-    push(&[t, frame.beat_phase, frame.loudness, 0.0]);
+    push(&[t, frame.beat_phase, frame.loudness, thorns.len() as f32]);
+    // Past the scalar block: one 32-byte thorn each, two `vec4` (`base`, `bend`, `tip`, width).
+    for (slot, word) in thorns.iter().take(thorn::MAX_THORNS * 2).enumerate() {
+        let start = 96 + (slot / 2) * THORN_BYTES + (slot % 2) * (THORN_BYTES / 2);
+        for (index, value) in word.iter().enumerate() {
+            let field = start + index * 4;
+            block[field..field + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    debug_assert_eq!(at, 96);
     block
+}
+
+/// One thorn as the shader's `Thorn` struct wants it: `base`, `bend`, `tip` and the base
+/// half-width, every number divided by the block's height. `block_uv` scaled by the block's aspect
+/// is that space, so the shader reads these directly and the thorn keeps its weight relative to
+/// the block at every `size`.
+fn thorn_words(thorns: &[Thorn], block_h: u32) -> Vec<[f32; 4]> {
+    let height = block_h.max(1) as f32;
+    let mut words = Vec::with_capacity(thorns.len() * 2);
+    for thorn in thorns.iter().take(thorn::MAX_THORNS) {
+        words.push([
+            thorn.base[0] / height,
+            thorn.base[1] / height,
+            thorn.bend[0] / height,
+            thorn.bend[1] / height,
+        ]);
+        words.push([
+            thorn.tip[0] / height,
+            thorn.tip[1] / height,
+            thorn.width / height,
+            0.0,
+        ]);
+    }
+    words
 }
 
 #[cfg(test)]
