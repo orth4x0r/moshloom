@@ -1,21 +1,26 @@
-//! The Cybersigil + Glitch style pack: every scene is lit, reacts to the beat and to the bands,
-//! P(0) moves it, and one pass fits the per-scene frame budget.
+//! The Sigil + Smear style packs: every scene is lit, reacts to the beat and to the bands, P(0) moves
+//! it, no scene paints a clipped white patch, and one pass fits the per-scene frame budget.
 //!
 //! Offscreen and small on purpose (the reference machine is shared with other workers): 160x90 for
 //! correctness, 480x270 for the preview PNGs the PR links, 960x540 only for the timing report.
 //!
 //! # What each test is for
 //!
-//! * [`the_pack_is_eight_scenes_of_two_packs`] pins the pack's shape: 8 scenes, 4 per pack, every
-//!   id and parameter name filled in, and the ids unique against every other visualizer.
+//! * [`the_pack_is_six_scenes_of_two_packs`] pins the pack's shape: 6 scenes, 4 in Sigil and 2 in
+//!   Smear, every id and parameter name filled in, and the ids unique against every other visualizer.
 //! * [`every_cyber_scene_renders_lit`] draws each scene at 3 intensity levels x 3 parameter sets
 //!   (one of them all zeros, one all ones: "looks good at every value"), reads the pixels back and
 //!   requires mean luminance > 0.02. It also writes one 480x270 PNG per scene under
-//!   `native/target/style-previews/cyber/` for the PR.
+//!   `native/target/style-previews/abstract/` for the PR.
+//! * [`every_cyber_control_moves_its_scene`] is the "every control does something" rule: each of
+//!   `p0..p7` is moved from 0 to 1 (0.5 for the cyclic hue) and the pixels must change, so no
+//!   parameter name is a promise the body does not keep.
 //! * [`every_cyber_scene_follows_p0`] is the "P(0) is the scene's clock" rule: the same frame at
 //!   two clock rates must not be the same picture.
 //! * [`every_cyber_scene_reacts_to_the_beat`] holds every uniform fixed except `pulse` and requires
 //!   the picture to change, so a scene that ignores the beat is caught.
+//! * [`no_cyber_scene_paints_a_clipped_white_patch`] holds the chrome to a roll-off: at most 2 % of the
+//!   frame may be clipped white, which is what stops a specular from flattening a patch of the picture.
 //! * [`cyber_scenes_fit_the_per_scene_budget`] prints GPU milliseconds per scene at 960x540 and
 //!   asserts the median is under 0.5 ms in release (the whole frame's 6 ms at 1080p, divided over
 //!   the layers a set draws). In a debug build the number is printed and not asserted: the codegen
@@ -165,9 +170,21 @@ fn differing_pixels(a: &[u8], b: &[u8], tolerance: u8) -> usize {
         .count()
 }
 
+/// The share of the frame that is clipped white: every channel at 250 or above, which is what a blown
+/// specular looks like written to RGBA8. Chrome is bright, a flat white patch is a bug.
+fn clipped_share(pixels: &[u8]) -> f32 {
+    let white = pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| pixel[0] >= 250 && pixel[1] >= 250 && pixel[2] >= 250)
+        .count();
+    white as f32 / (pixels.len() / 4) as f32
+}
+
 #[test]
-fn the_pack_is_eight_scenes_of_two_packs() {
-    assert_eq!(SCENES.len(), 8, "the pack is 8 scenes: {:?}", ids());
+fn the_pack_is_six_scenes_of_two_packs() {
+    assert_eq!(SCENES.len(), 6, "the pack is 6 scenes: {:?}", ids());
     let mut seen: HashSet<&str> = VISUALIZERS.iter().map(|v| v.id).collect();
     seen.extend(["fluid", "overlay", "camera", "text", "particles"]);
     let mut packs: [usize; 2] = [0, 0];
@@ -179,8 +196,8 @@ fn the_pack_is_eight_scenes_of_two_packs() {
         );
         assert!(!scene.name.is_empty(), "{} needs a display name", scene.id);
         let slot = match scene.pack {
-            "Cybersigil" => 0,
-            "Glitch" => 1,
+            "Sigil" => 0,
+            "Smear" => 1,
             other => panic!("{} has an unknown pack {other:?}", scene.id),
         };
         packs[slot] += 1;
@@ -197,8 +214,9 @@ fn the_pack_is_eight_scenes_of_two_packs() {
             scene.id
         );
     }
-    println!("scenes: Cybersigil {}, Glitch {}", packs[0], packs[1]);
-    assert!(packs[0] >= 4 && packs[1] >= 4, "two packs, 4+ scenes each");
+    println!("scenes: Sigil {}, Smear {}", packs[0], packs[1]);
+    assert_eq!(packs[0], 4, "the Sigil pack is four scenes");
+    assert_eq!(packs[1], 2, "the Smear pack is two scenes");
 }
 
 fn ids() -> Vec<&'static str> {
@@ -266,11 +284,83 @@ fn every_cyber_scene_renders_lit() {
     assert_no_validation(&gpu);
 }
 
-/// `native/target/style-previews/cyber/<id>.png`, not committed.
+/// `native/target/style-previews/abstract/<id>.png`, not committed. One directory for both style test
+/// files, because the scene ids are unique across the packs.
 fn preview_path(id: &str) -> std::path::PathBuf {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/style-previews/cyber");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/style-previews/abstract");
     std::fs::create_dir_all(&root).unwrap_or_else(|error| panic!("create {}: {error}", root.display()));
     root.join(format!("{id}.png"))
+}
+
+/// No scene may paint a flat white patch: at the preview parameters, the share of pixels with every
+/// channel at 250 or above must stay under 2 % of the frame.
+#[test]
+fn no_cyber_scene_paints_a_clipped_white_patch() {
+    let gpu = gpu();
+    let mut scenes = Scenes::new(&gpu).expect("scenes");
+    let dst = LayerTarget::new(&gpu, PREVIEW_W, PREVIEW_H);
+    let frame = frame_at(2);
+    let params = params_for(1);
+    let mut blown = Vec::new();
+    for (index, id) in ids().into_iter().enumerate() {
+        draw(
+            &mut scenes,
+            &gpu,
+            &dst,
+            id,
+            &frame,
+            &params,
+            6.0 + index as f32 * 0.8,
+        );
+        let share = clipped_share(&gpu.read_back(&dst));
+        println!("{id:<14} clipped white: {:.3} % of the frame", share * 100.0);
+        if share > 0.02 {
+            blown.push(format!("{id}: {:.3} %", share * 100.0));
+        }
+    }
+    assert!(
+        blown.is_empty(),
+        "these scenes clip to flat white (over 2 %): {blown:?}"
+    );
+    assert_no_validation(&gpu);
+}
+
+/// Every control moves its scene: `p0..p7` at 0 against 1 (0.5 for the cyclic hue, since 0 and 1 are
+/// the same colour), and at least one percent of the frame must change. A parameter whose name is a
+/// promise the body does not keep shows up here.
+#[test]
+fn every_cyber_control_moves_its_scene() {
+    let gpu = gpu();
+    let mut scenes = Scenes::new(&gpu).expect("scenes");
+    let frame = frame_at(2);
+    let base = params_for(1);
+    let low_dst = LayerTarget::new(&gpu, W, H);
+    let high_dst = LayerTarget::new(&gpu, W, H);
+    let mut dead = Vec::new();
+    for id in ids() {
+        let mut counts = [0usize; 8];
+        for (param, slot) in counts.iter_mut().enumerate() {
+            let mut low = base;
+            let mut high = base;
+            low.p[param] = 0.0;
+            high.p[param] = if param == 2 { 0.5 } else { 1.0 };
+            draw(&mut scenes, &gpu, &low_dst, id, &frame, &low, 3.0);
+            draw(&mut scenes, &gpu, &high_dst, id, &frame, &high, 3.0);
+            *slot = differing_pixels(&gpu.read_back(&low_dst), &gpu.read_back(&high_dst), 2);
+        }
+        println!("{id:<14} p0..p7 changed pixels: {counts:?}");
+        for (param, count) in counts.iter().enumerate() {
+            if *count < (W * H) as usize / 100 {
+                dead.push(format!("{id} p{param}: {count}"));
+            }
+        }
+    }
+    assert!(
+        dead.is_empty(),
+        "these controls do not move their scene: {dead:?}"
+    );
+    assert_no_validation(&gpu);
 }
 
 /// P(0) is the scene's clock rate: a frozen and a running clock must differ.

@@ -1,121 +1,125 @@
-// Sigil Glyph: a rune column that redraws itself once a bar, in chrome ink on black.
+// Sigil Glyph: a rune column that rewrites itself once a bar, cast in chrome on a grainy plate.
 //
-// The rune is implicit: two wavy strokes run down the figure at different frequencies and phases,
-// a stem, a diamond gate and a column of stipple dots finish it, and a dashed ring and a red
-// sunburst behind it are the tattoo flash's paper. Every bar the waves change frequency, phase and
-// offset from the bar's hash, crossfaded across the bar, so the glyph visibly rewrites itself
-// instead of cutting.
+// The rune is implicit: three wavy strokes run down the figure at different frequencies and phases, a
+// stem, two rungs, a diamond gate and a column of stipple beads finish it, and a dashed rectangular
+// frame is the flash sheet's border. Every bar the waves change frequency and phase from one hash,
+// crossfaded across the bar, so the glyph visibly rewrites itself instead of cutting. Every stroke is lit
+// as a chrome rod the full width of its line (`chrome_ridge` in `styles/paint.wgsl`): a bright shoulder,
+// a specular band, a shadowed side and an iridescent rim.
 //
-// Audio: the waves' amplitude is one mel band each, the stem swells with `U.bass`, `U.pulse` flares
-// the sunburst and shifts the stipple. `U.dens` adds a stroke, `U.vari` shifts which bands feed
-// which stroke.
+// The frame is a box and the light is a diagonal shaft, not a sunburst: an angle would cost an `atan2`
+// per pixel, and this scene's budget goes on the rune's strokes instead.
 //
-// P(0) clock rate, P(1) density, P(2) hue, P(3) curl, P(4) stroke width, P(5) flash, P(6) ring,
+// Audio: the waves' amplitude is one mel band each, the stem swells with `U.bass`, `U.pulse` widens the
+// stroke, swings the iridescent rim and lifts the shaft. Nothing strobes inside the 400 ms limit.
+//
+// P(0) clock rate, P(1) density, P(2) hue, P(3) curl, P(4) stroke weight, P(5) flash, P(6) frame,
 // P(7) grain.
 
-const RED = vec3f(0.74, 0.035, 0.060);
-const ICE = vec3f(0.62, 0.82, 1.0);
-const STEEL = vec3f(0.58, 0.64, 0.74);
+const STEEL = vec3f(0.88, 0.91, 0.97);
+const RED = vec3f(0.82, 0.045, 0.070);
 
 /// One wavy stroke of the rune: a vertical wave whose amplitude and phase the bar's hash picks,
 /// crossfaded from the bar's start to the next bar.
-fn rune_stroke(
-  p: vec2f, y0: f32, phase0: f32, phase1: f32, f: f32, freq: f32, amp: f32, w: f32
-) -> f32 {
+fn rune_stroke(p: vec2f, y0: f32, phase0: f32, phase1: f32, f: f32, freq: f32, amp: f32) -> f32 {
   let ph = mix(phase0, phase1, f);
-  let x = 0.045 + amp * sin(p.y * freq + ph) * (0.35 + 0.65 * smoothstep(-0.95, 0.95, p.y)) + y0;
-  return abs(p.x - x) - w;
-}
-
-/// Chrome from the field's screen normal: a bright ceiling, a dark floor, one strip light, a rim.
-fn chrome(nrm: vec3f, pulse: f32) -> vec3f {
-  let up = clamp(nrm.y * 0.5 + 0.5, 0.0, 1.0);
-  let up2 = up * up * (3.0 - 2.0 * up);
-  var env = mix(vec3f(0.16, 0.19, 0.26), vec3f(0.94, 0.98, 1.0), up2);
-  let strip = clamp(1.0 - abs(nrm.x) * 1.8, 0.0, 1.0) * clamp(nrm.y * 1.4 + 0.35, 0.0, 1.0);
-  env += vec3f(0.95, 0.98, 1.0) * strip * 0.85;
-  let rim = 1.0 - clamp(nrm.z, 0.0, 1.0);
-  let rim2 = rim * rim;
-  var metal = STEEL * (0.20 + env * 1.40);
-  metal += ICE * rim2 * 0.45 + RED * rim2 * (0.12 + 0.60 * pulse);
-  return metal;
+  let x = 0.040 + amp * sin(p.y * freq + ph) * (0.32 + 0.68 * smoothstep(-0.95, 0.95, p.y)) + y0;
+  return abs(p.x - x);
 }
 
 @fragment fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let q = XY(pos);
   let px = 2.0 / U.res.y;
-  let aa = px * 1.15;
-  let e = px * 2.2;
+  let aa = px * 1.10;
   let dens = clamp(U.dens, 0.0, 1.0);
   let p = vec2f(abs(q.x), q.y);
-  let r = length(q);
-  let a = atan2(q.y, q.x);
+  let t = U.T;
 
   // The bar the rune is rewriting itself for, and where in that rewrite we are.
   let bar = U.beat / 4.0;
   let k = floor(bar);
   let f = smoothstep(0.0, 1.0, fract(bar));
-  let grow = (0.85 + 0.35 * dens + 0.30 * P(4)) * (1.0 + 0.22 * clamp(U.high, 0.0, 1.0) + 0.10 * U.pulse);
-  let w = (0.0075 + 0.006 * P(4)) * grow;
-
-  var d = 1e6;
-  // The stem: a plain tapered line, the rune's spine.
-  d = min(d, abs(p.x - 0.020) - (0.005 + 0.006 * grow) * (1.0 + 0.25 * clamp(U.bass, 0.0, 1.0)));
-  // Two wavy strokes, each answering to its own mel band and its own bar-to-bar rewrite.
+  let grow = 0.85 + 0.30 * dens + 0.22 * P(4);
+  // One hash for the bar, its other values derived by multiplication: a hash is a `sin`, and the rune
+  // needs six of them otherwise.
+  let ks = h1(k * 7.31 + 1.0);
+  let k1 = fract(ks * 17.13);
+  let k2 = fract(ks * 41.71);
   let band0 = mel(i32(3.0 + U.vari * 2.0));
   let band1 = mel(i32(11.0 + U.vari * 2.0));
+
+  var d = 1e6;
+  // The stem: the rune's spine, and the heaviest line in the figure.
+  d = min(d, abs(p.x - 0.018));
+  // Three wavy strokes, each answering to its own mel band and its own bar-to-bar rewrite.
   d = min(d, rune_stroke(
-    p, 0.10, h1(k * 7.31 + 1.0) * 6.0, h1((k + 1.0) * 7.31 + 1.0) * 6.0, f,
-    14.0 + 9.0 * h1(k * 3.17), 0.022 + 0.052 * band0, w
+    p, 0.10, ks * 6.0, fract(ks * 11.7) * 6.0, f,
+    12.0 + 8.0 * k1, 0.020 + 0.050 * band0
   ));
   d = min(d, rune_stroke(
-    p, 0.30, h1(k * 5.13 + 2.0) * 6.0, h1((k + 1.0) * 5.13 + 2.0) * 6.0, f,
-    19.0 + 11.0 * h1(k * 9.71), 0.016 + 0.040 * band1, w * 0.75
+    p, 0.28, k1 * 6.0, fract(k1 * 9.3) * 6.0, f,
+    17.0 + 10.0 * k2, 0.014 + 0.038 * band1
   ));
-  if (dens > 0.55) {
+  if (dens > 0.5) {
     d = min(d, rune_stroke(
-      p, 0.52, h1(k * 2.71 + 3.0) * 6.0, h1((k + 1.0) * 2.71 + 3.0) * 6.0, f,
-    16.0 + 10.0 * h1(k * 4.43), 0.012 + 0.034 * band0, w * 0.6
+      p, 0.50, k2 * 6.0, fract(k2 * 7.9) * 6.0, f,
+      15.0 + 9.0 * (k1 * 0.5 + k2 * 0.5), 0.010 + 0.032 * band0
     ));
   }
-
   // The rungs: two short crossbars, so the rune reads as a character and not a ribbon.
-  d = min(d, max(abs(p.y - 0.24) - 0.006, (abs(p.x) - 0.34) * 0.5));
-  d = min(d, max(abs(p.y + 0.18) - 0.006, (abs(p.x) - 0.28) * 0.5));
-  // The gate: a diamond ring around the rune's waist.
-  d = min(d, abs(abs(p.x) * 1.25 + abs(p.y - 0.04) * 0.85 - 0.19) - 0.0050);
-  // The ring: a dashed circle, the flash sheet's frame.
-  let dash = step(0.32, fract(a * 9.0 / TAU + 0.10));
-  d = min(d, max(abs(r - 1.16) - 0.0030, (1.0 - dash) * 0.05));
-  // Stipple: a column of dots inside the ring.
-  let row = (p.y + 1.1) * 16.0;
-  let dot = vec2f(
-    p.x - (0.44 + 0.14 * h1(floor(row) * 5.1 + floor(U.T * 0.4))),
-    (fract(row) - 0.5) / 16.0
+  d = min(d, max(abs(p.y - 0.22) - 0.006, (abs(p.x) - 0.30) * 0.5));
+  d = min(d, max(abs(p.y + 0.16) - 0.006, (abs(p.x) - 0.25) * 0.5));
+  // The gate: a diamond at the rune's waist.
+  d = min(d, abs(abs(p.x) * 1.25 + abs(p.y - 0.03) * 0.85 - 0.17));
+  // The frame: a dashed box around the sheet. `Frame` walks it out past the glyph's feet and back in
+  // around the stem, and the dashes run along the edge each pixel is nearest.
+  let inset = 0.98 - 0.26 * P(6);
+  let ex = inset * 1.34;
+  let frame = max(abs(q.x) - ex, abs(q.y) - inset);
+  let near_side = step(abs(q.y) - inset, abs(q.x) - ex);
+  let dash = mix(
+    step(0.34, fract(q.x * 4.2 + 0.35)),
+    step(0.34, fract(q.y * 4.2 + 0.10)),
+    near_side
   );
-  d = min(d, length(dot) - 0.0028);
-  let g = vec2f(dpdx(d), dpdy(d)) * (e / px);
+  d = min(d, max(abs(frame), (1.0 - dash) * 0.06));
+  let g = vec2f(dpdx(d), dpdy(d));
+  // The stroke weight breathes with the low end: the glyph gains weight on a heavy bar.
+  let w = (0.0190 + 0.0055 * dens + 0.0090 * P(4))
+    * (1.0 + 0.10 * U.pulse + 0.08 * clamp(U.bass, 0.0, 1.0));
 
-  // --- the flash sheet: black paper, a red sunburst behind the glyph, grain, a vignette.
-  let rays = smoothstep(0.42, 0.0, abs(fract((a + U.T * (0.05 + 0.10 * P(0))) * 9.0 / TAU + 0.5) - 0.5) * 2.0);
-  var c = vec3f(0.008, 0.008, 0.012) + vec3f(0.022, 0.026, 0.038) * exp(-r * 1.6);
-  c += RED * (0.020 + 0.055 * P(5)) * rays * smoothstep(1.25, 0.05, r) * (0.35 + 1.00 * U.pulse * U.pulse);
-  c += RED * 0.045 * exp(-r * 2.2) * (0.30 + 1.00 * U.pulse * U.pulse);
-  c += ICE * 0.012 * exp(-r * 2.6) * (0.30 + 0.70 * U.high);
-  c *= 0.92 + 0.16 * h2(pos.xy * 0.75 + U.frame * 0.7) * (0.3 + 0.7 * P(7));
+  // --- the flash sheet: a grainy plate, a red shaft of light behind the glyph, a cold top light.
+  let shaft = glow(q.x * 0.72 - q.y * 0.62 - (0.25 + 0.55 * P(0) * t) * 0.10, 1.6);
+  let hue_ang = TAU * P(2);
+  let hue_tint = pal(cos(hue_ang), sin(hue_ang));
+  var c = plate(q, hue_tint * 0.36 + vec3f(0.09, 0.07, 0.10), t, 2.6);
+  c += RED * (0.045 + 0.095 * P(5)) * shaft * (0.35 + 1.05 * U.pulse * U.pulse);
+  c += vec3f(0.10, 0.16, 0.24) * 0.14 * glow(q.y - 0.90, 1.5) * (0.4 + 0.6 * U.high);
 
-  // --- the ink. The chrome is only sampled near a stroke, which is where it is used.
-  if (d < px * 9.0) {
-    let cov = 1.0 - smoothstep(-aa, aa, d);
-    let nrm = normalize(vec3f(-g, e * 0.60));
-    var metal = chrome(nrm, U.pulse);
-    metal *= 0.76 + 0.24 * smoothstep(0.0, -0.010, d);
+  // --- the metal.
+  let cov = 1.0 - smoothstep(w - aa, w + aa, d);
+  if (d < w + px * 2.5) {
+    let accent = mix(RED, hue_tint, 0.40) * (0.75 + 0.55 * P(5));
+    let metal = chrome_ridge(d, g, w, STEEL, accent, 0.45 + 0.45 * clamp(U.high, 0.0, 1.0));
     c = mix(c, metal, cov);
-    c += STEEL * 0.10 * exp(-max(d, 0.0) * 70.0) * (1.0 - cov);
   }
-  c += RED * 0.10 * exp(-abs(d) * 120.0) * U.pulse * U.pulse;
-  // Hue: a channel rotation on the finished frame, so P(2) shifts the whole plate from blood red
-  // toward violet without touching the chrome.
-  c *= mix(vec3f(1.0), vec3f(0.88, 0.58, 1.28), U.hue);
-  return fin(c);
+  // The stipple column: chrome beads beside the rune, on their own thin field so they stay beads. A bead
+  // is one sphere, so it is shaded with two smoothsteps rather than the full rod shader.
+  let row = (p.y + 1.1) * 17.0;
+  let bead = length(vec2f(
+    p.x - (0.42 + 0.13 * h1(floor(row) * 5.1 + floor(t * 0.4))),
+    (fract(row) - 0.5) / 17.0
+  ));
+  let bw = 0.0042 + 0.0030 * P(4);
+  let bcov = 1.0 - smoothstep(bw - aa, bw + aa, bead);
+  if (bead < bw + px * 3.0) {
+    var bm = STEEL * (0.16 + 0.95 * smoothstep(bw, 0.0, bead));
+    bm = bm + vec3f(1.0) * smoothstep(bw * 0.45, 0.0, bead) * 0.55;
+    c = mix(c, bm + RED * 0.30 * smoothstep(bw * 0.7, 0.0, bead), bcov);
+  }
+  c *= 1.0 - 0.24 * glow(d - w, 30.0);
+  c += RED * 0.09 * glow(d - w, 48.0) * U.pulse * U.pulse;
+  c *= grain(pos.xy, 0.10 + 0.20 * P(7));
+  c *= mix(vec3f(1.0), vec3f(0.96, 0.80, 1.10), P(2) * 0.55);
+  return fin(shoulder(c));
 }
