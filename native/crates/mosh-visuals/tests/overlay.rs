@@ -6,10 +6,13 @@
 //!
 //! # Row order, which the assertions depend on
 //!
-//! `Gpu::read_back` returns image row 0 first, and the compositor plus the stage's present pass
-//! flip the picture once each, so a layer target's row 0 is the **top** of the picture an audience
-//! sees. A frame whose row 0 is the top of the video therefore reads back with its row 0 first.
-//! Every expected pixel below is written in that orientation.
+//! A layer target is V-mirrored relative to the stage: the compositor samples a layer with
+//! `fullscreen.vert`'s uv, whose y is 0 at the top of the output image, while a layer target's
+//! row 0 is that output's bottom row; the stage's present pass adds no second flip. `read_back`
+//! returns the layer's row 0 first, so it is the *bottom* of the picture an audience sees. The
+//! expectations below are written in audience order (row 0 = the top of the stage) and read
+//! through [`stage_pixel`]; `tests/orientation.rs` pins the direction through the compositor's
+//! `OutputImage`, which is the path a frame actually takes to the stage.
 
 use std::ops::Deref;
 use std::sync::{Mutex, MutexGuard};
@@ -138,6 +141,12 @@ fn pixel_at(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
     ]
 }
 
+/// A pixel in *audience* coordinates (row 0 = the top of the stage): the layer read-back is
+/// V-mirrored, so its last row is the audience's first. See this file's header.
+fn stage_pixel(pixels: &[u8], width: u32, height: u32, x: u32, y: u32) -> [u8; 4] {
+    pixel_at(pixels, width, x, height - 1 - y)
+}
+
 fn assert_pixel(pixel: [u8; 4], expected: [u8; 4], tolerance: i32, what: &str) {
     for channel in 0..4 {
         let difference = i32::from(pixel[channel]) - i32::from(expected[channel]);
@@ -208,7 +217,7 @@ fn checkerboard_cover_crop() {
             };
             let x = column * 8 + 4;
             let y = row * 6 + 3;
-            let got = pixel_at(&pixels, target_width, x, y);
+            let got = stage_pixel(&pixels, target_width, target_height, x, y);
             assert_pixel(
                 got,
                 expected,
@@ -221,19 +230,19 @@ fn checkerboard_cover_crop() {
     // The corners pin the orientation: a vertically flipped draw would put the last row's cells
     // here instead, and the 6-row/10-column cell counts make that swap visible.
     assert_pixel(
-        pixel_at(&pixels, target_width, 2, 2),
+        stage_pixel(&pixels, target_width, target_height, 2, 2),
         [255, 0, 0, 255],
         2,
         "top-left cell",
     );
     assert_pixel(
-        pixel_at(&pixels, target_width, 61, 1),
+        stage_pixel(&pixels, target_width, target_height, 61, 1),
         [0, 255, 0, 255],
         2,
         "top-right cell",
     );
     assert_pixel(
-        pixel_at(&pixels, target_width, 2, 33),
+        stage_pixel(&pixels, target_width, target_height, 2, 33),
         [0, 255, 0, 255],
         2,
         "bottom-left cell",
@@ -241,7 +250,7 @@ fn checkerboard_cover_crop() {
 
     println!(
         "checkerboard 160x90 -> 64x36: cells at 8x6 px, top-left {:?}",
-        pixel_at(&pixels, target_width, 2, 2)
+        stage_pixel(&pixels, target_width, target_height, 2, 2)
     );
     assert_no_validation_messages(&gpu);
 }
@@ -279,7 +288,7 @@ fn wider_target_crops_top_bottom() {
     ] {
         for x in [1u32, target_width / 2, target_width - 2] {
             assert_pixel(
-                pixel_at(&pixels, target_width, x, y),
+                stage_pixel(&pixels, target_width, target_height, x, y),
                 [colour[0], colour[1], colour[2], 255],
                 2,
                 &format!("{name} at ({x},{y})"),
@@ -308,10 +317,10 @@ fn wider_target_crops_top_bottom() {
 
     println!(
         "wider target 96x36 from 160x90: rows green/blue/yellow/cyan {:?} {:?} {:?} {:?}",
-        pixel_at(&pixels, target_width, 48, 4),
-        pixel_at(&pixels, target_width, 48, 13),
-        pixel_at(&pixels, target_width, 48, 22),
-        pixel_at(&pixels, target_width, 48, 31)
+        stage_pixel(&pixels, target_width, target_height, 48, 4),
+        stage_pixel(&pixels, target_width, target_height, 48, 13),
+        stage_pixel(&pixels, target_width, target_height, 48, 22),
+        stage_pixel(&pixels, target_width, target_height, 48, 31)
     );
     assert_no_validation_messages(&gpu);
 }
@@ -354,7 +363,7 @@ fn no_new_allocations_after_first() {
     // A first frame, then 600 more draws: the picture is still right after all of them.
     let pixels = gpu.read_back(&dst);
     assert_pixel(
-        pixel_at(&pixels, 64, 2, 2),
+        stage_pixel(&pixels, 64, 36, 2, 2),
         [255, 0, 0, 255],
         2,
         "checkerboard after 601 draws",
@@ -418,7 +427,7 @@ fn size_change_reallocates_once() {
                 [0, 255, 0, 255]
             };
             assert_pixel(
-                pixel_at(&pixels, 64, column * 4 + 2, row * 3 + 1),
+                stage_pixel(&pixels, 64, 36, column * 4 + 2, row * 3 + 1),
                 expected,
                 2,
                 &format!("320x180 into 64x36, cell ({column},{row})"),
@@ -591,7 +600,7 @@ fn overlay_cpu_time_per_frame_1080p() {
 
     let pixels = gpu.read_back(&dst);
     assert_pixel(
-        pixel_at(&pixels, width, 10, 10),
+        stage_pixel(&pixels, width, height, 10, 10),
         [255, 0, 0, 255],
         2,
         "1080p checkerboard",

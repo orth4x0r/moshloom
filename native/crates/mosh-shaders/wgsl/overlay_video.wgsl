@@ -4,9 +4,12 @@
 //
 // Uniform block (16 bytes, std140): the destination size and the video size, in pixels.
 //
-// Row order: mosh-render's compositor and the stage's present pass each flip the picture once, so
-// a layer target's row 0 is the top of what the audience sees, and v is flipped here so the
-// video's first row (its top) lands there. A decoded frame is "top row first", like any image.
+// Row order: a layer target is V-mirrored relative to the stage. The compositor samples a layer
+// with this pass's uv, and uv.y is 0 at the top of the frame the audience sees and 1 at its
+// bottom, while a layer target's row 0 is the *bottom* of that frame; the present pass adds no
+// second flip (see `text/text.wgsl`, and `tests/orientation.rs`). A decoded frame is "top row
+// first", so texture v = 0 is its top: v follows uv, and the video's first row lands at the top
+// of the stage.
 
 struct Cover {
     dst: vec2<f32>,
@@ -25,7 +28,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let visible = cover.dst / (cover.src * scale);
     let source_uv = vec2<f32>(
         0.5 + (uv.x - 0.5) * visible.x,
-        0.5 - (uv.y - 0.5) * visible.y,
+        0.5 + (uv.y - 0.5) * visible.y,
     );
     // No alpha in v1: the decoder gives opaque RGB32, and the compositor applies layer opacity.
     return vec4<f32>(textureSample(video, video_sampler, source_uv).rgb, 1.0);
