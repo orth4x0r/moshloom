@@ -24,7 +24,7 @@ use mosh_capture::Loopback;
 use mosh_core::{
     ArrClip, AudioBlock, BlendMode, Clip, ClipId, ClipParams, ControlEvent, EventFlags,
     FollowAction, LaunchQuantize, Layer, MidiEvent, ParamRange, Project, RenderPlan, SceneRow,
-    SessionGrid, ShowMode, SongMarker, Transition,
+    SessionGrid, ShowMode, ShowRole, SongMarker, Transition,
 };
 use mosh_ipc::IpcReader;
 use mosh_show::Show;
@@ -98,7 +98,12 @@ impl PluginInput {
     /// Attach to the master tap. Fails while no plugin instance is running, which is the normal
     /// state before Live starts (Review Focus item 1).
     pub fn open() -> Option<PluginInput> {
-        IpcReader::open(mosh_core::ShowRole::Master)
+        PluginInput::open_role(mosh_core::ShowRole::Master)
+    }
+
+    /// Attach to a Tap instance set to `role` (a drum or bass stem). Fails while none is running.
+    pub fn open_role(role: mosh_core::ShowRole) -> Option<PluginInput> {
+        IpcReader::open(role)
             .ok()
             .map(|reader| PluginInput {
                 reader,
@@ -386,6 +391,113 @@ impl InputMux {
     }
 }
 
+/// The stem taps the analysis can use: a Tap instance on the drum bus and one on the bass bus
+/// (their `role` parameter set to Drums / Bass). Both are optional and found on their own, like
+/// the master tap; a show without them analyses the master alone.
+///
+/// Stems are read only while the master comes from the plugin: they are the same Live set's
+/// audio, and next to a loopback fallback they would be another clock.
+pub struct Stems {
+    taps: Vec<StemInput>,
+    auto_open: bool,
+    /// Stem blocks handed to the analyzer, for the status line and the tests.
+    fed: u64,
+}
+
+struct StemInput {
+    role: ShowRole,
+    source: Option<Box<dyn AudioSource>>,
+    retry_at: Option<Instant>,
+    dead_since: Option<Instant>,
+    blocks: Vec<AudioBlock>,
+}
+
+/// The stem roles the analyzer reads (`Analyzer::push_stem` ignores the others).
+const STEM_ROLES: [ShowRole; 2] = [ShowRole::Drums, ShowRole::Bass];
+
+impl Stems {
+    /// No stems and no attempt to find any (tests, and a mux over caller-owned sources).
+    pub fn none() -> Stems {
+        Stems {
+            taps: STEM_ROLES
+                .iter()
+                .map(|&role| StemInput {
+                    role,
+                    source: None,
+                    retry_at: None,
+                    dead_since: None,
+                    blocks: Vec::new(),
+                })
+                .collect(),
+            auto_open: false,
+            fed: 0,
+        }
+    }
+
+    /// The app's stems: attaches to each stem tap when one appears.
+    pub fn open() -> Stems {
+        Stems {
+            auto_open: true,
+            ..Stems::none()
+        }
+    }
+
+    /// Use `source` for `role` (tests). A role the analyzer does not read is ignored.
+    pub fn set_source(&mut self, role: ShowRole, source: Box<dyn AudioSource>) {
+        if let Some(tap) = self.taps.iter_mut().find(|tap| tap.role == role) {
+            tap.source = Some(source);
+        }
+    }
+
+    /// Stem blocks handed to the analyzer so far.
+    pub fn fed(&self) -> u64 {
+        self.fed
+    }
+
+    /// Read every stem tap's new blocks. `master_from_plugin` false drops them (see the type).
+    fn poll(&mut self, now: Instant, master_from_plugin: bool) {
+        for tap in &mut self.taps {
+            tap.blocks.clear();
+            if tap.source.is_none()
+                && self.auto_open
+                && master_from_plugin
+                && retry_due(&mut tap.retry_at, now)
+            {
+                tap.source = PluginInput::open_role(tap.role)
+                    .map(|input| Box::new(input) as Box<dyn AudioSource>);
+            }
+            let Some(source) = tap.source.as_mut() else {
+                continue;
+            };
+            let alive = source.poll(&mut tap.blocks);
+            if alive {
+                tap.dead_since = None;
+            } else {
+                tap.blocks.clear();
+                let since = *tap.dead_since.get_or_insert(now);
+                // A stem tap removed from the set is let go, so a new instance can be found.
+                if self.auto_open && now.saturating_duration_since(since) >= PLUGIN_REOPEN_AFTER {
+                    tap.source = None;
+                    tap.dead_since = None;
+                }
+            }
+            if !master_from_plugin {
+                tap.blocks.clear();
+            }
+        }
+    }
+
+    /// Hand the analyzer the stem blocks that go with master block `index` of this frame.
+    fn feed(&mut self, analyzer: &mut Analyzer, index: usize) {
+        for tap in &self.taps {
+            if let Some(block) = tap.blocks.get(index) {
+                analyzer.push_stem(tap.role, block);
+                self.fed += 1;
+            }
+        }
+    }
+}
+
 /// `true` when a deferred open may be tried again at `now`, and records the attempt.
 fn retry_due(stamp: &mut Option<Instant>, now: Instant) -> bool {
     match *stamp {
@@ -488,6 +600,8 @@ pub struct AppCore {
     analyzer: Analyzer,
     show: Show,
     inputs: InputMux,
+    /// Drum and bass stem taps, when the set has them.
+    stems: Stems,
     controls: Controls,
     blocks: Vec<AudioBlock>,
     events: Vec<ControlEvent>,
@@ -519,6 +633,11 @@ impl AppCore {
         AppCore {
             analyzer: Analyzer::new(AnalysisConfig::default()),
             show: Show::new(project),
+            stems: if inputs.auto_open {
+                Stems::open()
+            } else {
+                Stems::none()
+            },
             inputs,
             controls,
             blocks: Vec::new(),
@@ -547,6 +666,11 @@ impl AppCore {
             self.grid.stopping = 0;
         }
         self.show.set_mode(mode);
+    }
+
+    /// The stem taps: how many blocks they fed, and a way to hand one in (tests).
+    pub fn stems_mut(&mut self) -> &mut Stems {
+        &mut self.stems
     }
 
     /// Times the analyzer was started fresh because the input changed.
@@ -592,6 +716,7 @@ impl AppCore {
             self.analyzer_resets += 1;
         }
         self.analyzed_source = Some(source);
+        self.stems.poll(now, source == SourceKind::Plugin);
 
         self.events.clear();
         self.controls.poll(&mut self.events, now);
@@ -602,6 +727,8 @@ impl AppCore {
             if let Some(transport) = self.blocks[index].transport {
                 self.note_playhead(transport.ppq);
             }
+            // A stem block goes in before the master block it belongs to.
+            self.stems.feed(&mut self.analyzer, index);
             self.analyzer.push(&self.blocks[index]);
         }
         self.blocks.clear();

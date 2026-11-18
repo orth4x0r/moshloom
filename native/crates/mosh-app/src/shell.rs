@@ -31,10 +31,15 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use mosh_core::{AnalysisFrame, Clip, ControlEvent, Layer, Project, RenderPlan, ShowMode};
-use mosh_render::{
-    FramePacer, FrameRecorder, Gpu, GpuPreference, LayerTarget, RenderError, Stage, WaitTimer,
+use mosh_core::{
+    AnalysisFrame, BlendMode, Clip, ControlEvent, Layer, LayerKind, Project, RenderPlan, ShowMode,
 };
+use mosh_render::{
+    BlockFormat, CompositeTarget, FramePacer, FrameRecorder, Gpu, GpuPreference, LayerTarget,
+    RenderError, Stage, WaitTimer,
+};
+use mosh_video::hap::HapTextureFormat;
+use mosh_visuals::stack::{Stack, StackLayer};
 use mosh_visuals::{LayerSlot, Visuals};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -82,6 +87,11 @@ const IDLE_TICK: Duration = Duration::from_millis(16);
 /// clone of the device handle and must be dropped before the `Gpu`, so the device is last.
 struct Scene {
     stage: Option<Stage>,
+    /// The whole stack composited, when the show has an Adjustment or a Mask layer: the stack
+    /// writes it and the stage presents it as one layer. Output-sized; dropped on a resize.
+    stacked: Option<LayerTarget>,
+    /// Adjustment and Mask layers (`mosh_visuals::stack`): allocates nothing until a show has one.
+    stack: Stack,
     slots: Vec<LayerSlot>,
     /// Where a clip thumbnail is drawn (`crate::preview`), built on first use.
     thumb: Option<LayerTarget>,
@@ -115,6 +125,8 @@ impl Scene {
         let visuals = Visuals::new(&gpu, w, h)?;
         let mut scene = Scene {
             stage: None,
+            stacked: None,
+            stack: Stack::new(),
             slots: Vec::with_capacity(layers.len()),
             thumb: None,
             visuals: Some(visuals),
@@ -159,6 +171,7 @@ impl Scene {
             self.visuals_size = (w, h);
         }
         self.out = out;
+        self.stacked = None;
         self.rebuild_slots(layers);
         if let Some(stage) = self.stage.as_mut() {
             stage.resize(out.0, out.1);
@@ -194,6 +207,16 @@ fn internal_size(out: (u32, u32), scale: f32) -> (u32, u32) {
         ((out.0 as f32 * scale) as u32).max(16),
         ((out.1 as f32 * scale) as u32).max(16),
     )
+}
+
+/// The texture format a HAP plane uploads as.
+fn block_format(format: HapTextureFormat) -> BlockFormat {
+    match format {
+        HapTextureFormat::Bc1 => BlockFormat::Bc1,
+        HapTextureFormat::Bc3 => BlockFormat::Bc3,
+        HapTextureFormat::Bc3YCoCg => BlockFormat::Bc3YCoCg,
+        HapTextureFormat::Bc4Alpha => BlockFormat::Bc4,
+    }
 }
 
 /// Video for overlay layers, opened on first use and kept.
@@ -264,20 +287,57 @@ fn render_frame(
         return Err(RenderError::Stage("no device".into()));
     };
 
-    // Overlay video goes into the layer's texture before the layer is drawn.
-    for (index, state) in plan.layers.iter().enumerate() {
-        let Some(clip_id) = state.clip else { continue };
-        let Some(clip) = project.clips.iter().find(|clip| clip.id == clip_id) else {
-            continue;
-        };
-        let Some(video) = videos.frame_for(clip, analysis.time_s) else {
-            continue;
-        };
-        let (width, height) = (video.w, video.h);
-        if let Some(visuals) = scene.visuals.as_mut() {
-            visuals
-                .overlay
-                .set_frame(gpu, index, width, height, &video.bgra)?;
+    // Media goes into a layer before the layer is drawn: a video clip's frame, the camera a
+    // camera clip names, a text clip's words. Each kind reads only its own clips, so a
+    // `camera:` or `text:` source is never opened as a video file.
+    if let Some(visuals) = scene.visuals.as_mut() {
+        for (index, state) in plan.layers.iter().enumerate() {
+            let Some(clip_id) = state.clip else { continue };
+            let Some(clip) = project.clips.iter().find(|clip| clip.id == clip_id) else {
+                continue;
+            };
+            let media = clip.video.as_deref().unwrap_or("");
+            match state.visualizer.as_deref() {
+                Some("overlay") => {
+                    let Some(video) = videos.frame_for(clip, analysis.time_s) else {
+                        continue;
+                    };
+                    match video.hap() {
+                        // HAP: the compressed blocks go straight to the GPU, no CPU decode. A
+                        // device without block compression leaves the layer transparent.
+                        Some(hap) => {
+                            let Some(format) = hap.format.map(block_format) else {
+                                continue;
+                            };
+                            if !visuals.overlay.hap_supported() {
+                                continue;
+                            }
+                            let alpha = hap.alpha.as_ref().map(|plane| plane.data.as_slice());
+                            visuals.overlay.set_hap_frame(
+                                gpu, index, video.w, video.h, format, &hap.data, alpha,
+                            )?;
+                        }
+                        None => {
+                            visuals
+                                .overlay
+                                .set_frame(gpu, index, video.w, video.h, &video.bgra)?;
+                        }
+                    }
+                }
+                Some("camera") => {
+                    // `camera:` alone is the default camera; naming the same one again is free.
+                    let device = media.strip_prefix("camera:").unwrap_or("").trim();
+                    visuals
+                        .camera
+                        .set_source(index, (!device.is_empty()).then_some(device));
+                }
+                Some("text") => {
+                    // The same words again are free: glyphs are laid out on a change only.
+                    let words = media.strip_prefix("text:").unwrap_or("");
+                    visuals.text.set_text(gpu, index, words);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -288,17 +348,82 @@ fn render_frame(
         scene.slots.push(LayerSlot::new(gpu, index, w, h));
     }
 
+    // What each layer is: an Adjustment or a Mask changes how the stack is composited.
+    let kinds: Vec<LayerKind> = plan
+        .layers
+        .iter()
+        .map(|state| {
+            project
+                .session
+                .layers
+                .get(state.layer)
+                .map_or(LayerKind::Visualizer, |layer| layer.kind)
+        })
+        .collect();
+    let stacked = kinds
+        .iter()
+        .any(|kind| matches!(kind, LayerKind::Adjustment | LayerKind::Mask));
+
     let mut recorder = FrameRecorder::new(gpu);
     {
         let Some(visuals) = scene.visuals.as_mut() else {
             return Err(RenderError::Stage("no visuals".into()));
         };
         for (index, state) in plan.layers.iter().enumerate() {
+            // An Adjustment layer draws nothing of its own: the stack applies its clip's effects
+            // to the layers below it.
+            if kinds[index] == LayerKind::Adjustment {
+                continue;
+            }
             visuals.draw_layer(&mut recorder, &mut scene.slots[index], state, analysis, t)?;
         }
-        for (index, state) in plan.layers.iter().enumerate() {
-            recorder.layer(scene.slots[index].output(), state.blend, state.opacity);
+        if !stacked {
+            for (index, state) in plan.layers.iter().enumerate() {
+                recorder.layer(scene.slots[index].output(), state.blend, state.opacity);
+            }
         }
+    }
+    // Wall time of the stack's composite, which is mostly waiting for the GPU (the layers, then
+    // the adjustment's own passes): it is counted as GPU time, not as render-thread work.
+    let mut stack_ms = 0.0f32;
+    if stacked {
+        // A stack with an Adjustment or a Mask is composited by `mosh_visuals::stack` into an
+        // output-sized target, and the stage presents that as one layer. A plain stack never
+        // comes here: it stays one composite pass straight into the swapchain image.
+        let out = scene.out;
+        let target = scene
+            .stacked
+            .get_or_insert_with(|| LayerTarget::new(gpu, out.0, out.1));
+        let flow = scene
+            .visuals
+            .as_ref()
+            .and_then(|visuals| visuals.fluid.velocity());
+        let layers: Vec<StackLayer<'_>> = plan
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(index, state)| {
+                StackLayer::new(
+                    &scene.slots[index],
+                    kinds[index],
+                    state.blend,
+                    state.opacity,
+                    state,
+                )
+            })
+            .collect();
+        let composed = Instant::now();
+        scene.stack.compose(
+            recorder,
+            flow,
+            &layers,
+            CompositeTarget::Layer(target),
+            analysis,
+            t,
+        )?;
+        stack_ms = composed.elapsed().as_secs_f32() * 1_000.0;
+        recorder = FrameRecorder::new(gpu);
+        recorder.layer(target, BlendMode::Normal, 1.0);
     }
 
     // A clip thumbnail, when this frame carries one: one more scene pass at the end of the
@@ -332,14 +457,14 @@ fn render_frame(
         thumb_failed = Some(request.key);
     }
 
-    let cpu_ms = frame_start.elapsed().as_secs_f32() * 1_000.0;
+    let cpu_ms = (frame_start.elapsed().as_secs_f32() * 1_000.0 - stack_ms).max(0.0);
     let Some(stage) = scene.stage.as_mut() else {
         // No window to present in: the layers were still drawn, so the next monitor that appears
         // shows a current frame instead of a black one.
         drop(recorder);
         return Ok(Outcome {
             cpu_ms,
-            gpu_ms: 0.0,
+            gpu_ms: stack_ms,
             surface_lost: false,
             preview: None,
             thumbs: Vec::new(),
@@ -369,7 +494,7 @@ fn render_frame(
     }
     Ok(Outcome {
         cpu_ms,
-        gpu_ms: stage.timings().frame_ms,
+        gpu_ms: stage.timings().frame_ms + stack_ms,
         surface_lost: present.surface_lost,
         preview,
         thumbs,
@@ -433,6 +558,9 @@ struct RenderThread {
     rx: Receiver<Command>,
     proxy: EventLoopProxy<UserEvent>,
     budget: BudgetWatch,
+    /// `ILANAVISUAL_BUDGET_LOG=1`: log every budget window's averages, not only an exceed (for
+    /// measuring a steady state; the exceed line is latched and says nothing after the first).
+    budget_log: Option<Instant>,
     /// The frame rate cap: the stage renders at most this many frames a second whatever the
     /// display's refresh is (the reference panel is 120 Hz).
     pacer: FramePacer,
@@ -475,6 +603,7 @@ impl RenderThread {
             rx,
             proxy,
             budget: BudgetWatch::new(),
+            budget_log: std::env::var_os("ILANAVISUAL_BUDGET_LOG").map(|_| Instant::now()),
             pacer: FramePacer::new(fps),
             timer: WaitTimer::new(),
             paced_frames: 0,
@@ -670,6 +799,16 @@ impl RenderThread {
 
         for line in self.budget.sample(cpu_ms, gpu_ms, Instant::now()) {
             eprintln!("ilanaVisual: {line}");
+        }
+        if let Some(at) = self.budget_log
+            && at.elapsed() >= Duration::from_secs(1)
+        {
+            self.budget_log = Some(Instant::now());
+            eprintln!(
+                "ilanaVisual: budget window: render thread {:.2} ms, GPU {:.2} ms per frame",
+                self.budget.last_cpu_ms(),
+                self.budget.last_gpu_ms()
+            );
         }
 
         if self
