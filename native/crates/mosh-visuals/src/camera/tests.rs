@@ -14,9 +14,9 @@ use std::ops::Deref;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use mosh_core::ClipParams;
+use mosh_core::{BlendMode, ClipParams};
 use mosh_render::upload::VideoTexture;
-use mosh_render::{FrameRecorder, Gpu, GpuPreference, LayerTarget};
+use mosh_render::{Compositor, FrameRecorder, Gpu, GpuPreference, LayerTarget, OutputImage};
 
 use super::pass::CameraPass;
 use super::*;
@@ -137,6 +137,32 @@ fn solid(width: u32, height: u32, colour: [u8; 3]) -> Vec<u8> {
     bytes
 }
 
+const YELLOW: [u8; 3] = [255, 255, 0];
+
+/// The orientation fixture, the same one `tests/orientation.rs` uses: a red band on the top 60
+/// rows, a blue band on the bottom 60, a yellow box at x 20-139 / y 100-139 (upper third, left)
+/// and green elsewhere. Asymmetric in both axes, so a V-flip, an H-flip or a transpose each fail a
+/// different assertion.
+fn orientation_frame(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = vec![0u8; (width * height * 4) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let colour = if y < 60 {
+                RED
+            } else if y >= height - 60 {
+                BLUE
+            } else if (20..140).contains(&x) && (100..140).contains(&y) {
+                YELLOW
+            } else {
+                GREEN
+            };
+            let offset = ((y * width + x) * 4) as usize;
+            bytes[offset..offset + 4].copy_from_slice(&bgra(colour));
+        }
+    }
+    bytes
+}
+
 fn pixel_at(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
     let offset = ((y * width + x) * 4) as usize;
     [
@@ -145,6 +171,16 @@ fn pixel_at(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
         pixels[offset + 2],
         pixels[offset + 3],
     ]
+}
+
+/// A pixel in *audience* coordinates (row 0 = the top of the stage).
+///
+/// A layer target's read-back is V-mirrored relative to the stage: the compositor samples a layer
+/// with uv.y = 0 at the top of the output, so a layer's row 0 is the audience's bottom row, and the
+/// present pass adds no second flip (`tests/orientation.rs` has the output-path assertions). The
+/// cover-geometry tests below read the layer directly and work in audience order.
+fn stage_pixel(pixels: &[u8], width: u32, height: u32, x: u32, y: u32) -> [u8; 4] {
+    pixel_at(pixels, width, x, height - 1 - y)
 }
 
 fn assert_pixel(pixel: [u8; 4], expected: [u8; 4], tolerance: i32, what: &str) {
@@ -179,7 +215,9 @@ fn draw_synthetic(
 }
 
 /// A 160x90 checkerboard into a 64x36 target: the aspects match, so every one of the 8x6 cells
-/// lands on an exact 8x6 pixel block and the orientation is pinned by the corners.
+/// lands on an exact 8x6 pixel block and the cover geometry is pinned by the corners. The picture
+/// is read in audience order (see [`stage_pixel`]); the source's orientation through the output
+/// path is `captured_frame_is_upright_on_the_stage`.
 #[test]
 fn synthetic_frame_draws_cover_scaled_and_unflipped() {
     let gpu = gpu();
@@ -209,36 +247,107 @@ fn synthetic_frame_draws_cover_scaled_and_unflipped() {
             let x = column * 8 + 4;
             let y = row * 6 + 3;
             assert_pixel(
-                pixel_at(&pixels, target_width, x, y),
+                stage_pixel(&pixels, target_width, target_height, x, y),
                 expected,
                 2,
                 &format!("cell ({column},{row}) at ({x},{y})"),
             );
         }
     }
-    // The corners pin the orientation: a vertically flipped draw would swap the 6 cell rows.
+    // The corners pin the orientation: a horizontally flipped draw would swap the left and right
+    // cells, and a cover crop that took the wrong rows would move the 6 cell rows.
     assert_pixel(
-        pixel_at(&pixels, 2, 2, 2),
+        stage_pixel(&pixels, target_width, target_height, 2, 2),
         [255, 0, 0, 255],
         2,
         "top-left cell",
     );
     assert_pixel(
-        pixel_at(&pixels, target_width, 61, 1),
+        stage_pixel(&pixels, target_width, target_height, 61, 1),
         [0, 255, 0, 255],
         2,
         "top-right cell",
     );
     assert_pixel(
-        pixel_at(&pixels, target_width, 2, 33),
+        stage_pixel(&pixels, target_width, target_height, 2, 33),
         [0, 255, 0, 255],
         2,
         "bottom-left cell",
     );
     println!(
         "synthetic 160x90 -> 64x36: top-left {:?}, top-right {:?}",
-        pixel_at(&pixels, target_width, 2, 2),
-        pixel_at(&pixels, target_width, 61, 1)
+        stage_pixel(&pixels, target_width, target_height, 2, 2),
+        stage_pixel(&pixels, target_width, target_height, 61, 1)
+    );
+    assert_no_validation(&gpu);
+}
+
+/// The camera picture's orientation through the real output path. A synthetic frame's top band
+/// must be on the top of the composited output, and its marker must stay in the upper third on the
+/// left: the same fixture and the same assertions `tests/orientation.rs` runs for overlay BGRA and
+/// HAP. This case lives here because a captured frame can only be injected through `CameraPass`,
+/// which is crate-private.
+#[test]
+fn captured_frame_is_upright_on_the_stage() {
+    let gpu = gpu();
+    let (width, height) = (640u32, 360u32);
+    let (out_width, out_height) = (320u32, 180u32);
+    let dst = LayerTarget::new(&gpu, out_width, out_height);
+    draw_synthetic(
+        &gpu,
+        width,
+        height,
+        &orientation_frame(width, height),
+        &dst,
+        &params([0.0; 8]),
+    )
+    .expect("draw the fixture");
+
+    let out = OutputImage::new(&gpu, out_width, out_height);
+    let mut compositor = Compositor::new(&gpu).expect("compositor");
+    compositor
+        .composite(&[(&dst, BlendMode::Normal, 1.0)], &out)
+        .expect("composite the camera layer");
+    let pixels = gpu.read_back_output(&out);
+
+    // Output row 0 is the top of the stage: red band first, blue band last, marker upper-left.
+    let top = pixel_at(&pixels, out_width, out_width / 2, 2);
+    let bottom = pixel_at(&pixels, out_width, out_width / 2, out_height - 3);
+    let marker = pixel_at(&pixels, out_width, out_width / 12, out_height / 3);
+    let middle = pixel_at(&pixels, out_width, out_width / 2, out_height / 2);
+    let lower = pixel_at(
+        &pixels,
+        out_width,
+        out_width / 12,
+        out_height - out_height / 3,
+    );
+    println!(
+        "camera on the output: top {top:?}, bottom {bottom:?}, marker {marker:?}, middle {middle:?}"
+    );
+    assert_pixel(
+        top,
+        [255, 0, 0, 255],
+        3,
+        "output row 0 is the frame's red top band",
+    );
+    assert_pixel(
+        bottom,
+        [0, 0, 255, 255],
+        3,
+        "the output's last rows are the frame's blue bottom band",
+    );
+    assert_pixel(
+        marker,
+        [255, 255, 0, 255],
+        3,
+        "the marker is in the upper third, left",
+    );
+    assert_pixel(middle, [0, 255, 0, 255], 3, "the frame's middle is green");
+    assert_pixel(
+        lower,
+        [0, 255, 0, 255],
+        3,
+        "the marker is not repeated in the lower third (that would be a vertical mirror)",
     );
     assert_no_validation(&gpu);
 }
@@ -548,7 +657,7 @@ fn camera_draws_inside_the_frame() {
         "a redraw uploads nothing and draws the last picture"
     );
     assert_pixel(
-        pixel_at(&gpu.read_back(&dst), 64, 2, 2),
+        stage_pixel(&gpu.read_back(&dst), 64, 36, 2, 2),
         [255, 0, 0, 255],
         2,
         "the redrawn picture is still the checkerboard",
@@ -796,7 +905,7 @@ fn camera_cpu_time_per_frame_1080p() {
     let (record_min, record_median) = stats(&mut record_samples);
     let (cover_min, cover_median) = stats(&mut cover_samples);
     assert_pixel(
-        pixel_at(&gpu.read_back(&dst), width, 10, 10),
+        stage_pixel(&gpu.read_back(&dst), width, height, 10, 10),
         [255, 0, 0, 255],
         2,
         "1080p checkerboard",

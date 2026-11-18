@@ -27,11 +27,13 @@
 //!
 //! # Row order
 //!
-//! A layer target is V-mirrored relative to what the stage shows: the compositor flips every
-//! layer once when it writes the output (`fullscreen.vert` puts uv 0 at the bottom, so sampling a
-//! layer into the output reverses it). `read_back` returns the layer's memory row 0 first, which
-//! is the *bottom* of the audience's picture, so `the_word_is_upright_on_the_stage` pins the
-//! direction and the preview PNGs are written flipped, in audience order.
+//! A layer target is V-mirrored relative to what the stage shows: the compositor samples a layer
+//! with `fullscreen.vert`'s uv, whose y is 0 at the top of the output image and 1 at its bottom,
+//! while a layer target's row 0 is the output's *bottom* row, and the present pass adds no second
+//! flip. `read_back` therefore returns the layer's memory row 0 first, which is the *bottom* of
+//! the audience's picture. `the_word_is_upright_on_the_stage` follows the picture through the
+//! compositor into an `OutputImage`, whose row 0 is the top of the stage, so it pins the direction
+//! the audience sees; the preview PNGs are written flipped, in audience order.
 
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -39,7 +41,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use mosh_core::{AnalysisFrame, BlendMode, ClipParams, LayerState};
-use mosh_render::{FrameRecorder, Gpu, GpuPreference, LayerTarget};
+use mosh_render::{Compositor, FrameRecorder, Gpu, GpuPreference, LayerTarget, OutputImage};
 use mosh_visuals::text::TextLayer;
 use mosh_visuals::{LayerSlot, Visuals};
 
@@ -257,23 +259,58 @@ fn draw_once(
     }
 }
 
+/// The same draw, followed through mosh-render's `Compositor` into an `OutputImage` and read back
+/// from it: this is the path a frame takes to the stage, so row 0 of the result is the top of the
+/// picture an audience sees (see `tests/orientation.rs` for why the layer read-back is not).
+fn draw_once_on_stage(
+    gpu: &Gpu,
+    text: &str,
+    params: &ClipParams,
+    frame: &AnalysisFrame,
+    t: f32,
+    width: u32,
+    height: u32,
+) -> Shot {
+    let mut layer = TextLayer::new(gpu).expect("text layer");
+    layer.set_text(gpu, 0, text);
+    let dst = LayerTarget::new(gpu, width, height);
+    let mut recorder = FrameRecorder::new(gpu);
+    layer
+        .draw(&mut recorder, 0, &dst, frame, params, t)
+        .expect("draw text");
+    gpu.wait_frame(recorder.submit());
+
+    let out = OutputImage::new(gpu, width, height);
+    let mut compositor = Compositor::new(gpu).expect("compositor");
+    compositor
+        .composite(&[(&dst, BlendMode::Normal, 1.0)], &out)
+        .expect("composite the text layer");
+    Shot {
+        pixels: gpu.read_back_output(&out),
+        width,
+        height,
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Layout: what the sheet holds.
 // ---------------------------------------------------------------------------------------------
 
-/// The stage showed "ilanaVisual" mirrored top to bottom once: the layer target is V-mirrored
-/// relative to the audience (`read_back` row 0 is the bottom of the picture), so a shader that
-/// draws `position.y` straight down as the word's top lands the word upside down on the stage.
+/// The stage showed "ilanaVisual" mirrored top to bottom once. A layer target is V-mirrored
+/// relative to the audience (`read_back` row 0 is the bottom of the picture), so the pass draws in
+/// audience coordinates; this test follows the same picture through the compositor into an
+/// `OutputImage`, which is the path a frame takes to the stage.
 ///
-/// An `L` pins both axes: its stem is on the left, and its foot (the wide horizontal bar) is at
-/// the *audience's* bottom, which is the layer's *first* rows. Without the shader's flip the foot
-/// sits in the last rows instead, and this test fails.
+/// An `L` pins both axes: its stem is on the left, and its foot (the wide horizontal bar) is at the
+/// *audience's* bottom, which is the output's *last* rows (and the layer's first rows). With the
+/// shader drawing in layer coordinates instead, the foot lands in the output's first rows and this
+/// test fails.
 #[test]
 fn the_word_is_upright_on_the_stage() {
     let gpu = gpu();
     let (width, height) = (400u32, 300u32);
     let frame = AnalysisFrame::default();
-    let shot = draw_once(&gpu, "L", &clean(0.7), &frame, 0.0, width, height);
+    let shot = draw_once_on_stage(&gpu, "L", &clean(0.7), &frame, 0.0, width, height);
 
     let quarter = height / 4;
     let ink_in = |y0: u32, y1: u32| -> usize {
@@ -290,13 +327,13 @@ fn the_word_is_upright_on_the_stage() {
         .map(|x| (0..height).filter(|y| is_ink(&shot.pixel(x, *y))).count())
         .sum::<usize>();
     println!(
-        "L in the layer target: top quarter {top} lit px, bottom quarter {bottom}, left half \
-         {stem}, right half {arm}"
+        "L on the output: top quarter {top} lit px, bottom quarter {bottom}, left half {stem}, \
+         right half {arm}"
     );
     assert!(
-        top > bottom * 3 / 2,
-        "the L's foot must be in the layer's first rows (the audience's bottom): top quarter \
-         {top}, bottom quarter {bottom}. This is the upside-down defect"
+        bottom > top * 3 / 2,
+        "the L's foot must be in the output's last rows (the audience's bottom): bottom quarter \
+         {bottom}, top quarter {top}. This is the upside-down defect"
     );
     assert!(
         stem > arm * 3 / 2,
@@ -877,7 +914,7 @@ fn preview_path(name: &str) -> PathBuf {
 /// deflate blocks is a valid, if fat, PNG.
 ///
 /// Rows are written in reverse: the read-back is the layer target's, and the compositor mirrors
-/// it on the way to the stage, so the last layer row is the top of what an audience sees.
+/// it once on the way to the stage, so the last layer row is the top of what an audience sees.
 fn save_png(path: &PathBuf, shot: &Shot) -> std::io::Result<()> {
     let mut raw = Vec::with_capacity((shot.height * (1 + shot.width * 4)) as usize);
     for y in (0..shot.height).rev() {

@@ -13,8 +13,11 @@
 //         together on the CPU
 //   grade (exposure multiplier, contrast multiplier, tint -1..1, posterize levels: 0 = off)
 //
-// Row order matches `overlay_video.wgsl`: the vertex stage's uv is 0 at the bottom of the layer
-// target and 1 at the top, so v is flipped here, while a captured frame is "top row first".
+// Row order: a layer target is V-mirrored relative to the stage. This pass's uv.y is 0 at the top
+// of the frame the audience sees and 1 at its bottom, while a layer target's row 0 is that frame's
+// bottom, and the present pass adds no second flip (see `text/text.wgsl`). A captured frame is
+// "top row first", so texture v = 0 is its top and v follows uv: the picture's top row lands at
+// the top of the stage.
 
 struct Camera {
     dst: vec2<f32>,
@@ -31,7 +34,7 @@ struct Camera {
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let source_uv = vec2<f32>(
         cam.view.x + (uv.x - 0.5) * cam.view.z,
-        cam.view.y - (uv.y - 0.5) * cam.view.w,
+        cam.view.y + (uv.y - 0.5) * cam.view.w,
     );
     var c = textureSample(frame_tex, frame_sampler, source_uv).rgb;
     // Exposure first: a multiplier on the light, the way a camera's exposure works.

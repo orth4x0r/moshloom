@@ -5,8 +5,10 @@
 //! Every pixel assertion therefore covers the whole path: block upload, the GPU's block decode,
 //! HAP Q's YCoCg conversion, alpha premultiplication, and the compositor's "over".
 //!
-//! Row order: like `tests/overlay.rs`, a layer target's row 0 is the top of the picture the
-//! audience sees, and a HAP frame's first block row is its top.
+//! Row order: like `tests/overlay.rs`, a layer target is V-mirrored relative to the stage (`read_back`
+//! row 0 is the audience's bottom row), and a HAP frame's first block row is its top. The pictures
+//! asserted here are symmetric top to bottom, so their row order does not matter; the orientation
+//! is pinned through the compositor's output in `tests/orientation.rs`.
 
 use std::ops::Deref;
 use std::sync::{Mutex, MutexGuard};

@@ -441,12 +441,28 @@ impl<'a> Rig<'a> {
 // The `Visuals::draw_layer` side: the clip changes, which only the facade can express.
 // ---------------------------------------------------------------------------------------------
 
+/// The same picture with its rows reversed.
+///
+/// A layer target is V-mirrored relative to the stage (`tests/orientation.rs`), so a layer
+/// read-back is upside down relative to the source picture the oracle's reference works in. This
+/// turns one into the other; the mosh itself is equivariant under the flip, so an output compared
+/// after this is the output the oracle computes from the source-order picture.
+fn flip_rows(frame: Frame) -> Frame {
+    let (width, height) = (frame.width, frame.height);
+    Frame::from_fn(width, height, |x, y| {
+        let at = ((height - 1 - y) * width + x) * 3;
+        [frame.rgb[at], frame.rgb[at + 1], frame.rgb[at + 2]]
+    })
+}
+
 /// One layer through the real facade, fed with the synthetic clips.
 ///
 /// `Visuals::draw_layer`'s only way to put arbitrary pixels into a layer is the overlay path, so
 /// these cases upload each frame as 8-bit BGRA (`clips::bgra`) and the reference is fed
 /// `clips::quantized` — the same pictures. `the_overlay_path_delivers_the_oracle_pictures` pins
-/// that the upload, the cover pass and the row order come out as the pictures the oracle expects.
+/// that the upload and the cover pass come out as the pictures the oracle expects, through
+/// [`flip_rows`] (a layer target is V-mirrored relative to the stage, and the oracle's pictures
+/// are in source order).
 struct Facade<'a> {
     gpu: &'a Gpu,
     visuals: Visuals,
@@ -532,7 +548,16 @@ impl<'a> Facade<'a> {
                 self.slot.output_stage
             );
         }
-        Frame::from_rgba8(&self.gpu.read_back(self.slot.output()), WIDTH, HEIGHT)
+        // A layer target is V-mirrored relative to the stage: its row 0 is the audience's bottom
+        // row, while the oracle's pictures are in source order (row 0 is the top). `flip_rows`
+        // turns the layer back into that order. The comparison stays exact because the mosh is
+        // equivariant under a global row flip: it samples and writes by pixel index, its block
+        // grid maps onto itself, and its search window is symmetric in y.
+        flip_rows(Frame::from_rgba8(
+            &self.gpu.read_back(self.slot.output()),
+            WIDTH,
+            HEIGHT,
+        ))
     }
 
     /// The carry-over case, GPU side: [`WARM_FRAMES`] frames of clip A, then a `Datamosh` clip

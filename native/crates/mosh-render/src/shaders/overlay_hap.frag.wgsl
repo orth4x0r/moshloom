@@ -17,10 +17,11 @@
 //
 // Uniform block (32 bytes, std140): destination size, display size, padded texture size, mode.
 //
-// Row order: like `overlay_video.wgsl`, v is flipped so the HAP frame's first block row (its top)
-// lands on the layer target's row 0, which is the top of the picture the audience sees. The
-// texture is padded to whole 4x4 blocks, so the display region is the top-left corner of it and
-// `src / tex` crops the padding rows and columns away.
+// Row order: like `overlay_video.wgsl`, a layer target is V-mirrored relative to the stage (the
+// compositor samples a layer with uv.y = 0 at the top of the frame the audience sees, and a layer
+// target's row 0 is that frame's bottom), so v follows uv: the HAP frame's first block row (its
+// top) lands at the top of the stage. The texture is padded to whole 4x4 blocks, so the display
+// region is the top-left corner of it and `src / tex` crops the padding rows and columns away.
 
 struct Cover {
     dst: vec2<f32>,
@@ -58,7 +59,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let visible = cover.dst / (cover.src * scale);
     let source_uv = vec2<f32>(
         0.5 + (uv.x - 0.5) * visible.x,
-        0.5 - (uv.y - 0.5) * visible.y,
+        0.5 + (uv.y - 0.5) * visible.y,
     );
     // The texture is the display size rounded up to whole 4x4 blocks, so the display picture is
     // its top-left corner.
