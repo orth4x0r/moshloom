@@ -38,7 +38,11 @@ use crate::editor::theme;
 use crate::preview::{Picture, ThumbRequest, has_thumbnail, thumb_key};
 
 pub use arrangement::{SpanDrag, SpanZone, TimeAxis, drag_result, hit_span};
-pub use session::{HeaderDrawn, HeaderRects, MIN_COLUMN, column_width, header_layout};
+pub use detail::{DetailPage, DetailPlan, detail_plan};
+pub use session::{
+    HeaderDrawn, HeaderRects, MIN_COLUMN, TWO_ROW_COLUMN, column_width, header_height,
+    header_layout, scene_width,
+};
 pub use topbar::{TopBarPlan, top_bar_plan};
 
 /// How many thumbnails the cache keeps (96 x 54 RGBA each: 21 KB, so about 5 MB when full).
@@ -182,8 +186,12 @@ pub struct EditorUi {
     pub filter: String,
     /// Which browser sections are open: visualizers, presets, project.
     pub sections: [bool; 3],
+    /// The visualizer groups (catalog packs) the performer folded away.
+    pub folded: Vec<String>,
     /// The intensity level whose ranges the detail panel edits; `None` follows the live level.
     pub level_tab: Option<u8>,
+    /// Which half of the clip a narrow detail panel shows.
+    pub detail_page: DetailPage,
     /// The arrangement's horizontal scale and scroll.
     pub px_per_beat: f32,
     pub scroll_beats: f64,
@@ -222,7 +230,9 @@ impl Default for EditorUi {
             recent: Vec::new(),
             filter: String::new(),
             sections: [true, true, true],
+            folded: Vec::new(),
             level_tab: None,
+            detail_page: DetailPage::default(),
             px_per_beat: 14.0,
             scroll_beats: 0.0,
             follow: true,

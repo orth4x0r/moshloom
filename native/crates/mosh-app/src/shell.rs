@@ -51,7 +51,7 @@ use winit::platform::windows::MonitorHandleExtWindows;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::budget::BudgetWatch;
+use crate::budget::{BudgetWatch, WARMUP_FRAMES};
 use crate::core::{AppCore, Lamps, Status, default_project, window_title};
 use crate::editor::model::Command as EditorCommand;
 use crate::editor::ui::{StageInfo, UiAction};
@@ -724,6 +724,9 @@ impl RenderThread {
         if self.scene.is_none() && self.retry_at.is_none_or(|at| frame_start >= at) {
             self.build();
             self.thumb_queue.renderer_rebuilt();
+            // The frames that follow a build pay for first uses; they are reported as warm-up,
+            // and the budget's window starts after them.
+            self.budget.warm_up(WARMUP_FRAMES);
             self.note(format!(
                 "renderer built in {:.0} ms (not a frame: the budget counts from the next one)",
                 frame_start.elapsed().as_secs_f32() * 1_000.0

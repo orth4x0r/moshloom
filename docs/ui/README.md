@@ -103,8 +103,21 @@ slots and the lane.
   stop on one row, blend and opacity on the next. The opacity is a thin bar with the percentage
   in it (drag sideways, double-click for 100%). In a narrow column the pickers show short names
   ("Adjust", "Luma") with the full ones in the list and the hover text; a clip name that does
-  not fit ends in an ellipsis and is one hover away. Columns are never narrower than 156 points:
-  with more layers than fit, the columns scroll sideways and the scene column stays put.
+  not fit ends in an ellipsis and is one hover away.
+- **Every layer is in view.** The layer columns share what the scene column leaves. On the
+  reference laptop (the control window is 833 points wide, the browser open) four layers get
+  120 points each: the scene column slims to 104 and a header narrower than 150 stacks its
+  controls on three rows (number and kind, blend, opacity and stop). Only below 104 points a
+  column do the layers scroll sideways, under a scene column that stays put.
+- **The detail panel never cuts a column off.** With 1052 points or more it shows its four
+  columns side by side. Narrower, it shows the clip column and one page beside it, chosen by a
+  switch at the bottom of the clip column: *Parameters*, or *Effects* (effects, transition,
+  follow action). Both pages fit from the smallest window up; nothing scrolls sideways.
+- **The browser's groups fold.** Each catalog group (Classic, Layers, each style pack) is a
+  heading with its count; a click folds it away, and a filter looks inside folded groups too.
+- **The budget lines are about a running show.** The 120 frames after the renderer is built
+  are reported once, as a warm-up line with their mean and worst frame, and the budget's
+  one-second window starts after them.
 
 ## Shortcuts
 
@@ -131,6 +144,14 @@ The control window at the size it has on the reference laptop (58% of a 2560 px 
 is 833 points), four layers:
 
 ![833 points wide](session-833.png)
+
+The same window with the detail panel on its Effects page:
+
+![Effects page](session-833-effects.png)
+
+The browser with every group open, in a tall window:
+
+![Browser groups](browser-packs.png)
 
 ![Arrangement at 1920x1080](arrangement-1920.png)
 
