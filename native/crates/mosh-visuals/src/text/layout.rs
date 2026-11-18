@@ -312,6 +312,11 @@ pub struct Layout {
     /// One entry per visual line, in reading order, already centred in the block.
     #[cfg_attr(not(test), allow(dead_code))]
     pub lines: Vec<Line>,
+    /// The block's words, as inclusive x ranges in block pixels plus the line they sit on, in
+    /// reading order: within a line, a gap wider than a space separates two words. Thorns use them
+    /// to stay over the word they grow from (`text/thorn.rs`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub words: Vec<(i32, i32, usize)>,
     /// Characters the length cap dropped from the end of the text (0 for a text that fits).
     #[cfg_attr(not(test), allow(dead_code))]
     pub dropped: usize,
@@ -672,6 +677,28 @@ impl Face {
             }
         }
 
+        // The block's words, per line: a gap wider than a space (0.15 em of ink between two
+        // glyphs) starts a new word. Thorns use these so a spike cannot cross a space and spear the
+        // next word.
+        let mut words: Vec<(i32, i32, usize)> = Vec::new();
+        for line in 0..lines.len() {
+            let mut of_line: Vec<&Placed> = placed.iter().filter(|glyph| glyph.line == line).collect();
+            of_line.sort_by_key(|glyph| glyph.x);
+            let mut start: Option<i32> = None;
+            let mut end = 0i32;
+            for glyph in of_line {
+                if start.is_some() && (glyph.x - end) as f32 > 0.15 * px {
+                    words.push((start.unwrap_or(0) - ink_left, end - ink_left, line));
+                    start = None;
+                }
+                start.get_or_insert(glyph.x);
+                end = glyph.x + glyph.glyph.width as i32;
+            }
+            if let Some(start) = start {
+                words.push((start - ink_left, end - ink_left, line));
+            }
+        }
+
         let glyphs = placed
             .into_iter()
             .map(|glyph| Glyph {
@@ -687,6 +714,7 @@ impl Face {
             block_h,
             advance_w: block_advance,
             lines: extents,
+            words,
             dropped,
         }
     }

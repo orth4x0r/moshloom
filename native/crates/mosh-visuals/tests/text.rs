@@ -1194,7 +1194,14 @@ fn set_text_and_draw_costs() {
             0.0,
         )
         .expect("draw the sigil look");
-    gpu.wait_frame(recorder.submit());
+    let sigil_timings = gpu.wait_frame(recorder.submit());
+    // The sigil pass costs more than the clean one: it evaluates up to twenty thorn strokes and a
+    // handful of mark strokes per pixel over a wider region. Reported, not budgeted.
+    let sigil_pass = sigil_timings
+        .per_pass_ms
+        .iter()
+        .find(|(name, _)| name == "text.glyphs")
+        .map(|(_, ms)| *ms);
     let sigil_text = "the loom knows what the flesh wants";
     let sigil = {
         let start = Instant::now();
@@ -1210,11 +1217,12 @@ fn set_text_and_draw_costs() {
         start.elapsed().as_secs_f64() * 1000.0
     };
     println!(
-        "a sigil-look text change ({sigil_text:?}, thorns included): {sigil:.3} ms cold, \
-         {warm:.3} ms with every glyph already cached"
+        "a sigil-look text change ({sigil_text:?}, thorns and marks included): {sigil:.3} ms cold, \
+         {warm:.3} ms with every glyph already cached; the sigil pass {}",
+        sigil_pass.map_or("not timed".to_string(), |ms| format!("{ms:.4} ms"))
     );
-    // A sigil text change pays for the glyphs and for the thorn growth, and it must not become a
-    // per-frame or per-edit stall. 25 ms is about three times the 8.4-9.4 ms measured here for
+    // A sigil text change pays for the glyphs and for the thorn and mark growth, and it must not
+    // become a per-frame or per-edit stall. 25 ms is about twice the 9.5 ms measured here for
     // thirty-six characters, and the reviewer measured 9.2 ms at the 600-character, seven-line cap
     // — generous, but a 3x regression fails it.
     let sigil_bound = if cfg!(debug_assertions) { 400.0 } else { 25.0 };

@@ -12,14 +12,15 @@
 //
 // Three contemporary looks, one face each:
 //   chrome  Unbounded      liquid chrome: environment reflection, iridescent rim, soft specular
-//   sigil   Grenze Gotisch blackletter in polished silver, thorns grown out of its contour,
-//                          a thin blood-red glow
+//   sigil   Grenze Gotisch blackletter in polished silver, long whip thorns and mirrored sigil
+//                          marks grown at bake time, a thin blood-red glow
 //   clean   Space Grotesk  crisp minimal, soft shadow, thin cool rim
 // Nothing here flashes the whole frame: every bright thing is inside the glyphs.
 //
-// The sigil look's thorns are geometry, not a pattern: `text/thorn.rs` grows them at bake time,
-// only on the block's outer contour and only outward, and the shader draws the segments in the
-// same silver as the letters. Nothing is ever drawn across a glyph's face.
+// The sigil look's linework is geometry, not a pattern: `text/thorn.rs` grows it at bake time —
+// thorns on the block's outer contour, a bramble mark beside each end of the word — and the shader
+// draws the strokes in the same silver as the letters. Nothing is ever drawn across a glyph's face,
+// and no thorn crosses a space into the next word.
 //
 // Uniform block (416 bytes, matches `text::UNIFORM_BYTES`):
 //   0  dst: vec2f          8  sheet: vec2f
@@ -27,15 +28,21 @@
 //   32 p0: vec4f (p0..p3)  48 p1: vec4f (p4..p7)
 //   64 audio: vec4f (low, mid, high, intensity)
 //   80 time: f32  84 beat: f32  88 loud: f32  92 thorn_count: f32
-//   96 thorns: array<Thorn, 10>, 32 bytes each: base, bend, tip, base half-width, pad
-//      (the count is `thorn::MAX_THORNS`; the reflection test pins the two together)
+//   96 marks: vec4f (symbol_count, 0, 0, 0)
+//   112 thorns: array<Stroke, 20>, 32 bytes each: a, b, c, half-width, mirror
+//   752 symbols: array<Stroke, 8>
+//      (the counts and the strides are `thorn::MAX_THORNS`/`MAX_SYMBOLS`; the reflection test
+//      pins every offset together with `text.rs`)
 
-struct Thorn {
-    base: vec2<f32>,
-    bend: vec2<f32>,
-    tip: vec2<f32>,
+// One stroke of the sigil look's linework: two tapered capsules `a -> b -> c`, wide at `a` and a
+// needle point at `c`. `mirror` is 1 for a symbol stroke, which is drawn again mirrored about the
+// block's vertical centre, so the pair of marks is symmetric.
+struct Stroke {
+    a: vec2<f32>,
+    b: vec2<f32>,
+    c: vec2<f32>,
     width: f32,
-    pad: f32,
+    mirror: f32,
 };
 
 struct TextUniforms {
@@ -50,7 +57,9 @@ struct TextUniforms {
     beat: f32,
     loud: f32,
     thorn_count: f32,
-    thorns: array<Thorn, 10>,
+    marks: vec4<f32>,
+    thorns: array<Stroke, 20>,
+    symbols: array<Stroke, 8>,
 };
 
 @group(0) @binding(0) var<uniform> U: TextUniforms;
@@ -65,17 +74,17 @@ const SDF_RANGE: f32 = 12.0;
 // bevel's height, which is what turns the flat distance into a rounded stroke.
 const BEVEL_PX: f32 = 9.0;
 
-// How far the sigil look's thorns reach past the block's box, in block heights: `text/thorn.rs`
-// grows a thorn at most 0.26 of a line's height plus its base half-width, and a line is never
-// taller than the block.
-const THORN_REACH: f32 = 0.34;
+// How far the sigil look's linework reaches past the block's box, in block heights: `text/thorn.rs`
+// grows a thorn at most 0.60 of a line's height plus its base half-width, and puts the flanking
+// marks within 0.40 of a line of the box; a line is never taller than the block.
+const LINEWORK_REACH: f32 = 0.72;
 
-// The thorn's taper, as fractions of its base half-width: the second capsule of a thorn starts at
-// `BEND_WIDTH` of the first's radius and ends at `TIP_WIDTH` of it. `text/thorn.rs` rasters the
-// same two capsules for its tests, and `the_thorn_geometry_constants_match_the_shader` compares
-// these literals with that module's constants.
-const BEND_WIDTH: f32 = 0.55;
-const TIP_WIDTH: f32 = 0.01;
+// The stroke's taper, as fractions of its base half-width: the second capsule of a stroke starts at
+// `BEND_WIDTH` of the first's radius and ends at `TIP_WIDTH` of it, which is a needle point.
+// `text/thorn.rs` rasters the same two capsules for its tests, and
+// `the_thorn_geometry_constants_match_the_shader` compares these literals with that module's.
+const BEND_WIDTH: f32 = 0.7;
+const TIP_WIDTH: f32 = 0.0;
 
 fn hash11(n: f32) -> f32 {
     return fract(sin(n * 127.1) * 43758.5453);
@@ -89,10 +98,10 @@ fn texel(uv: vec2<f32>) -> vec4<f32> {
     return textureSampleLevel(sheetT, lin, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
 }
 
-// One tapered segment of a thorn: the signed distance to its edge (negative inside), the unit
-// vector across it — which is the thorn's own surface direction as it turns — and the radius
-// there. Distances are in block heights, the space the thorn array carries.
-fn thorn_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, ra: f32, rb: f32) -> vec4<f32> {
+// One tapered segment of a stroke: the signed distance to its edge (negative inside), the unit
+// vector across it — which is the stroke's own surface direction as it turns — and the radius
+// there. Distances are in block heights, the space the stroke arrays carry.
+fn stroke_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, ra: f32, rb: f32) -> vec4<f32> {
     let ab = b - a;
     let t = clamp(dot(p - a, ab) / max(dot(ab, ab), 0.000001), 0.0, 1.0);
     let delta = p - (a + ab * t);
@@ -100,6 +109,22 @@ fn thorn_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, ra: f32, rb: f32) -> 
     let radius = mix(ra, rb, t);
     let across = select(vec2<f32>(0.0, 1.0), delta / max(run, 0.000001), run > 0.000001);
     return vec4<f32>(run - radius, across, radius);
+}
+
+// A whole stroke: the nearer of its two tapered capsules. Same return as `stroke_segment`.
+fn stroke_sdf(p: vec2<f32>, stroke: Stroke) -> vec4<f32> {
+    let first = stroke_segment(p, stroke.a, stroke.b, stroke.width, stroke.width * BEND_WIDTH);
+    let second = stroke_segment(
+        p, stroke.b, stroke.c, stroke.width * BEND_WIDTH, stroke.width * TIP_WIDTH,
+    );
+    return select(first, second, second.x < first.x);
+}
+
+// The cheapest way to know a stroke cannot reach `p`: its own bounding circle. Most strokes are
+// rejected by this before the capsule maths runs.
+fn out_of_reach(p: vec2<f32>, stroke: Stroke) -> bool {
+    let radius = length(stroke.c - stroke.a) + stroke.width * 2.0 + 0.01;
+    return distance(p, stroke.a) > radius;
 }
 
 // Filmic roll-off: a specular highlight gets bright without ever clipping to flat white.
@@ -218,8 +243,8 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     block_uv.x = 0.5 + (block_uv.x - 0.5) / spacing;
 
     // The sigil look is the only one whose ink leaves the block's box: its thorns reach past the
-    // silhouette, so that look's pass covers a wider rectangle and every other look covers exactly
-    // the sheet's margin.
+    // silhouette and its marks flank the word, so that look's pass covers a wider rectangle and
+    // every other look covers exactly the sheet's margin.
     let thorny = look >= 1.0 && look < 2.0;
 
     // Every pixel outside the sheet (block plus its margin, in block units) has nothing to sample:
@@ -229,8 +254,8 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     var reach_u = 0.0;
     var reach_v = 0.0;
     if (thorny) {
-        reach_v = THORN_REACH;
-        reach_u = THORN_REACH / max(block_aspect, 0.0001);
+        reach_v = LINEWORK_REACH;
+        reach_u = LINEWORK_REACH / max(block_aspect, 0.0001);
     }
     if (abs(block_uv.x - 0.5) > 0.5 + margin_u + reach_u
         || abs(block_uv.y - 0.5) > 0.5 + margin_v + reach_v) {
@@ -246,13 +271,14 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let slice_shift = (hash21(vec2<f32>(slice_row * 3.7, slice_clock)) - 0.5) * 0.05 * glitch;
     sheet_uv = sheet_uv + vec2<f32>(slice_shift * slice_on * span.x, 0.0);
 
-    // Thorns (sigil only): the bake grows them on the block's outer contour, and never inside the
-    // ink — a spike that would touch a glyph or lean into a counter is dropped there, not here.
+    // The sigil look's linework (sigil only): thorns grown on the block's outer contour and the
+    // marks that flank the word, both baked geometry and never inside the ink — a spike that would
+    // touch a glyph, lean into a counter or spear the next word is dropped at bake time, not here.
     // `local` is the block's own space (one unit per block height, x by the aspect), which is the
-    // space the thorn array is written in; it slides with the same glitch the sheet takes.
-    var thorn_distance = 1.0e9;
-    var thorn_across = vec2<f32>(0.0, 1.0);
-    var thorn_radius = 1.0;
+    // space the stroke arrays are written in; it slides with the same glitch the sheet takes.
+    var line_distance = 1.0e9;
+    var line_across = vec2<f32>(0.0, 1.0);
+    var line_radius = 1.0;
     let local = vec2<f32>(
         block_uv.x * block_aspect + slice_shift * slice_on * block_aspect,
         block_uv.y,
@@ -263,34 +289,54 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
             if (index >= u32(U.thorn_count)) {
                 break;
             }
-            let thorn = U.thorns[index];
-            let first = thorn_segment(
-                local, thorn.base, thorn.bend, thorn.width, thorn.width * BEND_WIDTH,
-            );
-            if (first.x < thorn_distance) {
-                thorn_distance = first.x;
-                thorn_across = first.yz;
-                thorn_radius = first.w;
-            }
-            let second = thorn_segment(
-                local, thorn.bend, thorn.tip, thorn.width * BEND_WIDTH, thorn.width * TIP_WIDTH,
-            );
-            if (second.x < thorn_distance) {
-                thorn_distance = second.x;
-                thorn_across = second.yz;
-                thorn_radius = second.w;
-            }
+            let stroke = U.thorns[index];
             index = index + 1u;
+            if (out_of_reach(local, stroke)) {
+                continue;
+            }
+            let hit = stroke_sdf(local, stroke);
+            if (hit.x < line_distance) {
+                line_distance = hit.x;
+                line_across = hit.yz;
+                line_radius = hit.w;
+            }
+        }
+        // A mark is authored once, on the right of the block, and drawn again mirrored for the
+        // left: the mirror of a block-space x is the block's width in its own units minus x. Both
+        // copies sit outside the block's box, so there is nothing to evaluate over the letters.
+        if (local.x < 0.0 || local.x > block_aspect) {
+            let probe = select(
+                vec2<f32>(block_aspect - local.x, local.y),
+                local,
+                local.x > block_aspect,
+            );
+            var mark = 0u;
+            loop {
+                if (mark >= u32(U.marks.x)) {
+                    break;
+                }
+                let stroke = U.symbols[mark];
+                mark = mark + 1u;
+                if (out_of_reach(probe, stroke)) {
+                    continue;
+                }
+                let hit = stroke_sdf(probe, stroke);
+                if (hit.x < line_distance) {
+                    line_distance = hit.x;
+                    line_across = hit.yz;
+                    line_radius = hit.w;
+                }
+            }
         }
     }
 
     let sample = texel(sheet_uv);
     // Past the field's range every term below is zero: the glow fades out well before it, and the
     // body and ring are both measured from the distance. Most of the block is that empty space
-    // between letters, so this one tap is what the pass costs there. A thorn's ink is the one
+    // between letters, so this one tap is what the pass costs there. The linework's ink is the one
     // thing out there that still draws, so it is measured in screen pixels first.
-    let thorn_sdf = thorn_distance * block_h;
-    if (sample.a <= 0.0 && thorn_sdf >= 0.0) {
+    let line_sdf = line_distance * block_h;
+    if (sample.a <= 0.0 && line_sdf >= 0.0) {
         return vec4<f32>(0.0);
     }
     let distance_baked = (0.5 - sample.a) * (2.0 * SDF_RANGE);
@@ -320,22 +366,22 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         bold = 0.012 * block_h;
     }
 
-    // A thorn is part of the silhouette — the glow wraps it like the letters — so its distance
+    // The linework is part of the silhouette — the glow wraps it like the letters — so its distance
     // joins the glyph's. The stroke dilation is the letters' (`bold` gives a hairline face its
-    // display weight); a thorn carries its own taper, so the dilation is added back to its
-    // distance and the spike keeps the point the bake drew instead of swelling into a rod.
+    // display weight); a stroke carries its own taper, so the dilation is added back to its
+    // distance and the spike keeps the needle point the bake drew instead of swelling into a rod.
     // Nothing is ever added *inside* the ink: `min` only moves the edge outward, and the geometry
     // is outside the ink to begin with.
-    let shape = select(d0, min(d0, thorn_sdf + bold), thorny);
-    // Across a thorn the surface turns like a thin metal rod, not like a letter's bevel: the
-    // thorn's own width is its depth. Only the nearer edge owns the surface, and only outside the
-    // body's edge (`d0 - bold`): inside a letter the thorn's base would otherwise shade a dark
+    let shape = select(d0, min(d0, line_sdf + bold), thorny);
+    // Across a stroke the surface turns like a thin metal rod, not like a letter's bevel: the
+    // stroke's own width is its depth. Only the nearer edge owns the surface, and only outside the
+    // body's edge (`d0 - bold`): inside a letter the stroke's root would otherwise shade a dark
     // notch in the face, which is the same defect as a barb drawn across it.
     var surface = facing;
     var into = depth;
-    if (thorny && thorn_sdf < d0 - bold && d0 - bold > 0.0) {
-        surface = thorn_across;
-        into = clamp(-thorn_sdf / max(thorn_radius * block_h * 0.75, 1.0), 0.0, 1.0);
+    if (thorny && line_sdf < d0 - bold && d0 - bold > 0.0) {
+        surface = line_across;
+        into = clamp(-line_sdf / max(line_radius * block_h * 0.75, 1.0), 0.0, 1.0);
     }
 
     // The antialiasing width in distance units: the field is in screen pixels and its gradient

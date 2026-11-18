@@ -43,7 +43,7 @@
 //! letter's face.
 
 use super::layout::{BAKE_PX, Face, MAX_LINES, PAD};
-use super::thorn::{self, Thorn};
+use super::thorn::{self, Stroke};
 
 /// Margin around the block's ink box, in sheet pixels: [`PAD`] plus two pixels of slack so a
 /// bilinear sample at the block's edge never reads the texture's clamp.
@@ -76,9 +76,20 @@ pub struct Sheet {
     /// BGRA8, `width * height * 4` bytes.
     #[cfg_attr(not(test), allow(dead_code))]
     pub pixels: Vec<u8>,
-    /// The sigil look's spikes, in block pixels (`text/thorn.rs`); empty for the other looks.
+    /// The sigil look's thorns, in block pixels (`text/thorn.rs`); empty for the other looks.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub thorns: Vec<Thorn>,
+    pub thorns: Vec<Stroke>,
+    /// The sigil look's flanking marks, also in block pixels and outside the block's box; empty for
+    /// the other looks.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub symbols: Vec<Stroke>,
+    /// How many visual lines the block has; a thorn's length is a fraction of one line's height.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub lines: usize,
+    /// The block's words as x ranges and the line each sits on, from the layout: a thorn may not
+    /// leave its own word's columns while it is over the block (`text/thorn.rs`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub words: Vec<(i32, i32, usize)>,
 }
 
 impl Sheet {
@@ -102,6 +113,9 @@ impl Sheet {
             margin: MARGIN,
             pixels,
             thorns: baked.thorns,
+            symbols: baked.symbols,
+            lines: baked.lines,
+            words: baked.words,
         })
     }
 
@@ -120,6 +134,9 @@ impl Sheet {
             margin: MARGIN,
             pixels,
             thorns: baked.thorns,
+            symbols: baked.symbols,
+            lines: baked.lines,
+            words: baked.words,
         })
     }
 
@@ -144,8 +161,14 @@ pub struct Baked {
     pub dropped: usize,
     /// Rows of the texture this bake touched (the block plus its margin).
     pub mask_h: u32,
-    /// The sigil look's spikes, in block pixels; empty for the other looks.
-    pub thorns: Vec<Thorn>,
+    /// The sigil look's thorns, in block pixels; empty for the other looks.
+    pub thorns: Vec<Stroke>,
+    /// The sigil look's flanking marks; empty for the other looks.
+    pub symbols: Vec<Stroke>,
+    /// How many visual lines the block has.
+    pub lines: usize,
+    /// The block's words as x ranges and their line, from the layout.
+    pub words: Vec<(i32, i32, usize)>,
 }
 
 /// Composes `text` into `pixels` at `width` x `height`, clearing it first.
@@ -237,25 +260,35 @@ fn compose_into(
             }
         }
 
+    let block = (
+        layout.block_w.max(1) as u32,
+        layout.block_h.max(1) as u32,
+    );
+    let thorny = face.thorns();
     Some(Baked {
-        block_w: layout.block_w.max(1) as u32,
-        block_h: layout.block_h.max(1) as u32,
+        block_w: block.0,
+        block_h: block.1,
         dropped: layout.dropped,
         mask_h,
-        thorns: if face.thorns() {
+        thorns: if thorny {
             thorn::grow(
                 pixels,
                 width,
                 (MARGIN, MARGIN),
-                (
-                    layout.block_w.max(1) as u32,
-                    layout.block_h.max(1) as u32,
-                ),
+                block,
                 layout.lines.len(),
+                &layout.words,
             )
         } else {
             Vec::new()
         },
+        symbols: if thorny {
+            thorn::symbols(text, block, layout.lines.len())
+        } else {
+            Vec::new()
+        },
+        lines: layout.lines.len(),
+        words: layout.words.clone(),
     })
 }
 

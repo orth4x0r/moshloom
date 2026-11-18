@@ -1,95 +1,103 @@
-//! Thorns: the sigil look's spikes, grown from the block's own contour at bake time.
+//! Thorns and sigil marks: the sigil look's linework, grown from the block at bake time.
 //!
-//! # What a thorn is
+//! # What the linework is
 //!
-//! Cybersigilism is thin tribal linework, not a fringe: a few long, tapered, curved spikes that
-//! leave the silhouette where it turns hardest — a stroke's end, a corner, a point — and sweep
-//! outward. So a thorn here is *geometry*, found from the baked block and handed to the shader as
-//! a curve ([`Thorn`], two tapered capsules through `bend`), and the shader draws it in its own
-//! silver. The previous look grew its barbs as a diagonal lattice in distance space: a mark in
-//! every cell, all of them parallel, which read as scratches laid across the letters and painted
-//! the counters of `A`, `N` and `o`.
+//! Cybersigilism is thin tribal linework: long, whip-like spikes that leave the silhouette where it
+//! turns hardest — a stroke's end, a corner, a point — and sweep outward, plus abstract thorny
+//! marks that flank the word. Both are *geometry*, found or drawn at bake time and handed to the
+//! shader as tapered capsules, so they stay sharp at any size and can never be baked into a
+//! letter's face.
+//!
+//! A [`Stroke`] is two tapered capsules `a -> b -> c`, wide at `a` and a needle point at `c`. A
+//! thorn is one or two strokes (two make an S-curve, and a long thorn may carry a secondary barb);
+//! a symbol is five strokes on one side of the block, which the shader draws again mirrored about
+//! the block's centre, so the pair is symmetric.
 //!
 //! # Where a thorn may grow
 //!
 //! Only on an **outer** contour (a pixel the block's border can reach through empty space, so a
-//! counter — the hole in `A` — is never an anchor), and only so the spike itself stays in that
-//! empty space: every pixel a candidate thorn covers is checked against the block's ink, and a
-//! candidate that would touch ink or lean into a counter is dropped before it is kept. That is the
-//! property `thorn::tests` pins: thorn ink exists beyond the ink's dilation, and no thorn ink lies
-//! inside the ink or a counter.
+//! counter — the hole in `A` — is never an anchor), only so the spike itself stays in that empty
+//! space, and only over its own word: a spike that would reach into another word's column box
+//! would spear the next word across a space, which reads as a scratch, not a thorn. Every pixel a
+//! candidate covers is checked against the block's ink and against the other words' boxes, and a
+//! candidate that fails either is dropped before it is kept. `thorn::tests` pins both, plus that
+//! no linework lands inside a glyph's interior.
 //!
-//! Sparse by construction: anchors are taken in order of how sharply the contour turns, no two
-//! closer than a quarter of a line's height, at most [`MAX_THORNS`] per block, each with its own
-//! length, sweep and bend from a hash of its anchor, and none that would cross another. Nothing is
-//! mirror-symmetric.
+//! Sparse and asymmetric by construction: anchors are taken in order of how sharply the contour
+//! turns, no two closer than a fifth of a line's height, at most [`MAX_THORNS`] strokes per block,
+//! each with its own length, sweep and bend from a hash of its anchor, and none that would cross
+//! another. The marks come from a hash of the text, so the same words always draw the same sigil.
 
 use std::collections::VecDeque;
 
 use super::layout::SDF_RANGE;
 
-/// The most thorns one block carries. A long text already has many corners; the cap keeps the
-/// look sparse and the shader's uniform block bounded.
-pub const MAX_THORNS: usize = 10;
+/// The most thorn strokes one block carries. A thorn is one stroke, an S-curve or a long thorn
+/// with a barb is two or three, so this is roughly a dozen thorns on a ten-letter word: sparse,
+/// and the uniform block stays small (twenty strokes of 32 bytes).
+pub const MAX_THORNS: usize = 20;
 
-/// How far, in baked pixels, the far end of a thorn must reach beyond the ink's edge for the
+/// The most symbol strokes one mark carries. Each is drawn twice (mirrored), so the pair is
+/// symmetric without storing the reflection.
+pub const MAX_SYMBOLS: usize = 8;
+
+/// How far, in baked pixels, the far end of a stroke must reach beyond the ink's edge for the
 /// anchor to be worth a thorn. Shorter than this and the mark reads as a fringe, not a spike.
 pub const REACH_PX: f32 = 4.0;
 
-/// The second capsule's fraction of the base half-width at the bend, and at the tip. The thorn is
-/// a point by the end, so it tapers from a stroke to nothing instead of ending in a cut. These two
-/// numbers exist in `text/text.wgsl` as well (the GPU draws the same capsules);
-/// `text.rs`'s `the_thorn_geometry_constants_match_the_shader` compares them.
-pub(crate) const BEND_WIDTH: f32 = 0.55;
-pub(crate) const TIP_WIDTH: f32 = 0.01;
+/// The second capsule's fraction of the base half-width at the bend, and at the tip. A thorn ends
+/// in a needle point, so the tip is zero and the whip keeps most of its thickness until the bend.
+pub(crate) const BEND_WIDTH: f32 = 0.7;
+pub(crate) const TIP_WIDTH: f32 = 0.0;
 
-/// One thorn: a curved, tapered spike that grows outward from the contour, in block pixels
-/// (origin at the block's top-left, y down — the same space `Layout` places glyphs in, and the
-/// space `text.wgsl` maps `block_uv` into).
+/// One stroke of the sigil look's linework, in block pixels (origin at the block's top-left, y
+/// down — the same space `Layout` places glyphs in, and the space `text.wgsl` maps `block_uv`
+/// into): two tapered capsules from `a` through `b` to `c`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Thorn {
-    pub base: [f32; 2],
-    pub bend: [f32; 2],
-    pub tip: [f32; 2],
-    /// Half-width where the thorn leaves the ink, in block pixels.
+pub struct Stroke {
+    pub a: [f32; 2],
+    pub b: [f32; 2],
+    pub c: [f32; 2],
+    /// Half-width at `a`, in block pixels. The stroke tapers to a point at `c`.
     pub width: f32,
+    /// True for a symbol stroke: the shader draws it a second time, mirrored about the block's
+    /// vertical centre, which is what makes the pair of marks symmetric.
+    pub mirrored: bool,
 }
 
-impl Thorn {
-    /// The signed distance from `p` to the thorn's body, in block pixels: negative inside the
-    /// thorn. The union of its two tapered capsules, which is what `text.wgsl` evaluates too (the
-    /// tests use this one to rasterise the same body).
+impl Stroke {
+    /// The signed distance from `p` to the stroke's body, in block pixels: negative inside. The
+    /// union of its two tapered capsules, which is what `text.wgsl` evaluates too (the tests use
+    /// this one to rasterise the same body).
     pub fn signed(&self, p: [f32; 2]) -> f32 {
-        let first = capsule(p, self.base, self.bend, self.width, self.width * BEND_WIDTH);
+        let first = capsule(p, self.a, self.b, self.width, self.width * BEND_WIDTH);
         let second = capsule(
             p,
-            self.bend,
-            self.tip,
+            self.b,
+            self.c,
             self.width * BEND_WIDTH,
             self.width * TIP_WIDTH,
         );
         first.min(second)
     }
 
-    /// True when `p` is in the thorn's body, away from the root where it joins the ink: the root
-    /// is buried in the silhouette by design (a thorn grows out of the letter, it does not float),
-    /// so it is not part of what has to stay clear. Everything the spike adds past the root must be
-    /// outside the ink.
+    /// True when `p` is in the stroke's body, away from the root where it joins what it grows
+    /// from: the root is buried in the silhouette by design (a thorn grows out of the letter, a
+    /// symbol stroke out of the mark's spine), so it is not part of what has to stay clear.
     pub fn covers_clear(&self, p: [f32; 2]) -> bool {
-        let dx = p[0] - self.base[0];
-        let dy = p[1] - self.base[1];
+        let dx = p[0] - self.a[0];
+        let dy = p[1] - self.a[1];
         let root = self.width + 1.5;
         dx * dx + dy * dy > root * root && self.signed(p) <= 0.0
     }
 
-    /// The length of the thorn's centreline, in block pixels.
+    /// The length of the stroke's centreline, in block pixels.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn length(&self) -> f32 {
-        distance(self.base, self.bend) + distance(self.bend, self.tip)
+        distance(self.a, self.b) + distance(self.b, self.c)
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
     ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt()
 }
@@ -108,8 +116,18 @@ fn capsule(p: [f32; 2], a: [f32; 2], b: [f32; 2], ra: f32, rb: f32) -> f32 {
     (d[0] * d[0] + d[1] * d[1]).sqrt() - (ra + (rb - ra) * t)
 }
 
+/// A hash of the words, so the marks are a function of the text and nothing else.
+pub fn text_seed(text: &str) -> u32 {
+    let mut hash = 2_166_136_261u32;
+    for byte in text.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash
+}
+
 /// The block's ink, read from the sheet's baked distance field, plus the empty space the block's
-/// border can reach. Thorns grow in that empty space only.
+/// border can reach and the columns its words occupy. Thorns grow in that empty space only.
 struct Block<'a> {
     /// The sheet's BGRA field.
     field: &'a [u8],
@@ -225,32 +243,60 @@ impl<'a> Block<'a> {
         Some([-gx / length, -gy / length])
     }
 
-    /// True when every pixel the thorn covers sits in the block's outside space.
-    fn is_clear(&self, thorn: &Thorn) -> bool {
-        let (min_x, max_x, min_y, max_y) = thorn_bounds(thorn, self.size);
+    /// The word (x range and line) a spike at `x` grows from, or a box that contains nothing when
+    /// the anchor is outside every word.
+    fn own_word(&self, words: &[(i32, i32, usize)], x: f32) -> (u32, u32, usize) {
+        words
+            .iter()
+            .copied()
+            .find(|word| x >= word.0 as f32 && x <= word.1 as f32 + 1.0)
+            .map(|word| (word.0.max(0) as u32, word.1.max(0) as u32, word.2))
+            .unwrap_or((self.size.0, 0, usize::MAX))
+    }
+
+    /// True when every pixel the stroke covers sits in the block's outside space and stays over
+    /// `own` word. Inside the block's columns a stroke may only cover its own word's columns — no
+    /// gap and no other word — so a spike can lean out of the text but never across a space; outside
+    /// the block it may point anywhere (that is where spikes leave the word).
+    fn is_clear(
+        &self,
+        stroke: &Stroke,
+        own: (u32, u32, usize),
+        words: &[(i32, i32, usize)],
+    ) -> bool {
+        let _ = words;
+        let (min_x, max_x, min_y, max_y) = stroke_bounds(stroke, self.size);
         for y in min_y..=max_y {
             for x in min_x..=max_x {
                 let p = [x as f32 + 0.5, y as f32 + 0.5];
-                if !thorn.covers_clear(p) {
+                if !stroke.covers_clear(p) {
                     continue;
                 }
                 if !self.is_outside(x as i32, y as i32) {
                     return false;
                 }
+                if own.0 > own.1 {
+                    // The anchor is in no word (a block with no ink boxes): nothing to check.
+                    continue;
+                }
+                if x >= own.0 && x <= own.1 {
+                    continue;
+                }
+                return false;
             }
         }
         true
     }
 
-    /// The farthest distance a thorn's clear body reaches beyond the ink, in baked pixels: the
-    /// number that says a thorn is a spike and not a fringe.
-    fn reach(&self, thorn: &Thorn) -> f32 {
-        let (min_x, max_x, min_y, max_y) = thorn_bounds(thorn, self.size);
+    /// The farthest distance a stroke's clear body reaches beyond the ink, in baked pixels: the
+    /// number that says a spike is a spike and not a fringe.
+    fn reach(&self, stroke: &Stroke) -> f32 {
+        let (min_x, max_x, min_y, max_y) = stroke_bounds(stroke, self.size);
         let mut reach = f32::NEG_INFINITY;
         for y in min_y..=max_y {
             for x in min_x..=max_x {
                 let p = [x as f32 + 0.5, y as f32 + 0.5];
-                if thorn.covers_clear(p) {
+                if stroke.covers_clear(p) {
                     reach = reach.max(self.distance(p[0], p[1]));
                 }
             }
@@ -266,10 +312,10 @@ fn index(width: u32, origin: (u32, u32), size: (u32, u32), x: u32, y: u32) -> us
     ((sheet_y * width + sheet_x) * 4 + 3) as usize
 }
 
-/// The box a thorn can cover, in block pixels, as inclusive integer bounds.
-fn thorn_bounds(thorn: &Thorn, size: (u32, u32)) -> (u32, u32, u32, u32) {
-    let points = [thorn.base, thorn.bend, thorn.tip];
-    let reach = thorn.width + 1.5;
+/// The box a stroke can cover, in block pixels, as inclusive integer bounds.
+fn stroke_bounds(stroke: &Stroke, size: (u32, u32)) -> (u32, u32, u32, u32) {
+    let points = [stroke.a, stroke.b, stroke.c];
+    let reach = stroke.width + 1.5;
     let mut min_x = f32::MAX;
     let mut min_y = f32::MAX;
     let mut max_x = f32::MIN;
@@ -290,18 +336,20 @@ fn thorn_bounds(thorn: &Thorn, size: (u32, u32)) -> (u32, u32, u32, u32) {
 
 /// Grows the thorns for a baked block: `field` is the sheet's BGRA distance field, `width` its
 /// width, `origin` the block's top-left in it, `size` the block's size in pixels and `lines` how
-/// many visual lines the block has. At most [`MAX_THORNS`], and none at all for a block with no
-/// contour (empty or whitespace-only text).
+/// many visual lines the block has. At most [`MAX_THORNS`] strokes, and none at all for a block
+/// with no contour (empty or whitespace-only text).
 ///
 /// A thorn's length is a fraction of one *line's* height, not of the whole block, so a two-line
-/// phrase grows the same spikes as a single word on one line.
+/// phrase grows the same spikes as a single word on one line. The longest reach about 0.6 of the
+/// line's height out from the silhouette.
 pub fn grow(
     field: &[u8],
     width: u32,
     origin: (u32, u32),
     size: (u32, u32),
     lines: usize,
-) -> Vec<Thorn> {
+    words: &[(i32, i32, usize)],
+) -> Vec<Stroke> {
     if size.0 < 3 || size.1 < 3 || field.len() < (width * (origin.1 + size.1) * 4) as usize {
         return Vec::new();
     }
@@ -370,37 +418,194 @@ pub fn grow(
             .then_with(|| (a.y, a.x).cmp(&(b.y, b.x)))
     });
 
-    let spacing = (0.24 * line_h).clamp(7.0, 30.0);
-    let mut chosen: Vec<[f32; 2]> = Vec::new();
-    let mut thorns: Vec<Thorn> = Vec::new();
+    let spacing = (0.20 * line_h).clamp(7.0, 26.0);
+    let mut anchors: Vec<[f32; 2]> = Vec::new();
+    let mut kept: Vec<Stroke> = Vec::new();
     for candidate in candidates {
-        if thorns.len() == MAX_THORNS {
+        if kept.len() >= MAX_THORNS {
             break;
         }
         let at = [candidate.x as f32, candidate.y as f32];
-        if chosen
+        if anchors
             .iter()
             .any(|other| (other[0] - at[0]).hypot(other[1] - at[1]) < spacing)
         {
             continue;
         }
-        let thorn = spawn(candidate.normal, at, line_h);
-        // Two spikes crossing each other read as a scratch, so a crossing is not kept.
-        if !block.is_clear(&thorn)
-            || block.reach(&thorn) < REACH_PX
-            || thorns.iter().any(|kept| crosses(kept, &thorn))
+        let own = block.own_word(words, at[0]);
+        let strokes = spawn(candidate.normal, at, line_h);
+        if kept.len() + strokes.len() > MAX_THORNS {
+            continue;
+        }
+        if !strokes.iter().all(|stroke| {
+            block.is_clear(stroke, own, words) && block.reach(stroke) >= REACH_PX
+        }) {
+            continue;
+        }
+        // Two spikes crossing each other read as a scratch, so a crossing is not kept. A thorn's
+        // own strokes share an end point on purpose, so they are not compared with each other.
+        if kept
+            .iter()
+            .any(|held| strokes.iter().any(|stroke| crosses(held, stroke)))
         {
             continue;
         }
-        chosen.push(at);
-        thorns.push(thorn);
+        anchors.push(at);
+        kept.extend(strokes);
     }
-    thorns
+    kept
 }
 
-/// True when two thorns' bodies would touch or cross.
-fn crosses(a: &Thorn, b: &Thorn) -> bool {
-    let joins = |thorn: &Thorn| [(thorn.base, thorn.bend), (thorn.bend, thorn.tip)];
+/// One anchor's thorns: a whip that grows outward, sometimes S-curved through a second stroke or
+/// carrying a short barb, each with its own length, sweep and bend from the anchor's hash, so no
+/// two are the same and nothing is mirrored.
+fn spawn(normal: [f32; 2], at: [f32; 2], line_h: f32) -> Vec<Stroke> {
+    let seed = (at[0] as u32).wrapping_mul(73_856_093) ^ (at[1] as u32).wrapping_mul(19_349_663);
+    let length = line_h * (0.24 + 0.36 * hash(seed, 1));
+    let sweep = (hash(seed, 2) - 0.5) * 1.4;
+    let bend_side = (hash(seed, 3) - 0.5) * 0.9 * length;
+    let width = (0.030 * line_h).clamp(1.1, 2.4);
+    let (sin, cos) = sweep.sin_cos();
+    let direction = [
+        normal[0] * cos - normal[1] * sin,
+        normal[0] * sin + normal[1] * cos,
+    ];
+    let across = [-direction[1], direction[0]];
+    let base = [at[0] + normal[0] * 0.6, at[1] + normal[1] * 0.6];
+    let along = |t: f32, side: f32| {
+        [
+            base[0] + direction[0] * length * t + across[0] * side,
+            base[1] + direction[1] * length * t + across[1] * side,
+        ]
+    };
+    let mut strokes = Vec::with_capacity(3);
+    if hash(seed, 4) < 0.35 && length > 0.35 * line_h {
+        // An S: two strokes round a shared elbow, bending the other way, so the whip snakes.
+        let flip = if hash(seed, 5) < 0.5 { -1.0 } else { 1.0 };
+        let elbow = along(0.45, bend_side);
+        let mut strokes_at = |points: [[f32; 2]; 3], width: f32| {
+            strokes.push(Stroke {
+                a: points[0],
+                b: points[1],
+                c: points[2],
+                width,
+                mirrored: false,
+            });
+        };
+        strokes_at([base, along(0.22, bend_side * 0.5), elbow], width);
+        strokes_at(
+            [
+                elbow,
+                along(0.72, flip * bend_side * 0.9),
+                along(1.0, flip * bend_side * 0.3),
+            ],
+            width * 0.8,
+        );
+    } else {
+        strokes.push(Stroke {
+            a: base,
+            b: along(0.38, bend_side),
+            c: along(1.0, bend_side * 0.4),
+            width,
+            mirrored: false,
+        });
+        // A long whip may carry one short barb, branching off its belly.
+        if length > 0.45 * line_h && hash(seed, 6) < 0.4 {
+            let root = along(0.55, bend_side * 0.7);
+            let branch = [
+                direction[0] * 0.55 + across[0] * flip_side(seed) * 0.83,
+                direction[1] * 0.55 + across[1] * flip_side(seed) * 0.83,
+            ];
+            let reach = length * 0.34;
+            strokes.push(Stroke {
+                a: root,
+                b: [
+                    root[0] + branch[0] * reach * 0.55,
+                    root[1] + branch[1] * reach * 0.55,
+                ],
+                c: [
+                    root[0] + branch[0] * reach,
+                    root[1] + branch[1] * reach,
+                ],
+                width: width * 0.7,
+                mirrored: false,
+            });
+        }
+    }
+    strokes
+}
+
+/// -1 or +1, from the seed, for a barb that may leave either side of a thorn.
+fn flip_side(seed: u32) -> f32 {
+    if hash(seed, 7) < 0.5 {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
+/// The sigil marks that flank the word: five strokes in a box just outside the block on the right
+/// (the shader mirrors them for the left), so the pair is symmetric, abstract — a bramble: one
+/// spine in two halves that bends twice, with three barbs on one side, an open line, never a closed
+/// figure, no letterforms and nothing from an alphabet. The same words always draw the same marks
+/// (`text_seed`), and they sit outside the ink's box, so they can never cover a glyph.
+pub fn symbols(text: &str, size: (u32, u32), lines: usize) -> Vec<Stroke> {
+    let line_h = size.1 as f32 / lines.max(1) as f32;
+    if size.0 < 3 || size.1 < 3 || line_h < 8.0 {
+        return Vec::new();
+    }
+    let seed = text_seed(text);
+    // Small enough to stay inside the layer: the block is fitted to most of the frame's width, so
+    // there are only a few tenths of a line height to the side.
+    let mark_w = 0.20 * line_h;
+    let mark_h = 0.72 * line_h;
+    let gap = 0.06 * line_h;
+    let left = size.0 as f32 + gap;
+    let top = size.1 as f32 * 0.5 - mark_h * 0.5;
+    // (u, v) in the mark's own box, v down, to block pixels.
+    let at = |u: f32, v: f32| [left + u * mark_w, top + v * mark_h];
+    let jitter = |salt: u32, amount: f32| (hash(seed.wrapping_add(17 * salt), salt) - 0.5) * amount;
+    let width = (0.014 * line_h).clamp(0.7, 1.4);
+    let bend = jitter(1, 0.14);
+
+    // A bramble: a spine that bends twice, three barbs out to one side, all open (a barb never
+    // closes back onto the spine, which is what would make a star or any other figure).
+    let spine = [at(0.40 + bend, 0.00), at(0.56 + bend, 0.34), at(0.40 + bend, 0.60)];
+    let tail = [at(0.40 + bend, 0.60), at(0.24 + bend, 0.84), at(0.40 + bend, 1.00)];
+    let barb_high = [
+        at(0.56 + bend, 0.34),
+        at(0.84, 0.22 + jitter(2, 0.10)),
+        at(1.00, 0.30 + jitter(3, 0.08)),
+    ];
+    let barb_mid = [
+        at(0.40 + bend, 0.60),
+        at(0.82, 0.56 + jitter(4, 0.10)),
+        at(0.96, 0.68 + jitter(5, 0.08)),
+    ];
+    let barb_low = [
+        at(0.24 + bend, 0.84),
+        at(0.62, 0.90 + jitter(6, 0.08)),
+        at(0.74, 1.00),
+    ];
+    let strokes = [spine, tail, barb_high, barb_mid, barb_low];
+    strokes
+        .iter()
+        .take(MAX_SYMBOLS)
+        .enumerate()
+        .map(|(index, points)| Stroke {
+            a: points[0],
+            b: points[1],
+            c: points[2],
+            // The spine leads; the barbs are lighter, so the mark reads as one line with thorns.
+            width: if index < 2 { width } else { width * 0.75 },
+            mirrored: true,
+        })
+        .collect()
+}
+
+/// True when two strokes' bodies would touch or cross.
+fn crosses(a: &Stroke, b: &Stroke) -> bool {
+    let joins = |stroke: &Stroke| [(stroke.a, stroke.b), (stroke.b, stroke.c)];
     let mut closest = f32::INFINITY;
     for (a0, a1) in joins(a) {
         for (b0, b1) in joins(b) {
@@ -438,37 +643,6 @@ fn point_gap(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
     (ap[0] - ab[0] * t).hypot(ap[1] - ab[1] * t)
 }
 
-/// One thorn from an anchor: a length, a sweep away from the normal and a bend, each from the
-/// anchor's own hash, so no two are the same and nothing is mirrored.
-fn spawn(normal: [f32; 2], at: [f32; 2], line_h: f32) -> Thorn {
-    let seed = (at[0] as u32).wrapping_mul(73_856_093) ^ (at[1] as u32).wrapping_mul(19_349_663);
-    let length = line_h * (0.18 + 0.08 * hash(seed, 1));
-    let sweep = (hash(seed, 2) - 0.5) * 0.8;
-    let bend_side = (hash(seed, 3) - 0.5) * 0.28 * length;
-    let width = (0.042 * line_h).clamp(1.8, 4.0);
-    let (sin, cos) = sweep.sin_cos();
-    let direction = [
-        normal[0] * cos - normal[1] * sin,
-        normal[0] * sin + normal[1] * cos,
-    ];
-    let across = [-direction[1], direction[0]];
-    let base = [at[0] + normal[0] * 0.6, at[1] + normal[1] * 0.6];
-    let tip = [
-        base[0] + direction[0] * length,
-        base[1] + direction[1] * length,
-    ];
-    let bend = [
-        base[0] + direction[0] * length * 0.35 + across[0] * bend_side,
-        base[1] + direction[1] * length * 0.35 + across[1] * bend_side,
-    ];
-    Thorn {
-        base,
-        bend,
-        tip,
-        width,
-    }
-}
-
 /// A deterministic hash of a seed and a salt, in `0..1`.
 fn hash(seed: u32, salt: u32) -> f32 {
     let mut value = seed ^ salt.wrapping_mul(0x9e37_79b9);
@@ -490,11 +664,12 @@ mod tests {
             .expect("Grenze Gotisch")
     }
 
-    /// A block's thorns and its reachable empty space, from a sheet the same way `grow` reads it.
+    /// A block's linework and its surroundings, read from a sheet the same way `grow` reads it.
     struct Probe {
         sheet: Sheet,
         outside: Vec<bool>,
         size: (u32, u32),
+        line_h: f32,
     }
 
     impl Probe {
@@ -508,16 +683,22 @@ mod tests {
                 size,
             );
             let outside = block.outside.clone();
+            let line_h = sheet.block_h as f32 / sheet.lines.max(1) as f32;
             Probe {
                 sheet,
                 outside,
                 size,
+                line_h,
             }
         }
 
-        /// The thorns the bake grew for this block: the same list the layer uploads.
-        fn thorns(&self) -> &[Thorn] {
+        /// The thorns the bake grew: the same list the layer uploads.
+        fn thorns(&self) -> &[Stroke] {
             &self.sheet.thorns
+        }
+
+        fn symbols(&self) -> &[Stroke] {
+            &self.sheet.symbols
         }
 
         fn is_outside(&self, x: u32, y: u32) -> bool {
@@ -530,19 +711,18 @@ mod tests {
             (0.5 - f32::from(self.sheet.pixels[at as usize]) / 255.0) * (2.0 * SDF_RANGE)
         }
 
-        /// The farthest the thorn's own centreline gets from the ink, in baked pixels: the spike's
+        /// The farthest the stroke's own centreline gets from the ink, in baked pixels: the spike's
         /// reach, measured on the curve rather than on its (sub-pixel at the tip) raster.
-        fn reach(&self, thorn: &Thorn) -> f32 {
+        fn reach(&self, stroke: &Stroke) -> f32 {
             let mut reach = f32::NEG_INFINITY;
             for step in 0..=24u32 {
-                let t = 0.15 + 0.85 * (step as f32 / 24.0);
-                let p = if t < 0.42 {
-                    lerp(thorn.base, thorn.bend, t / 0.42)
+                let t = step as f32 / 24.0;
+                let p = if t < 0.5 {
+                    lerp(stroke.a, stroke.b, t * 2.0)
                 } else {
-                    lerp(thorn.bend, thorn.tip, (t - 0.42) / 0.58)
+                    lerp(stroke.b, stroke.c, (t - 0.5) * 2.0)
                 };
                 if p[0] < 0.0 || p[1] < 0.0 {
-                    // Past the block's box there is no ink anywhere: the field's whole range.
                     reach = reach.max(SDF_RANGE);
                     continue;
                 }
@@ -555,6 +735,11 @@ mod tests {
             }
             reach
         }
+
+        /// The block's words, from the layout that baked it: a thorn may not leave its own word.
+        fn words(&self) -> &[(i32, i32, usize)] {
+            &self.sheet.words
+        }
     }
 
     fn lerp(a: [f32; 2], b: [f32; 2], t: f32) -> [f32; 2] {
@@ -562,19 +747,24 @@ mod tests {
     }
 
     #[test]
-    fn a_block_grows_few_long_thorns_on_its_outer_contour() {
+    fn a_block_grows_long_thin_thorns_on_its_outer_contour() {
         for text in ["ILANA", "SIGIL", "THE LOOM\nIS US"] {
             let probe = Probe::new(text);
             let thorns = probe.thorns();
+            let lengths: Vec<f32> = thorns.iter().map(Stroke::length).collect();
+            let longest = lengths.iter().copied().fold(0.0f32, f32::max);
+            let shortest = lengths.iter().copied().fold(f32::INFINITY, f32::min);
             println!(
-                "{text:?}: {}x{} block, {} thorns, lengths {:?}",
+                "{text:?}: {}x{} block, {} strokes, lengths {:.1}..{:.1}px (line {:.1}px), \
+                 widths {:.2}..{:.2}",
                 probe.size.0,
                 probe.size.1,
                 thorns.len(),
-                thorns
-                    .iter()
-                    .map(|thorn| (thorn.length() * 10.0).round() / 10.0)
-                    .collect::<Vec<_>>()
+                shortest,
+                longest,
+                probe.line_h,
+                thorns.iter().map(|s| s.width).fold(f32::INFINITY, f32::min),
+                thorns.iter().map(|s| s.width).fold(0.0f32, f32::max),
             );
             assert!(
                 !thorns.is_empty(),
@@ -582,50 +772,62 @@ mod tests {
             );
             assert!(
                 thorns.len() <= MAX_THORNS,
-                "{text:?} grew {} thorns, over the cap",
+                "{text:?} grew {} strokes, over the cap",
                 thorns.len()
             );
-            for thorn in thorns {
-                // A thorn is a spike, not a blob: several times longer than it is thick.
+            // Whip-like: the longest reach about half a line or more, and every stroke is many
+            // times longer than it is thick.
+            assert!(
+                longest >= 0.45 * probe.line_h,
+                "{text:?}: the longest thorn is {longest:.1}px on a {:.1}px line, not long enough",
+                probe.line_h
+            );
+            assert!(
+                shortest >= 0.15 * probe.line_h,
+                "{text:?}: a thorn is {shortest:.1}px on a {:.1}px line, shorter than a fringe",
+                probe.line_h
+            );
+            for stroke in thorns {
                 assert!(
-                    thorn.length() > thorn.width * 3.5,
-                    "{text:?}: a thorn {}px long and {}px thick is a blob",
-                    thorn.length(),
-                    thorn.width
+                    stroke.length() > stroke.width * 6.0,
+                    "{text:?}: a stroke {:.1}px long and {:.1}px thick is a blob",
+                    stroke.length(),
+                    stroke.width
                 );
-                // Sparse: thorns start well apart.
-                for other in thorns {
-                    if std::ptr::eq(thorn, other) {
+            }
+            // Sparse: no two thorns start on top of each other.
+            for (index, stroke) in thorns.iter().enumerate() {
+                for other in thorns.iter().skip(index + 1) {
+                    let gap = distance(stroke.a, other.a);
+                    if std::ptr::eq(stroke, other) {
                         continue;
                     }
-                    let gap = distance(thorn.base, other.base);
                     assert!(
-                        gap > 5.0,
-                        "{text:?}: two thorns start {gap}px apart, which reads as a fringe"
+                        gap > 5.0 || (stroke.a == other.a),
+                        "{text:?}: two thorns start {gap}px apart without sharing a root"
                     );
                 }
             }
         }
     }
 
-    /// The look's contract, on the same raster the shader draws: a thorn's ink lies outside the
-    /// ink's dilation and never inside the glyph's interior — not in the ink, and not in a
-    /// counter. The old diagonal lattice failed the second half: it grew a barb in the hole of
-    /// every `A` and `N`.
+    /// The look's contract, on the same raster the shader draws: no linework ink inside the ink or
+    /// a counter, and the thorns reach well beyond the silhouette. The lattice this replaces
+    /// failed the first half: it grew a barb in the hole of every `A` and `N`.
     #[test]
-    fn thorn_ink_lies_outside_the_ink_and_never_across_a_face() {
+    fn linework_never_lies_across_a_glyph_face() {
         for text in ["ILANA", "SIGIL", "THE LOOM\nIS US"] {
             let probe = Probe::new(text);
-            let thorns = probe.thorns();
             let (width, height) = probe.size;
-            let mut ink = 0usize;
             let mut inside = 0usize;
+            let mut ink = 0usize;
             for y in 0..height {
                 for x in 0..width {
                     let p = [x as f32 + 0.5, y as f32 + 0.5];
-                    let covered = thorns
+                    let covered = probe
+                        .thorns()
                         .iter()
-                        .any(|thorn| thorn.covers_clear(p) && thorn.signed(p) <= 0.0);
+                        .any(|stroke| stroke.covers_clear(p) && stroke.signed(p) <= 0.0);
                     if !covered {
                         continue;
                     }
@@ -636,28 +838,186 @@ mod tests {
                     }
                 }
             }
-            // How far each spike's own centreline gets from the ink: a thorn whose far end is
-            // still on top of a letter is a scratch, not a thorn.
-            let reach: Vec<f32> = thorns.iter().map(|thorn| probe.reach(thorn)).collect();
-            let shallowest = reach.iter().copied().fold(f32::INFINITY, f32::min);
-            let longest = reach.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let reach = probe
+                .thorns()
+                .iter()
+                .map(|stroke| probe.reach(stroke))
+                .fold(f32::NEG_INFINITY, f32::max);
+            let nearest = probe
+                .thorns()
+                .iter()
+                .map(|stroke| probe.reach(stroke))
+                .fold(f32::INFINITY, f32::min);
+            let longest = probe
+                .thorns()
+                .iter()
+                .map(Stroke::length)
+                .fold(0.0f32, f32::max);
             println!(
-                "{text:?}: {} thorns, {ink} thorn px, each reaching {shallowest:.1}..{longest:.1}px \
-                 beyond the ink, {inside} px not in the block's outside space",
-                thorns.len(),
+                "{text:?}: {ink} thorn px, reaching {nearest:.1}..{reach:.1}px beyond the ink \
+                 (the field stops at {SDF_RANGE}), the longest stroke {longest:.1}px on a {:.1}px \
+                 line, {inside} px not in the block's outside space",
+                probe.line_h
             );
-            assert!(!thorns.is_empty(), "{text:?} has no thorn ink at all");
+            assert!(ink > 0, "{text:?} has no thorn ink at all");
             assert_eq!(
                 inside, 0,
                 "{text:?}: {inside} thorn pixels lie inside the glyph's interior (a counter, or \
                  the ink itself)"
             );
             assert!(
-                shallowest > REACH_PX - 1.0,
-                "{text:?}: a thorn reaches only {shallowest:.1}px beyond the ink, so it is a \
-                 fringe against the letter, not a spike (the others reach {longest:.1}px)"
+                nearest > 1.5,
+                "{text:?}: a stroke reaches only {nearest:.1}px beyond the ink, so it is a fringe \
+                 against the letter, not a spike"
+            );
+            assert!(
+                reach >= SDF_RANGE * 0.99,
+                "{text:?}: no thorn leaves the field's range ({reach:.1}px), so none is long"
+            );
+            assert!(
+                longest > 0.45 * probe.line_h,
+                "{text:?}: the longest whip is {longest:.1}px on a {:.1}px line, too short to read \
+                 as sigil linework",
+                probe.line_h
             );
         }
+    }
+
+    /// A thorn must not spear the next word: it stays over its own word's columns while it is over
+    /// the block, and (on a single line) never enters a gap column at all. The word boxes come from
+    /// the layout that baked the sheet; the gap columns come from the ink itself.
+    #[test]
+    fn a_thorn_stays_over_its_own_word() {
+        for text in ["THE LOOM", "one two three", "THE LOOM IS US"] {
+            let probe = Probe::new(text);
+            let words = probe.words().to_vec();
+            let single_line = probe.sheet.lines == 1;
+            // The spaces between the words on each line, from the layout's own boxes: the columns
+            // strictly between one word's right edge and the next word's left edge.
+            let mut gaps: Vec<(i32, i32)> = Vec::new();
+            for (index, word) in words.iter().enumerate() {
+                let next = words.iter().skip(index + 1).find(|next| next.2 == word.2);
+                if let Some(next) = next.filter(|next| next.0 > word.1 + 1) {
+                    gaps.push((word.1 + 1, next.0 - 1));
+                }
+            }
+            let gap_columns = gaps.iter().map(|gap| gap.1 - gap.0 + 1).sum::<i32>();
+            println!(
+                "{text:?}: {} words at {words:?}, {gap_columns} gap columns in {gaps:?}, {} thorn \
+                 strokes",
+                words.len(),
+                probe.thorns().len()
+            );
+            if text != "ILANA" {
+                assert!(
+                    !gaps.is_empty(),
+                    "{text:?} needs a space between two words for this test to mean anything"
+                );
+            }
+            // The gap test is single-line only: on a two-line block the columns of one line's space
+            // sit over the other line's words, so a column-wise gap means nothing there.
+            let check_gaps = single_line;
+            let (width, _) = probe.size;
+            let mut crossers = 0usize;
+            let mut in_gap = 0usize;
+            for stroke in probe.thorns() {
+                let own = words.iter().copied().find(|word| {
+                    stroke.a[0] >= word.0 as f32 && stroke.a[0] <= word.1 as f32 + 1.0
+                });
+                for y in 0..probe.size.1 {
+                    for x in 0..width {
+                        let p = [x as f32 + 0.5, y as f32 + 0.5];
+                        if !stroke.covers_clear(p) || stroke.signed(p) > 0.0 {
+                            continue;
+                        }
+                        let mine = own.is_some_and(|own| x as i32 >= own.0 && x as i32 <= own.1);
+                        if own.is_some() && !mine {
+                            crossers += 1;
+                        }
+                        if check_gaps
+                            && gaps
+                                .iter()
+                                .any(|gap| x as i32 >= gap.0 && x as i32 <= gap.1)
+                        {
+                            in_gap += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                crossers, 0,
+                "{text:?}: {crossers} thorn pixels lie over another word or a gap; a spike \
+                 crossing a space spears the next word"
+            );
+            assert_eq!(
+                in_gap, 0,
+                "{text:?}: {in_gap} thorn pixels lie in a space between words"
+            );
+        }
+    }
+
+    /// The marks flank the word, mirrored by the shader, and never touch it: every authored stroke
+    /// sits to the right of the block, inside a mark's width of it, and the same words always draw
+    /// the same marks.
+    #[test]
+    fn symbols_flank_the_word_and_never_touch_it() {
+        for text in ["ILANA", "THE LOOM\nIS US"] {
+            let probe = Probe::new(text);
+            let symbols = probe.symbols();
+            println!(
+                "{text:?}: {} symbol strokes, x {:.0}..{:.0} for a {:.0}px block",
+                symbols.len(),
+                symbols.iter().map(|s| s.a[0]).fold(f32::INFINITY, f32::min),
+                symbols
+                    .iter()
+                    .flat_map(|s| [s.a[0], s.b[0], s.c[0]])
+                    .fold(0.0f32, f32::max),
+                probe.size.0 as f32
+            );
+            assert!(!symbols.is_empty(), "{text:?}: no sigil mark at all");
+            assert!(symbols.len() <= MAX_SYMBOLS, "over the symbol cap");
+            for stroke in symbols {
+                assert!(stroke.mirrored, "a mark's stroke is drawn on both sides");
+                for point in [stroke.a, stroke.b, stroke.c] {
+                    assert!(
+                        point[0] > probe.size.0 as f32,
+                        "{text:?}: a mark's point {point:?} overlaps the block"
+                    );
+                    assert!(
+                        point[0] < probe.size.0 as f32 + 0.40 * probe.line_h,
+                        "{text:?}: a mark reaches {:.0}px past the block, too far to stay in the \
+                         layer",
+                        point[0] - probe.size.0 as f32
+                    );
+                    assert!(
+                        point[1] >= 0.0 && point[1] <= probe.size.1 as f32,
+                        "{text:?}: a mark's point {point:?} is outside the block's rows"
+                    );
+                }
+                assert!(
+                    stroke.length() > stroke.width * 4.0,
+                    "a mark stroke is {:.1}px long and {:.1}px thick",
+                    stroke.length(),
+                    stroke.width
+                );
+            }
+        }
+    }
+
+    /// Same words, same sigil: the thorns and the marks are a function of the block and the text,
+    /// with nothing random and nothing from a hash map's order.
+    #[test]
+    fn the_same_text_draws_the_same_sigil() {
+        for text in ["ILANA", "THE LOOM\nIS US"] {
+            let first = Probe::new(text);
+            let second = Probe::new(text);
+            assert_eq!(first.thorns(), second.thorns(), "{text:?}: thorns differ");
+            assert_eq!(first.symbols(), second.symbols(), "{text:?}: marks differ");
+        }
+        // Different words draw different marks.
+        let one = Probe::new("THE LOOM");
+        let two = Probe::new("THE FLESH");
+        assert_ne!(one.symbols(), two.symbols(), "the text does not reach the marks");
     }
 
     /// The same predicate against the *class* of defect the previous shader had: a diagonal lattice
@@ -669,9 +1029,9 @@ mod tests {
     fn the_old_diagonal_lattice_would_fail_the_same_test() {
         let probe = Probe::new("ILANA");
         let (width, height) = probe.size;
-        let block_h = height as f32;
-        let bold = 0.012 * block_h;
-        let barb_len = 0.075 * block_h;
+        let line_h = probe.line_h;
+        let bold = 0.012 * line_h;
+        let barb_len = 0.075 * line_h;
         let mut inside = 0usize;
         let mut total = 0usize;
         for y in 0..height {
@@ -726,19 +1086,20 @@ mod tests {
     }
 
     #[test]
-    fn a_thorn_is_clear_where_it_touches_its_base() {
-        let thorn = Thorn {
-            base: [10.0, 10.0],
-            bend: [12.0, 4.0],
-            tip: [14.0, -2.0],
+    fn a_stroke_is_clear_where_it_touches_its_base() {
+        let stroke = Stroke {
+            a: [10.0, 10.0],
+            b: [12.0, 4.0],
+            c: [14.0, -2.0],
             width: 2.0,
+            mirrored: false,
         };
-        assert!(!thorn.covers_clear([10.0, 10.0]), "the base joint is not the thorn");
-        assert!(thorn.covers_clear([12.0, 6.0]), "the body is");
-        assert!(thorn.signed([12.0, 6.0]) <= 0.0);
-        assert!(thorn.signed([40.0, 6.0]) > 0.0);
-        assert!(thorn.length() > 12.0 && thorn.length() < 14.0);
+        assert!(!stroke.covers_clear([10.0, 10.0]), "the base joint is not the stroke");
+        assert!(stroke.covers_clear([12.0, 6.0]), "the body is");
+        assert!(stroke.signed([12.0, 6.0]) <= 0.0);
+        assert!(stroke.signed([40.0, 6.0]) > 0.0);
+        assert!(stroke.length() > 12.0 && stroke.length() < 14.0);
+        // A needle: the tip capsule has no radius, so the very end is a point.
+        assert!(stroke.width * TIP_WIDTH == 0.0);
     }
 }
-
-

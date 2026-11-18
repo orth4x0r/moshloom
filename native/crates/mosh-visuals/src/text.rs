@@ -15,14 +15,16 @@
 //! | `p1` | look | face | treatment |
 //! | --- | --- | --- | --- |
 //! | 0 | Chrome | Unbounded | liquid chrome: environment reflection, iridescent rim, soft specular |
-//! | 1 | Sigil | Grenze Gotisch | blackletter polished silver, thorns grown out of its contour, a thin blood-red glow |
+//! | 1 | Sigil | Grenze Gotisch | blackletter polished silver, long whip thorns grown out of its contour, mirrored sigil marks beside the word, a thin blood-red glow |
 //! | 2 | Clean | Space Grotesk | crisp minimal, soft shadow, thin cool rim |
 //!
 //! The sigil look raises the words to uppercase before it bakes them: Grenze Gotisch's lowercase is
 //! a polite book serif with none of the look's character, and the look is a sigil, not a caption.
-//! Its thorns are geometry grown from the block's outer contour (`text/thorn.rs`), uploaded with
-//! the pass's uniforms: sharp tapered spikes where the silhouette turns hardest, sparse, each one
-//! its own sweep and bend, and never one that touches the ink.
+//! Its linework is geometry grown at bake time (`text/thorn.rs`) and uploaded with the pass's
+//! uniforms: long tapered spikes where the silhouette turns hardest, sparse, each with its own
+//! sweep and bend, never one that touches the ink or crosses a word's space; plus an abstract
+//! bramble mark beside each end of the word, mirrored so the pair is symmetric and derived from a
+//! hash of the text, so the same words always draw the same sigil.
 //!
 //! Only the face the layer last *drew* is baked. A text change costs one face's bake, not three;
 //! the look that is not in use is baked on the next `set_text` after `draw` asks for it, which is
@@ -68,7 +70,7 @@ use mosh_render::{FrameRecorder, Gpu, LayerTarget, Pipeline, RenderError};
 
 use layout::Face;
 use sheet::Sheet;
-use thorn::Thorn;
+use thorn::Stroke;
 
 /// What `p0..p7` mean for `text` (shown in the clip editor).
 pub const PARAMS: [&str; 8] = [
@@ -76,9 +78,10 @@ pub const PARAMS: [&str; 8] = [
 ];
 
 /// Bytes of the pass's uniform block. Keep in sync with `text/text.wgsl` (a unit test reflects the
-/// shader and compares every member's offset): 96 bytes of scalar block, then [`thorn::MAX_THORNS`]
-/// thorns at 32 bytes.
-const UNIFORM_BYTES: usize = 96 + thorn::MAX_THORNS * THORN_BYTES;
+/// shader and compares every member's offset): 112 bytes of scalar block, then the sigil look's
+/// linework — [`thorn::MAX_THORNS`] thorn strokes and [`thorn::MAX_SYMBOLS`] symbol strokes at 32
+/// bytes each. 1008 bytes, well inside a device's uniform budget.
+const UNIFORM_BYTES: usize = THORNS_AT + (thorn::MAX_THORNS + thorn::MAX_SYMBOLS) * THORN_BYTES;
 
 /// The uniform block's scalar member offsets, in bytes. `text/text.wgsl`'s `TextUniforms` is the
 /// other half of this contract: `the_uniform_block_members_match_the_shader` reflects the shader
@@ -92,17 +95,20 @@ const TAPS_AT: usize = 48;
 const AUDIO_AT: usize = 64;
 const CLOCK_AT: usize = 80;
 const THORN_COUNT_AT: usize = 92;
-const THORNS_AT: usize = 96;
+const SYMBOL_COUNT_AT: usize = 96;
+const THORNS_AT: usize = 112;
+const SYMBOLS_AT: usize = THORNS_AT + thorn::MAX_THORNS * THORN_BYTES;
 
-/// Bytes of one thorn in the uniform block: its `Thorn` struct — `base`, `bend` and `tip` as a
-/// `vec2` each, then the base half-width and a padding float.
+/// Bytes of one stroke in the uniform block: its `Stroke` struct — `a`, `b` and `c` as a `vec2`
+/// each, then the base half-width and the mirror flag.
 const THORN_BYTES: usize = 32;
 
-/// The `Thorn` struct's member offsets, in bytes, relative to the thorn.
-const THORN_BASE_AT: usize = 0;
-const THORN_BEND_AT: usize = 8;
-const THORN_TIP_AT: usize = 16;
-const THORN_WIDTH_AT: usize = 24;
+/// The `Stroke` struct's member offsets, in bytes, relative to the stroke.
+const STROKE_A_AT: usize = 0;
+const STROKE_B_AT: usize = 8;
+const STROKE_C_AT: usize = 16;
+const STROKE_WIDTH_AT: usize = 24;
+const STROKE_MIRROR_AT: usize = 28;
 
 /// A show has far fewer layers than this; the cap only stops a bogus index from growing the
 /// per-layer vector without bound.
@@ -137,8 +143,8 @@ struct TextSheet {
     height: u32,
     inset_min: [f32; 2],
     inset_max: [f32; 2],
-    /// The sigil look's thorns, packed for the shader ([`ThornWords`]).
-    thorns: ThornWords,
+    /// The sigil look's linework, packed for the shader ([`Linework`]).
+    linework: Linework,
     /// The BGRA bytes of the last bake. Kept so a text change reuses the allocation instead of
     /// creating a few megabytes on the render thread.
     pixels: Vec<u8>,
@@ -268,7 +274,7 @@ impl TextLayer {
             height,
             inset_min: [0.0; 2],
             inset_max: [1.0; 2],
-            thorns: ThornWords::default(),
+            linework: Linework::default(),
             pixels: Vec::new(),
             written_rows: 0,
         });
@@ -288,7 +294,7 @@ impl TextLayer {
         };
         held.written_rows = baked.mask_h;
         let (inset_min, inset_max) = baked.inset_in(width, height);
-        let thorns = ThornWords::new(&baked.thorns, baked.block_h);
+        let linework = Linework::new(&baked.thorns, &baked.symbols, baked.block_h);
         let uploaded = match held.texture.as_mut() {
             Some(texture) => texture.upload(gpu, width, height, &held.pixels),
             None => match VideoTexture::new(gpu, width, height) {
@@ -304,7 +310,7 @@ impl TextLayer {
         };
         held.inset_min = inset_min;
         held.inset_max = inset_max;
-        held.thorns = thorns;
+        held.linework = linework;
         entry.fresh[look] = uploaded.is_ok();
         if baked.dropped > 0 {
             // Logged once per text change, not per frame: the app repeats the same text every
@@ -379,7 +385,7 @@ impl TextLayer {
             sheet.height,
             sheet.inset_min,
             sheet.inset_max,
-            &sheet.thorns,
+            &sheet.linework,
             params,
             frame,
             t,
@@ -398,7 +404,7 @@ fn uniforms(
     height: u32,
     inset_min: [f32; 2],
     inset_max: [f32; 2],
-    thorns: &ThornWords,
+    linework: &Linework,
     params: &ClipParams,
     frame: &AnalysisFrame,
     t: f32,
@@ -428,67 +434,80 @@ fn uniforms(
             frame.intensity,
         ],
     );
-    // `thorn_count` is the number of *thorns*, not of the words below: the shader indexes
-    // `U.thorns[i]` once per thorn, so publishing the word count would read the array's tail (and
+    write(CLOCK_AT, &[t, frame.beat_phase, frame.loudness]);
+    // The counts are the numbers of *strokes*, not of the words below: the shader indexes
+    // `U.thorns[i]` once per stroke, so publishing a word count would read the array's tail (and
     // loop over it) for every Sigil pixel.
-    write(
-        CLOCK_AT,
-        &[t, frame.beat_phase, frame.loudness],
-    );
-    write(THORN_COUNT_AT, &[thorns.count as f32]);
-    for (index, thorn) in thorns.words.iter().take(thorn::MAX_THORNS).enumerate() {
-        let start = THORNS_AT + index * THORN_BYTES;
-        write(start + THORN_BASE_AT, &thorn[0][0..2]);
-        write(start + THORN_BEND_AT, &thorn[0][2..4]);
-        write(start + THORN_TIP_AT, &thorn[1][0..2]);
-        write(start + THORN_WIDTH_AT, &thorn[1][2..3]);
+    write(THORN_COUNT_AT, &[linework.thorns as f32]);
+    write(SYMBOL_COUNT_AT, &[linework.symbols as f32]);
+    for (index, word) in linework.words.iter().enumerate() {
+        let start = if index < linework.thorns {
+            THORNS_AT + index * THORN_BYTES
+        } else {
+            SYMBOLS_AT + (index - linework.thorns) * THORN_BYTES
+        };
+        write(start + STROKE_A_AT, &word[0][0..2]);
+        write(start + STROKE_B_AT, &word[0][2..4]);
+        write(start + STROKE_C_AT, &word[1][0..2]);
+        write(start + STROKE_WIDTH_AT, &word[1][2..3]);
+        write(start + STROKE_MIRROR_AT, &word[1][3..4]);
     }
     block
 }
 
-/// The sigil look's thorns as the shader reads them: how many there are, and one entry per thorn
-/// holding its `Thorn` struct's two `vec4` words, in the block's height units.
+/// The sigil look's linework as the shader reads it: how many thorn strokes and how many symbol
+/// strokes, and every stroke's two `vec4` words in one list (thorns first), in the block's height
+/// units.
 #[derive(Default)]
-struct ThornWords {
-    /// The number of thorns — what `thorn_count` carries. One per `U.thorns[i]`, never the number
-    /// of `vec4` words (there are two of those per thorn).
-    count: usize,
-    /// One entry per thorn: `(base.xy, bend.xy)` and `(tip.xy, half-width, unused)`. Every number
-    /// is divided by the block's height, because `block_uv` scaled by the block's aspect is that
-    /// space; the shader reads them directly and a thorn keeps its weight relative to the block at
+struct Linework {
+    /// The number of thorn strokes — what `thorn_count` carries. One per `U.thorns[i]`, never the
+    /// number of `vec4` words (there are two of those per stroke).
+    thorns: usize,
+    /// The number of symbol strokes — what `symbol_count` carries. Each is drawn twice, mirrored.
+    symbols: usize,
+    /// One entry per stroke: `(a.xy, b.xy)` and `(c.xy, half-width, mirror)`. Every number is
+    /// divided by the block's height, because `block_uv` scaled by the block's aspect is that
+    /// space; the shader reads them directly and a stroke keeps its weight relative to the block at
     /// every `size`.
     words: Vec<[[f32; 4]; 2]>,
 }
 
-impl ThornWords {
-    /// Packs `thorns` (in block pixels) for the shader.
-    fn new(thorns: &[Thorn], block_h: u32) -> ThornWords {
+impl Linework {
+    /// Packs the thorns and the marks (both in block pixels) for the shader.
+    fn new(thorns: &[Stroke], symbols: &[Stroke], block_h: u32) -> Linework {
         let height = block_h.max(1) as f32;
-        let words: Vec<[[f32; 4]; 2]> = thorns
-            .iter()
-            .take(thorn::MAX_THORNS)
-            .map(|thorn| {
-                [
-                    [
-                        thorn.base[0] / height,
-                        thorn.base[1] / height,
-                        thorn.bend[0] / height,
-                        thorn.bend[1] / height,
-                    ],
-                    [
-                        thorn.tip[0] / height,
-                        thorn.tip[1] / height,
-                        thorn.width / height,
-                        0.0,
-                    ],
-                ]
-            })
-            .collect();
-        ThornWords {
-            count: words.len(),
+        let mut words: Vec<[[f32; 4]; 2]> = Vec::with_capacity(thorns.len() + symbols.len());
+        for stroke in thorns.iter().take(thorn::MAX_THORNS) {
+            words.push(pack(stroke, height));
+        }
+        let thorns = words.len();
+        for stroke in symbols.iter().take(thorn::MAX_SYMBOLS) {
+            words.push(pack(stroke, height));
+        }
+        Linework {
+            thorns,
+            symbols: words.len() - thorns,
             words,
         }
     }
+}
+
+/// One stroke's two `vec4` words, every number divided by the block's height.
+fn pack(stroke: &Stroke, height: f32) -> [[f32; 4]; 2] {
+    [
+        [
+            stroke.a[0] / height,
+            stroke.a[1] / height,
+            stroke.b[0] / height,
+            stroke.b[1] / height,
+        ],
+        [
+            stroke.c[0] / height,
+            stroke.c[1] / height,
+            stroke.width / height,
+            if stroke.mirrored { 1.0 } else { 0.0 },
+        ],
+    ]
 }
 
 #[cfg(test)]
@@ -558,8 +577,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("`{name}`'s literal: {error}"))
     }
 
-    /// The uniform block's layout, member by member: offsets, the thorn array's stride and the
-    /// offsets inside `Thorn`. Swapping two members of `Thorn` in the shader (say `bend` and `tip`)
+    /// The uniform block's layout, member by member: every offset, both arrays' strides and the
+    /// offsets inside `Stroke`. Swapping two members of `Stroke` in the shader (say `b` and `c`)
     /// keeps the total size, so only this test can catch it.
     #[test]
     fn the_uniform_block_members_match_the_shader() {
@@ -596,66 +615,87 @@ mod tests {
             ("beat", CLOCK_AT + 4),
             ("loud", CLOCK_AT + 8),
             ("thorn_count", THORN_COUNT_AT),
+            ("marks", SYMBOL_COUNT_AT),
             ("thorns", THORNS_AT),
+            ("symbols", SYMBOLS_AT),
         ] {
             assert_eq!(offset(name), expected, "`{name}` sits at the wrong byte");
         }
-        // The thorn array: one 32-byte `Thorn` each, and the struct's own member offsets, which is
-        // where text.rs writes `base`, `bend`, `tip` and the half-width.
-        let thorns = members
-            .iter()
-            .find(|member| member.name.as_deref() == Some("thorns"))
-            .expect("the thorns member");
-        let naga::TypeInner::Array { base, stride, .. } = &module.types[thorns.ty].inner else {
-            panic!("`thorns` is an array");
-        };
-        assert_eq!(
-            *stride as usize, THORN_BYTES,
-            "one thorn's stride in the uniform block"
-        );
-        let naga::TypeInner::Struct {
-            members: thorn_members,
-            ..
-        } = &module.types[*base].inner
-        else {
-            panic!("a thorn is a struct");
-        };
-        let thorn_offset = |name: &str| {
-            thorn_members
+        // The two arrays: one 32-byte `Stroke` each, and the struct's own member offsets, which is
+        // where text.rs writes `a`, `b`, `c`, the half-width and the mirror flag.
+        for (member_name, expected_offset) in [("thorns", THORNS_AT), ("symbols", SYMBOLS_AT)] {
+            let member = members
                 .iter()
-                .find(|member| member.name.as_deref() == Some(name))
-                .map(|member| member.offset as usize)
-                .unwrap_or_else(|| panic!("the WGSL `Thorn` has no `{name}` member"))
-        };
-        assert_eq!(thorn_offset("base"), THORN_BASE_AT);
-        assert_eq!(thorn_offset("bend"), THORN_BEND_AT);
-        assert_eq!(thorn_offset("tip"), THORN_TIP_AT);
-        assert_eq!(thorn_offset("width"), THORN_WIDTH_AT);
+                .find(|member| member.name.as_deref() == Some(member_name))
+                .unwrap_or_else(|| panic!("the `{member_name}` member"));
+            let naga::TypeInner::Array { base, stride, .. } = &module.types[member.ty].inner else {
+                panic!("`{member_name}` is an array");
+            };
+            assert_eq!(
+                *stride as usize, THORN_BYTES,
+                "one stroke's stride in `{member_name}`"
+            );
+            assert_eq!(member.offset as usize, expected_offset);
+            let naga::TypeInner::Struct {
+                members: stroke_members,
+                ..
+            } = &module.types[*base].inner
+            else {
+                panic!("a stroke is a struct");
+            };
+            let stroke_offset = |name: &str| {
+                stroke_members
+                    .iter()
+                    .find(|member| member.name.as_deref() == Some(name))
+                    .map(|member| member.offset as usize)
+                    .unwrap_or_else(|| panic!("the WGSL `Stroke` has no `{name}` member"))
+            };
+            assert_eq!(stroke_offset("a"), STROKE_A_AT);
+            assert_eq!(stroke_offset("b"), STROKE_B_AT);
+            assert_eq!(stroke_offset("c"), STROKE_C_AT);
+            assert_eq!(stroke_offset("width"), STROKE_WIDTH_AT);
+            assert_eq!(stroke_offset("mirror"), STROKE_MIRROR_AT);
+        }
     }
 
-    /// The count the shader loops over is the number of thorns, not the number of `vec4` words it
-    /// takes to describe them: publishing the word count made the Sigil pass read past the end of
-    /// the array and loop twice per thorn.
+    /// The counts the shader loops over are the numbers of strokes, not the number of `vec4` words
+    /// it takes to describe them: publishing a word count made the Sigil pass read past the end of
+    /// the array and loop twice per stroke.
     #[test]
-    fn the_thorn_count_in_the_uniform_block_is_the_thorn_count() {
-        let thorns: Vec<Thorn> = (0..7)
-            .map(|index| Thorn {
-                base: [index as f32, 20.0],
-                bend: [index as f32 + 1.0, 10.0],
-                tip: [index as f32 + 2.0, 0.0],
+    fn the_counts_in_the_uniform_block_are_the_stroke_counts() {
+        let thorns: Vec<Stroke> = (0..7)
+            .map(|index| Stroke {
+                a: [index as f32, 20.0],
+                b: [index as f32 + 1.0, 10.0],
+                c: [index as f32 + 2.0, 0.0],
                 width: 2.0,
+                mirrored: false,
             })
             .collect();
-        let words = ThornWords::new(&thorns, 100);
-        assert_eq!(words.count, thorns.len(), "one uniform entry per thorn");
-        assert_eq!(words.words.len(), thorns.len(), "two vec4 per thorn, one entry");
+        let symbols: Vec<Stroke> = (0..5)
+            .map(|index| Stroke {
+                a: [300.0 + index as f32, 20.0],
+                b: [301.0 + index as f32, 10.0],
+                c: [302.0 + index as f32, 0.0],
+                width: 3.0,
+                mirrored: true,
+            })
+            .collect();
+        let linework = Linework::new(&thorns, &symbols, 100);
+        assert_eq!(linework.thorns, thorns.len(), "one uniform entry per thorn");
+        assert_eq!(linework.symbols, symbols.len(), "one for each mark stroke");
+        assert_eq!(
+            linework.words.len(),
+            thorns.len() + symbols.len(),
+            "one entry per stroke, two vec4 each"
+        );
         let block = uniforms(
             (960, 540),
             512,
             256,
             [0.0; 2],
             [1.0; 2],
-            &words,
+            &linework,
             &ClipParams {
                 p: [0.5; 8],
                 palette: 0,
@@ -667,22 +707,41 @@ mod tests {
         let at = |offset: usize| {
             f32::from_le_bytes(block[offset..offset + 4].try_into().expect("four bytes"))
         };
-        let count = at(THORN_COUNT_AT);
+        let thorn_count = at(THORN_COUNT_AT);
+        let symbol_count = at(SYMBOL_COUNT_AT);
         assert_eq!(
-            count,
+            thorn_count,
             thorns.len() as f32,
             "the shader's `thorn_count` is the number of thorns, not of their words"
         );
+        assert_eq!(
+            symbol_count,
+            symbols.len() as f32,
+            "the shader's `symbol_count` is the number of stroke entries"
+        );
         assert!(
-            count as usize <= thorn::MAX_THORNS,
-            "{count} thorns do not fit the shader's array of {}",
+            thorn_count as usize <= thorn::MAX_THORNS,
+            "{thorn_count} thorns do not fit the shader's array of {}",
             thorn::MAX_THORNS
         );
-        // And the entry the shader indexes per thorn is the one the bake grew, at its own slot.
-        let last = THORNS_AT + (thorns.len() - 1) * THORN_BYTES;
-        assert_eq!(at(last), 6.0 / 100.0, "thorn 6 starts where thorn 6 is");
-        assert_eq!(at(last + 8), 7.0 / 100.0, "its bend follows its base");
-        assert_eq!(at(last + 16), 8.0 / 100.0, "its tip follows its bend");
-        assert_eq!(at(last + THORN_WIDTH_AT), 2.0 / 100.0, "its half-width");
+        assert!(
+            symbol_count as usize <= thorn::MAX_SYMBOLS,
+            "{symbol_count} mark strokes do not fit the shader's array of {}",
+            thorn::MAX_SYMBOLS
+        );
+        // And each stroke the shader indexes is the one the bake grew, at its own slot.
+        let last_thorn = THORNS_AT + (thorns.len() - 1) * THORN_BYTES;
+        assert_eq!(at(last_thorn), 6.0 / 100.0, "thorn 6 starts where thorn 6 is");
+        assert_eq!(at(last_thorn + STROKE_B_AT), 7.0 / 100.0, "its bend follows");
+        assert_eq!(at(last_thorn + STROKE_C_AT), 8.0 / 100.0, "its tip follows");
+        assert_eq!(at(last_thorn + STROKE_WIDTH_AT), 2.0 / 100.0, "its half-width");
+        let last_symbol = SYMBOLS_AT + (symbols.len() - 1) * THORN_BYTES;
+        assert_eq!(at(last_symbol), 304.0 / 100.0, "mark 4 starts at its own slot");
+        assert_eq!(
+            at(last_symbol + STROKE_MIRROR_AT),
+            1.0,
+            "a mark is drawn on both sides"
+        );
+        assert_eq!(at(last_symbol + STROKE_WIDTH_AT), 3.0 / 100.0);
     }
 }
