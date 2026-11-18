@@ -1652,11 +1652,32 @@ fn default_media(visualizer: &str) -> Option<String> {
     }
 }
 
-/// A fresh clip of `visualizer`: the look in the middle of its range, a light beat pulse.
+/// A fresh clip of `visualizer`: the look in the middle of its range, a light beat pulse, and the
+/// web app's `newBlock` default datamosh (`mosh:.6, trans:2`).
 pub fn new_clip(id: ClipId, visualizer: &str) -> Clip {
     let name = catalog_entry(visualizer)
         .map(|entry| entry.name.to_string())
         .unwrap_or_else(|| visualizer.to_string());
+    // A scene is a datamosh from the moment it is dragged in, as the web app's `newBlock` is.
+    // Media clips (a video file, the webcam, words) are left clean on purpose: a mosh smears them
+    // into mush, so that stays a choice the user makes in the Effects list. The fluid gets a
+    // moderate 0.5: it stirs the mosh buffer with its own velocity instead of being smeared by it.
+    let (effects, transition_in) = if MediaKind::of(visualizer) == MediaKind::None {
+        let amount = if visualizer == "fluid" { 0.5 } else { 0.6 };
+        (
+            vec![EffectSlot {
+                kind: EffectKind::Mosh,
+                amount,
+                param: 0.5,
+            }],
+            Transition {
+                kind: TransitionKind::Datamosh,
+                beats: 2.0,
+            },
+        )
+    } else {
+        (Vec::new(), Transition::default())
+    };
     Clip {
         id,
         name,
@@ -1670,8 +1691,8 @@ pub fn new_clip(id: ClipId, visualizer: &str) -> Clip {
         },
         ranges: [[ParamRange::default(); 8]; 4],
         pulse_depth: [0.25; 4],
-        effects: Vec::new(),
-        transition_in: Transition::default(),
+        effects,
+        transition_in,
         follow: FollowAction::None,
         follow_after_bars: 8,
         react_to_events: true,

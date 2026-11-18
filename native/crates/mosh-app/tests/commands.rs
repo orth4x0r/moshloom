@@ -14,7 +14,8 @@ use mosh_app::core::{Status, arrangement_project, default_project, simple_clip};
 use mosh_app::editor::model::{MAX_LAYERS, MediaKind, Panels, new_clip};
 use mosh_app::editor::{ClipSource, Command, EditorError, EditorModel, SpanRef, View};
 use mosh_core::{
-    ArrClip, BlendMode, ControlEvent, LayerKind, ParamRange, Project, ShowMode, SigChange,
+    ArrClip, BlendMode, ControlEvent, EffectKind, EffectSlot, LayerKind, ParamRange, Project,
+    ShowMode, SigChange, Transition, TransitionKind,
 };
 
 fn span(clip: u32, start_ppq: f64, end_ppq: f64) -> ArrClip {
@@ -809,4 +810,47 @@ fn a_new_clip_is_ready_to_draw() {
         assert!(layers.contains(&id), "{id} is missing from {layers:?}");
     }
     let _ = (Project::default(), simple_clip(1, "tunnel"));
+}
+
+/// A scene dragged in from the browser is a datamosh from its first frame, as the web app's
+/// `newBlock` is (`mosh:.6`, `trans:2`). A media clip (a video file, the webcam, words) is left
+/// clean: a mosh smears those into mush, so that stays a choice in the Effects list.
+#[test]
+fn a_new_clip_starts_with_the_web_mosh_default() {
+    for entry in mosh_app::editor::model::catalog() {
+        let clip = new_clip(9, entry.id);
+        match MediaKind::of(entry.id) {
+            MediaKind::None => {
+                let amount = if entry.id == "fluid" { 0.5 } else { 0.6 };
+                assert_eq!(
+                    clip.effects,
+                    vec![EffectSlot {
+                        kind: EffectKind::Mosh,
+                        amount,
+                        param: 0.5,
+                    }],
+                    "{}",
+                    entry.id
+                );
+                assert_eq!(
+                    clip.transition_in,
+                    Transition {
+                        kind: TransitionKind::Datamosh,
+                        beats: 2.0,
+                    },
+                    "{}",
+                    entry.id
+                );
+            }
+            MediaKind::File | MediaKind::Camera | MediaKind::Text => {
+                assert!(clip.effects.is_empty(), "{}: {:?}", entry.id, clip.effects);
+                assert_eq!(clip.transition_in, Transition::default(), "{}", entry.id);
+            }
+        }
+    }
+    // Both branches above are populated by the catalog, and the fluid is a scene visualizer.
+    for id in ["overlay", "camera", "text"] {
+        assert_ne!(MediaKind::of(id), MediaKind::None, "{id} is not media");
+    }
+    assert_eq!(MediaKind::of("fluid"), MediaKind::None);
 }
