@@ -435,3 +435,50 @@ fn an_input_switch_starts_a_fresh_analyzer() {
     assert_eq!(core.step(start + Duration::from_millis(3_000)).source, SourceKind::Plugin);
     assert_eq!(core.analyzer_resets(), 2);
 }
+
+// Drum and bass stem taps feed the analysis next to the master, block for block, but only while
+// the master comes from the plugin: next to a loopback fallback they would be another clock.
+#[test]
+fn stem_taps_feed_the_analyzer_only_beside_the_plugin() {
+    let plugin = Script::with_block(transport_block(4.0));
+    let mut core = AppCore::new(
+        default_project(),
+        InputMux::new(Some(Box::new(plugin.clone())), None),
+        Controls::new(Vec::new()),
+    );
+    let drums = Script::silent();
+    let bass = Script::silent();
+    core.stems_mut()
+        .set_source(mosh_core::ShowRole::Drums, Box::new(drums.clone()));
+    core.stems_mut()
+        .set_source(mosh_core::ShowRole::Bass, Box::new(bass));
+    // A role the analyzer does not read is not a stem tap.
+    core.stems_mut()
+        .set_source(mosh_core::ShowRole::Vocal, Box::new(Script::silent()));
+    let start = Instant::now();
+    for frame in 0..3u32 {
+        core.step(start + Duration::from_millis(16 * u64::from(frame)));
+    }
+    // One master block a frame, each with one drum and one bass block.
+    assert_eq!(core.stems_mut().fed(), 6);
+
+    // A drum tap that stops is dropped from the feed; the bass carries on.
+    drums.set_alive(false);
+    core.step(start + Duration::from_millis(48));
+    assert_eq!(core.stems_mut().fed(), 7);
+
+    // The master falls back to loopback: no stems at all, even live ones.
+    let loopback = Script::silent();
+    let mut fallback = AppCore::new(
+        default_project(),
+        InputMux::new(None, Some(Box::new(loopback))),
+        Controls::new(Vec::new()),
+    );
+    fallback
+        .stems_mut()
+        .set_source(mosh_core::ShowRole::Drums, Box::new(Script::silent()));
+    for frame in 0..3u32 {
+        fallback.step(start + Duration::from_millis(16 * u64::from(frame)));
+    }
+    assert_eq!(fallback.stems_mut().fed(), 0);
+}
