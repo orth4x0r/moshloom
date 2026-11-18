@@ -1,31 +1,40 @@
-//! Text layer: words (song titles, lyrics, phrases) drawn in glitchy Y2K / cyber type that reacts
+//! Text layer: words (song titles, lyrics, phrases) drawn in contemporary display type that reacts
 //! to the music. Owner: L-text.
 //!
 //! # What happens when
 //!
 //! `set_text` is the whole of the work: it lays the words out (lines from `\n`, each line centred,
-//! kerning from the font), rasterises every glyph's signed distance field, packs the block into one
-//! sheet image and hands it to a `VideoTexture`. `draw` records one full-screen pass and nothing
-//! else: the layout and the glyphs are never touched per frame.
+//! spacing and kerning from the font's advances), rasterises the block once, turns it into one
+//! continuous signed distance field and hands it to a `VideoTexture` per face. `draw` records one
+//! full-screen pass and nothing else: the layout and the glyphs are never touched per frame.
 //!
-//! # Two faces, three looks
+//! # Three faces, three looks
 //!
-//! `p1` ("font") picks one of three looks, and a look owns a face: chrome (0) and clean (2) use
-//! Ubuntu Light, thorny (1) uses Hack Regular. `set_text` bakes both faces once; `draw` binds the
-//! sheet the current look needs. Styling on top of the face — SDF dilation for the bubble, the
-//! bevel shading, the noise-warped thorny edge — lives in `text/text.wgsl`.
+//! `p1` ("font") picks one of three looks, and each look has its own display face from
+//! `native/assets/fonts/`:
+//!
+//! | `p1` | look | face | treatment |
+//! | --- | --- | --- | --- |
+//! | 0 | Chrome | Unbounded | liquid chrome: environment reflection, iridescent rim, soft specular |
+//! | 1 | Sigil | Grenze Gotisch | blackletter polished silver, barbed accents, blood-red glow |
+//! | 2 | Clean | Space Grotesk | crisp minimal, soft shadow, thin cool rim |
+//!
+//! `set_text` bakes one sheet per face; `draw` binds the sheet the current look needs. Styling on
+//! top of the face — the bevel from the baked surface normals, the reflections, the barbs, the
+//! shadow — lives in `text/text.wgsl`. Nothing in the styling is retro: no scanlines, no CRT or
+//! VHS treatment, no pixel type, no acid-green outline.
 //!
 //! # Parameters
 //!
 //! | param | meaning |
 //! | --- | --- |
 //! | `p0` size | the block's height as a fraction of the layer, 0.20..0.88 |
-//! | `p1` font | three looks: chrome, thorny, clean |
+//! | `p1` font | three looks: chrome, sigil, clean |
 //! | `p2` spacing | widens the block about its centre, 0.92x..1.47x |
-//! | `p3` jitter | per-glyph offset and rotation, on a 24 Hz clock |
+//! | `p3` jitter | a 24 Hz wobble of the whole block (never per glyph: that would tear it) |
 //! | `p4` glitch | slice displacement, RGB split, square cut-outs; intensity adds to it |
-//! | `p5` outline | the dark rim outside the glyphs |
-//! | `p6` beat pop | the word breathes and each letter pops on the beat with the low band |
+//! | `p5` outline | the rim outside the glyphs |
+//! | `p6` beat pop | the word breathes and its fill lifts on the beat with the low band |
 //! | `p7` scroll | rolls the block from below the frame to above it |
 //!
 //! Nothing here flashes the whole frame: every bright pixel is inside the glyphs, so the 400 ms
@@ -54,23 +63,21 @@ const UNIFORM_BYTES: usize = 96;
 /// per-layer vector without bound.
 const MAX_LAYERS: usize = 32;
 
-/// How many looks `p1` has.
+/// How many looks `p1` has, one per face.
 const LOOKS: usize = 3;
 
 /// The pass, compiled once in [`TextLayer::new`] with the same naga options as every other shader.
 const SHADER: &str = include_str!("text/text.wgsl");
 
-/// The two faces. Both are freely redistributable and their licence files sit next to them
-/// (`native/assets/fonts/README.md`).
-const FACE_DISPLAY: &[u8] = include_bytes!("../../../assets/fonts/Ubuntu-Light.ttf");
-const FACE_MONO: &[u8] = include_bytes!("../../../assets/fonts/Hack-Regular.ttf");
+/// The three display faces, one per look. Each is under the SIL Open Font License 1.1 and its
+/// licence file sits next to it (`native/assets/fonts/README.md`). Variable fonts: the default
+/// (regular) instance is what `fontdue` rasterises.
+const FACE_CHROME: &[u8] = include_bytes!("../../../assets/fonts/unbounded/Unbounded[wght].ttf");
+const FACE_SIGIL: &[u8] =
+    include_bytes!("../../../assets/fonts/grenzegotisch/GrenzeGotisch[wght].ttf");
+const FACE_CLEAN: &[u8] = include_bytes!("../../../assets/fonts/spacegrotesk/SpaceGrotesk[wght].ttf");
 
-/// Which face a look draws with.
-fn face_of_look(look: usize) -> usize {
-    if look == 1 { 1 } else { 0 }
-}
-
-/// `p1` -> 0 chrome, 1 thorny, 2 clean.
+/// `p1` -> 0 chrome, 1 sigil, 2 clean.
 fn look_index(font: f32) -> usize {
     ((font.clamp(0.0, 0.999) * LOOKS as f32) as usize).min(LOOKS - 1)
 }
@@ -82,17 +89,20 @@ struct TextSheet {
     height: u32,
     inset_min: [f32; 2],
     inset_max: [f32; 2],
+    /// A zeroed buffer the size of the texture, allocated only when a smaller text has to be
+    /// padded into a texture that is already allocated.
+    scratch: Vec<u8>,
 }
 
-/// What a layer shows: the words it was given, and their sheets per face.
+/// What a layer shows: the words it was given, and their sheet for each look.
 struct LayerText {
     text: String,
-    sheets: [Option<TextSheet>; 2],
+    sheets: [Option<TextSheet>; LOOKS],
 }
 
 pub struct TextLayer {
     pipeline: Pipeline,
-    faces: [Option<Face>; 2],
+    faces: [Option<Face>; LOOKS],
     layers: Vec<Option<LayerText>>,
 }
 
@@ -104,7 +114,11 @@ impl TextLayer {
             Pipeline::fullscreen(gpu, &words, UNIFORM_BYTES, 1)?.with_name("text.glyphs");
         Ok(TextLayer {
             pipeline,
-            faces: [Face::new(FACE_DISPLAY), Face::new(FACE_MONO)],
+            faces: [
+                Face::new(FACE_CHROME),
+                Face::new(FACE_SIGIL),
+                Face::new(FACE_CLEAN),
+            ],
             layers: Vec::new(),
         })
     }
@@ -123,7 +137,7 @@ impl TextLayer {
         }
         let entry = self.layers[layer].get_or_insert_with(|| LayerText {
             text: String::new(),
-            sheets: [None, None],
+            sheets: [None, None, None],
         });
         if entry.text == text {
             return;
@@ -145,39 +159,57 @@ impl TextLayer {
                 *slot = None;
                 continue;
             };
-            let (inset_min, inset_max) = baked.inset();
-            let same_size = slot
+            // A texture that already fits the new text is reused, not reallocated: a lyric
+            // changing line would otherwise allocate a VkImage and two staging buffers on the
+            // render thread, which was most of this call's cost. A larger text grows it.
+            let fits = slot
                 .as_ref()
-                .is_some_and(|held| (held.width, held.height) == (baked.width, baked.height));
-            if same_size {
-                // The same words at another size would reallocate; the same size is a memcpy.
-                let Some(held) = slot.as_mut() else {
-                    continue;
-                };
-                if held
-                    .texture
-                    .upload(gpu, baked.width, baked.height, &baked.pixels)
-                    .is_err()
-                {
-                    *slot = None;
-                    continue;
-                }
-                held.inset_min = inset_min;
-                held.inset_max = inset_max;
-                continue;
-            }
-            let created =
-                VideoTexture::new(gpu, baked.width, baked.height).and_then(|mut texture| {
-                    texture.upload(gpu, baked.width, baked.height, &baked.pixels)?;
-                    Ok(TextSheet {
+                .is_some_and(|held| held.width >= baked.width && held.height >= baked.height);
+            if !fits {
+                let created =
+                    VideoTexture::new(gpu, baked.width, baked.height).map(|texture| TextSheet {
                         texture,
                         width: baked.width,
                         height: baked.height,
-                        inset_min,
-                        inset_max,
-                    })
-                });
-            *slot = created.ok();
+                        inset_min: [0.0; 2],
+                        inset_max: [1.0; 2],
+                        scratch: Vec::new(),
+                    });
+                *slot = created.ok();
+                if slot.is_none() {
+                    continue;
+                }
+            }
+            let Some(held) = slot.as_mut() else {
+                continue;
+            };
+            let (inset_min, inset_max) = baked.inset_in(held.width, held.height);
+            let uploaded = if (baked.width, baked.height) == (held.width, held.height) {
+                held.texture
+                    .upload(gpu, held.width, held.height, &baked.pixels)
+            } else {
+                // The bake is smaller than the texture: pad it into the texture's top-left, with
+                // the rest transparent, and point the shader's inset at the smaller block.
+                if held.scratch.len() != (held.width * held.height * 4) as usize {
+                    held.scratch = vec![0u8; (held.width * held.height * 4) as usize];
+                }
+                held.scratch.fill(0);
+                for row in 0..baked.height {
+                    let source = (row * baked.width * 4) as usize;
+                    let target = (row * held.width * 4) as usize;
+                    let count = (baked.width * 4) as usize;
+                    held.scratch[target..target + count]
+                        .copy_from_slice(&baked.pixels[source..source + count]);
+                }
+                held.texture
+                    .upload(gpu, held.width, held.height, &held.scratch)
+            };
+            if uploaded.is_err() {
+                *slot = None;
+                continue;
+            }
+            held.inset_min = inset_min;
+            held.inset_max = inset_max;
         }
     }
 
@@ -191,20 +223,25 @@ impl TextLayer {
         params: &ClipParams,
         t: f32,
     ) -> Result<(), RenderError> {
-        let preferred = face_of_look(look_index(params.p[1]));
-        let other = 1 - preferred;
-        // Two fields, two borrows: the pipeline is borrowed immutably, the layer's sheet mutably.
+        let look = look_index(params.p[1]);
+        // The pass writes partial alpha (glow, ring) and the layer blend reads the destination,
+        // so the target must be black first: otherwise the word composited two frames ago tints
+        // the glow, and a freshly allocated target would make the same frame two different
+        // pictures. A clear is one `vkCmdClearColorImage`, not a shaded pass.
+        rec.clear(dst)?;
+        // A look falls back to another face when its own sheet failed to bake.
         let pipeline = &self.pipeline;
         let Some(entry) = self.layers.get_mut(layer).and_then(Option::as_mut) else {
-            return rec.clear(dst);
+            return Ok(());
         };
-        // A look falls back to the other face when its own sheet failed to bake.
-        let Some(sheet) = (if entry.sheets[preferred].is_some() {
-            entry.sheets[preferred].as_mut()
-        } else {
-            entry.sheets[other].as_mut()
-        }) else {
-            return rec.clear(dst);
+        let chosen = (0..LOOKS)
+            .map(|offset| (look + offset) % LOOKS)
+            .find(|index| entry.sheets[*index].is_some());
+        let Some(index) = chosen else {
+            return Ok(());
+        };
+        let Some(sheet) = entry.sheets[index].as_mut() else {
+            return Ok(());
         };
         let uniforms = uniforms(dst, sheet, params, frame, t);
         rec.upload_video(&mut sheet.texture)?;
@@ -249,14 +286,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn both_faces_load() {
+    fn all_three_faces_load() {
+        // One display face per look, each under its own licence file.
         assert!(
-            Face::new(FACE_DISPLAY).is_some(),
-            "the display face (Ubuntu Light) must parse; it backs the chrome and clean looks"
+            Face::new(FACE_CHROME).is_some(),
+            "Unbounded must parse; it is the chrome look"
         );
         assert!(
-            Face::new(FACE_MONO).is_some(),
-            "the mono face (Hack) must parse; it is the thorny look"
+            Face::new(FACE_SIGIL).is_some(),
+            "Grenze Gotisch must parse; it is the sigil look"
+        );
+        assert!(
+            Face::new(FACE_CLEAN).is_some(),
+            "Space Grotesk must parse; it is the clean look"
         );
     }
 
@@ -269,9 +311,6 @@ mod tests {
         assert_eq!(look_index(0.67), 2);
         assert_eq!(look_index(1.0), 2);
         assert_eq!(look_index(-3.0), 0);
-        assert_eq!(face_of_look(0), 0);
-        assert_eq!(face_of_look(1), 1);
-        assert_eq!(face_of_look(2), 0);
     }
 
     #[test]

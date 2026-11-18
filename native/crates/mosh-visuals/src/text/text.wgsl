@@ -1,18 +1,20 @@
 // One full-screen pass that draws a baked text sheet (see `mosh-visuals/src/text/sheet.rs`).
 //
-// The sheet holds a laid-out word as a signed distance field plus, in the colour channels, each
-// glyph's own cell centre and noise value. That is what lets a single pass work per glyph: a pixel
-// looks up which glyph's cell it belongs to, then resamples the field around that cell's centre for
-// the beat pop, jitter and rotation. Nothing is re-laid out per frame.
+// The sheet holds the laid-out block as ONE signed distance field plus, in the colour channels, a
+// baked surface direction and bevel depth (see `text/sheet.rs`). There are no per-glyph cells and
+// no per-glyph resampling here: a pixel's distance is the distance to the nearest edge of the
+// whole line, so a stroke a neighbour's outline, glow or bevel reaches is never cut at a cell
+// border.
 //
 // `p0..p7` (see `text::PARAMS`):
 //   p0 size      p1 font (three looks)   p2 spacing   p3 jitter
 //   p4 glitch    p5 outline              p6 beat pop  p7 scroll
 //
-// The three looks share one sheet: chrome dilates the field into a bubble and shades it with a
-// bevel normal from the field's own gradient; thorny warps the edge with noise and adds thorns;
-// clean is the field thresholded crisply. There is no full-frame flash anywhere in here: every
-// bright thing is inside the glyphs.
+// Three contemporary looks, one face each:
+//   chrome  Unbounded      liquid chrome: environment reflection, iridescent rim, soft specular
+//   sigil   Grenze Gotisch blackletter in polished silver, barbed accents, a blood-red glow
+//   clean   Space Grotesk  crisp minimal, soft shadow, thin cool rim
+// Nothing here flashes the whole frame: every bright thing is inside the glyphs.
 //
 // Uniform block (96 bytes, matches `text::UNIFORM_BYTES`):
 //   0  dst: vec2f          8  sheet: vec2f
@@ -39,9 +41,13 @@ struct TextUniforms {
 @group(0) @binding(1) var sheetT: texture_2d<f32>;
 @group(0) @binding(2) var lin: sampler;
 
-// Keep in sync with `text::SDF_RANGE`: the sheet's 0..1 range covers this many baked pixels on
-// each side of an edge.
-const SDF_RANGE: f32 = 6.0;
+// Keep in sync with `text/layout.rs::SDF_RANGE`: the sheet's 0..1 range covers this many baked
+// pixels on each side of an edge.
+const SDF_RANGE: f32 = 12.0;
+
+// Keep in sync with 	ext/layout.rs::BEVEL_PX: this many baked pixels of the field is the
+// bevel's height, which is what turns the flat distance into a rounded stroke.
+const BEVEL_PX: f32 = 9.0;
 
 fn hash11(n: f32) -> f32 {
     return fract(sin(n * 127.1) * 43758.5453);
@@ -51,24 +57,78 @@ fn hash21(p: vec2<f32>) -> f32 {
     return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
 }
 
-fn value_noise(p: vec2<f32>) -> f32 {
-    let cell = floor(p);
-    let frac = fract(p);
-    let weight = frac * frac * (3.0 - 2.0 * frac);
-    let a = hash21(cell);
-    let b = hash21(cell + vec2<f32>(1.0, 0.0));
-    let c = hash21(cell + vec2<f32>(0.0, 1.0));
-    let d = hash21(cell + vec2<f32>(1.0, 1.0));
-    return mix(mix(a, b, weight.x), mix(c, d, weight.x), weight.y);
-}
-
 fn texel(uv: vec2<f32>) -> vec4<f32> {
     return textureSampleLevel(sheetT, lin, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
+}
+
+// Filmic roll-off: a specular highlight gets bright without ever clipping to flat white.
+fn tonemap(c: vec3<f32>) -> vec3<f32> {
+    let nn = c * (2.51 * c + 0.03);
+    let dd = c * (2.43 * c + 0.59) + 0.14;
+    return clamp(nn / dd, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// x^2n by squaring: the same highlight lobe as `pow` without the transcendental.
+fn soft_power(x: f32, doublings: u32) -> f32 {
+    var value = clamp(x, 0.0, 1.0);
+    var index = 0u;
+    loop {
+        if (index >= doublings) {
+            break;
+        }
+        value = value * value;
+        index = index + 1u;
+    }
+    return value;
+}
+
+// A thin-film rim: the colour of the outer millimetre of a polished surface, from the viewing
+// angle. Never a rainbow paint job, just an iridescent edge. A triangle wave, not three cosines.
+fn iridescence(t: f32) -> vec3<f32> {
+    let phase = fract(t * 0.8 + 0.12);
+    let a = abs(phase * 2.0 - 1.0);
+    let b = abs(fract(phase + 0.3333) * 2.0 - 1.0);
+    let c = abs(fract(phase + 0.6667) * 2.0 - 1.0);
+    return vec3<f32>(0.5) + 0.5 * vec3<f32>(1.0 - 2.0 * a, 1.0 - 2.0 * b, 1.0 - 2.0 * c);
+}
+
+// A studio environment for the chrome reflection: sky above, a dark horizon, a lit floor below,
+// and two soft bands that read as reflected softboxes.
+fn environment(dir: vec3<f32>) -> vec3<f32> {
+    let up = clamp(dir.y, -1.0, 1.0);
+    let sky = mix(
+        vec3<f32>(0.44, 0.52, 0.66),
+        vec3<f32>(0.99, 0.995, 1.0),
+        smoothstep(-0.04, 0.80, up),
+    );
+    let ground = mix(
+        vec3<f32>(0.035, 0.040, 0.058),
+        vec3<f32>(0.58, 0.59, 0.64),
+        smoothstep(0.0, -0.70, up),
+    );
+    var c = mix(ground, sky, smoothstep(-0.025, 0.025, up));
+    // One thin horizon line, then the floor's soft reflection bands.
+    c = c * (1.0 - 0.42 * exp(-abs(up) * 32.0));
+    let azimuth = dir.x / (abs(dir.z) + 0.35);
+    let band = pow(0.5 + 0.5 * sin(azimuth * 2.0 + up * 5.0), 3.0);
+    return c + vec3<f32>(0.15, 0.19, 0.27) * band * (1.0 - abs(up));
+}
+
+// Premultiplied over: `src` in front of `base`.
+fn over(base: vec4<f32>, src: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(src.rgb + base.rgb * (1.0 - src.a), src.a + base.a * (1.0 - src.a));
 }
 
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let res = U.dst;
+    // A layer target is V-mirrored relative to what the stage shows: the compositor flips every
+    // layer once when it writes the output (mosh-render's `fullscreen.vert` puts uv 0 at the
+    // bottom, so sampling a layer into the output reverses it). Every other visualizer flips its
+    // own source for the same reason (see `camera/overlay_camera.wgsl`). So the word is drawn
+    // mirrored here and reads upright on the stage; `screen` is the audience's coordinate, y
+    // down from the top of the picture.
+    let screen = vec2<f32>(position.x, res.y - position.y);
     let look = clamp(U.p0.y, 0.0, 0.999) * 3.0;
     let size = clamp(U.p0.x, 0.0, 1.0);
     let spacing = 0.92 + clamp(U.p0.z, 0.0, 1.0) * 0.55;
@@ -82,12 +142,12 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let high = clamp(U.audio.z, 0.0, 1.0);
 
     // The block's aspect comes from what was baked, so the glyphs keep their shape at any size.
-    let block_aspect = ((U.inset_max.x - U.inset_min.x) * U.sheet.x)
-        / max((U.inset_max.y - U.inset_min.y) * U.sheet.y, 1.0);
+    let span = U.inset_max - U.inset_min;
+    let block_aspect = (span.x * U.sheet.x) / max(span.y * U.sheet.y, 1.0);
 
     // The beat: one envelope per beat, plus a slow breath from the low band.
     let beat_env = exp(-fract(U.beat) * 6.0) * pop_amount;
-    var block_h = res.y * (0.14 + 0.44 * size) * (1.0 + beat_env * 0.10);
+    var block_h = res.y * (0.14 + 0.44 * size) * (1.0 + beat_env * 0.08);
     // A wide word stops growing when it would leave the frame, so `size` never crops the letters;
     // spacing widens the block, so it counts against the same fit.
     let fit_h = res.x * 0.86 / max(block_aspect * spacing, 0.0001);
@@ -97,187 +157,255 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let cycle = fract(U.time * scroll * 0.07);
     let centre_y = mix(0.5, 1.5 - 2.0 * cycle, step(0.001, scroll));
 
-    let offset = (position.xy - vec2<f32>(0.5 * res.x, centre_y * res.y)) / block_h;
+    // Jitter wobbles the whole block on a 24 Hz clock. A per-glyph shift would tear the line at
+    // every glyph boundary, which is the same defect as a clipped cell, so the wobble is coherent.
+    let clock = floor(U.time * 24.0);
+    let wobble = vec2<f32>(
+        hash11(clock * 0.73 + 1.0) * 2.0 - 1.0,
+        hash11(clock * 1.31 + 7.0) * 2.0 - 1.0,
+    );
+    let angle = (hash11(clock * 2.17 + 3.0) - 0.5) * 0.03 * jitter;
+
+    var offset = (screen - vec2<f32>(0.5 * res.x, centre_y * res.y)) / block_h;
+    let cs = cos(angle);
+    let sn = sin(angle);
+    offset = vec2<f32>(cs * offset.x - sn * offset.y, sn * offset.x + cs * offset.y);
+    offset = offset + wobble * (0.008 * jitter);
+
     var block_uv = vec2<f32>(offset.x / max(block_aspect, 0.0001) + 0.5, offset.y + 0.5);
     // `spacing` widens the block: a screen position maps closer to the block's centre.
     block_uv.x = 0.5 + (block_uv.x - 0.5) / spacing;
 
-    // Most of the frame is empty: outside the block (plus room for the outline and the glow) there
-    // is nothing to sample, so the pass costs a compare per pixel there.
-    if (any(abs(block_uv - vec2<f32>(0.5)) > vec2<f32>(0.58))) {
+    // Every pixel outside the sheet (block plus its margin, in block units) has nothing to sample:
+    // the pass costs a compare there.
+    let margin_u = U.inset_min.x / max(span.x, 0.000001);
+    let margin_v = U.inset_min.y / max(span.y, 0.000001);
+    if (abs(block_uv.x - 0.5) > 0.5 + margin_u || abs(block_uv.y - 0.5) > 0.5 + margin_v) {
         return vec4<f32>(0.0);
     }
 
     var sheet_uv = mix(U.inset_min, U.inset_max, block_uv);
 
     // Glitch: whole rows of the sheet slide sideways on a fast clock.
-    let inset = U.inset_max - U.inset_min;
     let slice_row = floor(sheet_uv.y * 42.0);
     let slice_clock = floor(U.time * 11.0);
     let slice_on = step(1.0 - glitch * 0.38, hash21(vec2<f32>(slice_row, slice_clock)));
     let slice_shift = (hash21(vec2<f32>(slice_row * 3.7, slice_clock)) - 0.5) * 0.05 * glitch;
-    sheet_uv = sheet_uv + vec2<f32>(slice_shift * slice_on * inset.x, 0.0);
+    sheet_uv = sheet_uv + vec2<f32>(slice_shift * slice_on * span.x, 0.0);
 
-    // The cell this pixel belongs to, before any per-glyph transform.
-    let base = texel(sheet_uv);
-    let cell = base.rg;
-    let noise = base.b;
-    let present = step(0.0005, max(max(base.r, base.g), max(base.b, base.a)));
-
-    // Per-glyph jitter and rotation, in sheet pixels about the cell centre.
-    let clock = floor(U.time * 24.0);
-    let jitter_px = vec2<f32>(
-        hash11(noise * 131.0 + clock) - 0.5,
-        hash11(noise * 197.0 + clock * 1.7) - 0.5,
-    ) * jitter * (0.03 + 0.09 * glitch) * (0.4 + high) * block_h;
-    let local_px = (sheet_uv - cell) * U.sheet;
-    // A glyph may only be moved a little about its own cell centre: a pixel whose own cell has no
-    // ink has no glyph to be driven by, so a large per-glyph turn would tear the word at the
-    // borders between cells. The thorny look's crookedness comes from the baked face and the
-    // noise-warped edge below, not from turning glyphs here.
-    let angle = (hash11(noise * 71.0 + clock) - 0.5) * 0.05 * jitter * (0.3 + glitch);
-    let cs = cos(angle);
-    let sn = sin(angle);
-    let rotated = vec2<f32>(
-        cs * local_px.x - sn * local_px.y,
-        sn * local_px.x + cs * local_px.y,
-    );
-    // Per-glyph beat pop: each letter grows around its own cell centre, inside its PAD.
-    let glyph_pop = 1.0 + beat_env * 0.12 + low * pop_amount * 0.05;
-    let glyph_uv = cell + (rotated + jitter_px) / max(glyph_pop, 0.2) / U.sheet;
-
-    // Distance in screen pixels: positive outside the ink, negative inside.
-    let inset_h_px = (U.inset_max.y - U.inset_min.y) * U.sheet.y;
-    let scale = block_h / max(inset_h_px, 1.0);
-    // The base tap already carries the field; only a transformed glyph needs a second one.
-    var field = base.a;
-    if (any(abs(glyph_uv - sheet_uv) > vec2<f32>(0.0002))) {
-        field = texel(glyph_uv).a;
+    let sample = texel(sheet_uv);
+    // Past the field's range every term below is zero: the glow fades out well before it, and the
+    // body, ring and barbs are all measured from the distance. Most of the block is that empty
+    // space between letters, so this one tap is what the pass costs there.
+    if (sample.a <= 0.0) {
+        return vec4<f32>(0.0);
     }
-    var edge = (0.5 - field) * (2.0 * SDF_RANGE) * scale;
+    let distance_baked = (0.5 - sample.a) * (2.0 * SDF_RANGE);
+    // Screen pixels per baked pixel: the distance, the outline and the glow all live in screen
+    // space so they stay the same weight at every `size`.
+    let scale = block_h / max(span.y * U.sheet.y, 1.0);
+    let d0 = distance_baked * scale;
+    // The distance is only meaningful out to the sheet's range; every effect measured from it
+    // (barbs, glow) must finish inside this, or it would paint the sheet's margin.
+    let field_reach = SDF_RANGE * scale;
 
-    // Bold: the chrome look is a bubble, clean is a medium weight, thorny keeps its thin cuts.
-    var bold = 0.008 * block_h;
+    // Baked surface: the outward direction across the stroke comes from the sheet, the height
+    // from the distance. The bevel is a few *screen* pixels, never a fraction of the stroke: at
+    // 540p a wide word is drawn small, and a baked-width bevel would swallow the whole glyph.
+    let facing = sample.rg * 2.0 - vec2<f32>(1.0);
+    let bevel = max(0.008 * block_h, 1.0);
+    let depth = clamp(-d0 / bevel, 0.0, 1.0);
+
+    // The stroke's weight, before anything is added to the silhouette.
+    var bold = 0.011 * block_h;
     if (look < 1.0) {
-        bold = (0.042 + 0.012 * low) * block_h;
-    } else if (look >= 2.0) {
-        bold = 0.007 * block_h;
-    } else {
-        bold = 0.004 * block_h;
-    }
-
-    // Thorny: noise-warped edge plus spikes radiating from the cell centre.
-    if (look >= 1.0 && look < 2.0) {
-        let warp = (value_noise(local_px * 0.11 + vec2<f32>(U.time * 1.6, 0.0)) * 2.0 - 1.0)
-            + (value_noise(local_px * 0.29 - vec2<f32>(U.time * 0.9, 3.0)) * 2.0 - 1.0) * 0.6;
-        edge = edge - warp * (0.016 + 0.03 * jitter + 0.02 * glitch) * block_h;
-        let radius = length(local_px);
-        let reach = smoothstep(0.10 * block_h, 0.55 * block_h, radius);
-        let thorn = pow(abs(sin(atan2(local_px.y, local_px.x) * 7.0 + noise * 6.283)), 14.0);
-        edge = edge - thorn * reach * (0.010 + 0.020 * glitch) * block_h;
-    }
-
-    let aa = max(fwidth(edge), 0.0015) * 1.1;
-    let body = smoothstep(aa, -aa, edge - bold);
-    let outline_px = outline * 0.045 * block_h + 0.002 * block_h;
-    let ring = clamp(smoothstep(aa, -aa, edge - bold + outline_px) - body, 0.0, 1.0);
-    let glow = exp(-max(edge - bold, 0.0) / max(0.035 * block_h, 0.001))
-        * (0.10 + 0.30 * high + 0.20 * intensity + 0.15 * clamp(U.loud, 0.0, 1.0));
-    let dome = smoothstep(0.0, 0.20 * block_h, -edge);
-
-    // Where the ink ends, inside: the bevel, the acid rim, the clean edge line. The band is a
-    // fixed slice of the block's height, so a thin stroke keeps a dark core instead of being
-    // swallowed by its own rim.
-    let rim_width = max(0.8, 0.012 * block_h);
-    let edge_band = clamp(1.0 - smoothstep(0.0, rim_width, -edge), 0.0, 1.0);
-
-    // Wet look: the bevel is lit from the field's own depth and the glyph's vertical position.
-    // The field's screen-space gradient is not used here: an 8-bit field's derivative is noisy
-    // enough to dither the fill.
-    let vy = clamp(0.5 - (sheet_uv.y - cell.y) * U.sheet.y / max(inset_h_px, 1.0), 0.0, 1.0);
-    let up = clamp(vy * 0.90 + (dome - 0.5) * 0.25, 0.0, 1.0);
-
-    var fill = vec3<f32>(1.0);
-    var top_colour = vec3<f32>(1.0);
-    var ring_colour = vec3<f32>(0.02, 0.03, 0.06);
-    var glow_colour = vec3<f32>(0.5, 0.7, 1.0);
-    var ring_strength = 0.9;
-    var inner_amount = 0.35;
-    var glow_amount = 1.0;
-
-    if (look < 1.0) {
-        // Y2K liquid chrome: sky above the horizon, a dark horizon line, the floor's reflection
-        // below it, then a silver base. Four bands, because that is what reads as metal.
-        fill = vec3<f32>(0.10, 0.14, 0.26);
-        fill = mix(fill, vec3<f32>(0.95, 0.98, 1.0), smoothstep(0.28, 0.44, up));
-        fill = mix(fill, vec3<f32>(0.02, 0.03, 0.07), smoothstep(0.44, 0.50, up));
-        fill = mix(fill, vec3<f32>(0.52, 0.66, 0.92), smoothstep(0.50, 0.64, up));
-        fill = mix(fill, vec3<f32>(1.0, 1.0, 1.0), smoothstep(0.70, 0.94, up));
-        fill = fill + vec3<f32>(1.0) * pow(dome, 20.0) * 0.30;
-        fill = fill + vec3<f32>(0.20, 0.55, 0.95) * (1.0 - up) * dome * 0.25;
-        top_colour = vec3<f32>(0.95, 0.99, 1.0);
-        ring_colour = vec3<f32>(0.55, 0.74, 1.0);
-        ring_strength = 0.60;
-        glow_colour = vec3<f32>(0.35, 0.75, 1.0);
-        inner_amount = 0.85;
+        bold = (0.017 + 0.006 * low) * block_h;
     } else if (look < 2.0) {
-        // Cybersigil: near-black ink, an acid contour, coarse magenta abrasion, thorns.
-        fill = mix(vec3<f32>(0.010, 0.014, 0.010), vec3<f32>(0.06, 0.11, 0.03), dome * 0.9);
-        let abrasion = smoothstep(
-            0.62,
-            0.98,
-            value_noise(vec2<f32>(local_px.x * 0.09, local_px.y * 0.30) + vec2<f32>(0.0, U.time * 3.0)),
-        );
-        fill = mix(fill, vec3<f32>(0.42, 0.02, 0.24), abrasion * 0.55);
-        top_colour = vec3<f32>(0.55, 1.0, 0.25);
-        ring_colour = vec3<f32>(0.45, 1.0, 0.20);
-        ring_strength = 1.0;
-        glow_colour = vec3<f32>(0.35, 0.90, 0.20);
-        inner_amount = 0.70;
-        glow_amount = 0.45;
-    } else {
-        // Clean: a bright grotesk with a thin edge line.
-        fill = mix(vec3<f32>(1.0), vec3<f32>(0.66, 0.78, 1.0), clamp(vy, 0.0, 1.0) * 0.9);
-        fill = fill * (0.80 + 0.30 * dome);
-        top_colour = vec3<f32>(1.0, 1.0, 1.0);
-        ring_colour = vec3<f32>(0.62, 0.76, 1.0);
-        ring_strength = 0.5;
-        glow_colour = vec3<f32>(0.50, 0.70, 1.0);
-        inner_amount = 0.25;
+        // The blackletter face's default instance is a hairline; a polished metal needs a stroke.
+        bold = 0.020 * block_h;
     }
 
-    var colour = fill * body;
-    colour = mix(colour, top_colour, clamp(edge_band * inner_amount, 0.0, 1.0) * body);
+    // Barbs (sigil only): sharp accents that grow out of the strokes. They are geometry in the
+    // field, not a wobble: a narrow periodic tooth shifted outward along the distance, so the
+    // silhouette gets points while the stroke itself stays crisp. Every part of the pattern is
+    // measured from the *body's* edge (`d0 - bold`), so it can never hatch the letter itself.
+    var shape = d0;
+    var barb_tip = 0.0;
+    if (look >= 1.0 && look < 2.0) {
+        // Short enough to stay inside the field's range, so a spike is always attached to a
+        // stroke and never a band of its own out in the margin.
+        let barb_len = min((0.045 + 0.015 * glitch) * block_h, 0.40 * field_reach);
+        let lattice = dot(offset * block_h, vec2<f32>(0.82, 0.57)) / max(barb_len * 2.6, 0.001);
+        let teeth = pow(abs(sin(lattice * 3.14159)), 34.0);
+        let beyond = d0 - bold;
+        let outside = smoothstep(0.05 * barb_len, 0.55 * barb_len, beyond);
+        let near_edge = outside * (1.0 - smoothstep(0.9 * barb_len, 1.3 * barb_len, beyond));
+        shape = d0 - teeth * near_edge * barb_len;
+        barb_tip = clamp(smoothstep(0.0, 0.7 * barb_len, beyond), 0.0, 1.0) * teeth * near_edge;
+    }
+
+    // The antialiasing width in distance units: the field is in screen pixels and its gradient
+    // across an edge is ~1, so one pixel of coverage is one unit. A constant also keeps the
+    // derivative math out of the early-out branch, where those derivatives are undefined.
+    let aa = 0.9;
+    let body = smoothstep(aa, -aa, shape - bold);
+
+    // The rim just outside the body: one number for its weight, one for where it starts.
+    var ring_width = 0.002 * block_h + outline * 0.030 * block_h;
+    if (look >= 1.0 && look < 2.0) {
+        ring_width = 0.002 * block_h + outline * 0.022 * block_h;
+    }
+    let ring_outer = smoothstep(aa, -aa, shape - bold - ring_width);
+    let ring = clamp(ring_outer - body, 0.0, 1.0);
+
+    // Glow, in screen pixels. Its width is a fraction of the block, and it is faded out before the
+    // field's range ends so the sheet's margin can never show as a soft rectangle.
+    var glow_width = 0.020 * block_h;
+    var glow_colour = vec3<f32>(0.62, 0.72, 0.88);
+    var glow_strength = 0.055 + 0.05 * high + 0.03 * intensity;
+    if (look < 1.0) {
+        glow_width = 0.030 * block_h;
+        glow_colour = vec3<f32>(0.36, 0.72, 1.0);
+        glow_strength = 0.20 + 0.20 * high + 0.14 * intensity;
+    } else if (look < 2.0) {
+        glow_width = 0.032 * block_h;
+        glow_colour = vec3<f32>(0.92, 0.09, 0.14);
+        glow_strength = 0.36 + 0.26 * low + 0.16 * intensity;
+    }
+    let reach_fade = 1.0 - smoothstep(0.30 * field_reach, 0.65 * field_reach, shape - bold);
+    // A rational falloff instead of `exp`: same soft halo, no transcendental per pixel.
+    let falloff = max(shape - bold, 0.0) / max(glow_width, 0.001);
+    let glow = (1.0 / (1.0 + falloff * falloff * falloff)) * glow_strength * reach_fade;
+
+    // Per-look shading. Each look computes only the lighting it uses: a crisp fill has no business
+    // paying for a chrome reflection.
+    var body_colour = vec3<f32>(1.0);
+    var ring_colour = vec3<f32>(0.02, 0.03, 0.06);
+    var ring_strength = 0.55;
+    let view = vec3<f32>(0.0, 0.0, 1.0);
+    let light = normalize(vec3<f32>(-0.42, 0.55, 0.72));
+
+    if (look < 1.0) {
+        // Chrome: liquid metal mirroring the studio environment, a thin iridescent rim, one soft
+        // specular. The reflection is warped a little so the surface reads as a liquid.
+        let shoulder = sqrt(max(1.0 - depth * depth, 0.0));
+        let normal = normalize(vec3<f32>(facing * shoulder, 0.16 + 0.84 * depth));
+        let ndl = clamp(dot(normal, light), 0.0, 1.0);
+        let halfway = normalize(light + view);
+        let specular = soft_power(clamp(dot(normal, halfway), 0.0, 1.0), 6);
+        let fresnel = soft_power(1.0 - clamp(normal.z, 0.0, 1.0), 3);
+        let film = mix(
+            vec3<f32>(0.72, 0.80, 1.0),
+            iridescence(normal.z * 0.6 + normal.y * 0.4),
+            0.45,
+        );
+        let warp = vec2<f32>(
+            sin(block_uv.x * 9.0 + block_uv.y * 5.0),
+            cos(block_uv.y * 8.0 - block_uv.x * 4.0),
+        ) * 0.05;
+        let reflected = reflect(-view, normal);
+        var c = environment(reflected + vec3<f32>(warp.x, warp.y, 0.0))
+            + vec3<f32>(0.03, 0.035, 0.05);
+        c = c * (0.82 + 0.34 * ndl);
+        c = c + film * fresnel * 0.55;
+        c = c + vec3<f32>(1.0) * specular * 0.40;
+        body_colour = tonemap(c * 1.12);
+        ring_colour = mix(vec3<f32>(0.03, 0.04, 0.09), film, 0.30);
+        ring_strength = 0.50;
+    } else if (look < 2.0) {
+        // Sigil: polished silver, brushed along the stroke, an iridescent edge and a red glow.
+        let shoulder = sqrt(max(1.0 - depth * depth, 0.0));
+        let normal = normalize(vec3<f32>(facing * shoulder, 0.16 + 0.84 * depth));
+        let halfway = normalize(light + view);
+        let specular = soft_power(clamp(dot(normal, halfway), 0.0, 1.0), 6);
+        let fresnel = soft_power(1.0 - clamp(normal.z, 0.0, 1.0), 3);
+        let film = mix(
+            vec3<f32>(0.78, 0.84, 1.0),
+            iridescence(normal.z * 0.6 + normal.y * 0.4),
+            0.35,
+        );
+        let silver = mix(
+            vec3<f32>(0.14, 0.15, 0.18),
+            vec3<f32>(0.94, 0.95, 0.98),
+            smoothstep(0.02, 0.55, depth),
+        );
+        let brush = 0.5 + 0.5 * sin((offset.y * 9.0 + offset.x * 2.0) + facing.y * 3.0);
+        var c = silver * (0.74 + 0.32 * brush);
+        c = c + film * fresnel * 0.70;
+        c = c + vec3<f32>(1.0) * specular * 1.10;
+        c = c + vec3<f32>(0.70, 0.05, 0.10) * barb_tip * 0.9;
+        body_colour = tonemap(c * 1.05);
+        ring_colour = mix(vec3<f32>(0.045, 0.028, 0.032), film, 0.14);
+        ring_strength = 0.30;
+    } else {
+        // Clean: near-white paper, a cool edge, one soft shadow, no chrome.
+        body_colour = mix(
+            vec3<f32>(0.86, 0.89, 0.96),
+            vec3<f32>(0.995, 0.998, 1.0),
+            smoothstep(0.0, 0.22, depth),
+        );
+        body_colour = body_colour * 1.0;
+        ring_colour = vec3<f32>(0.07, 0.09, 0.14);
+        ring_strength = 0.16;
+    }
+
+    var acc = vec4<f32>(0.0);
+
+    // Glow first, behind everything.
+    acc = over(
+        acc,
+        vec4<f32>(glow_colour * glow, clamp(glow, 0.0, 1.0)),
+    );
+
+    // Clean gets a soft shadow; the other looks are lit from inside.
+    if (look >= 2.0) {
+        let shadow_delta = vec2<f32>(0.012 / max(block_aspect, 0.0001), 0.014);
+        let shadow_sample = texel(sheet_uv - shadow_delta);
+        let shadow_distance = (0.5 - shadow_sample.a) * (2.0 * SDF_RANGE) * scale;
+        let shadow_fade = 1.0 - smoothstep(0.35 * SDF_RANGE * scale, 0.95 * SDF_RANGE * scale, shadow_distance);
+        let shadow = (1.0 - smoothstep(-0.04 * block_h, 0.10 * block_h, shadow_distance))
+            * shadow_fade
+            * (1.0 - body)
+            * 0.42;
+        acc = over(acc, vec4<f32>(vec3<f32>(0.015, 0.02, 0.04) * shadow, shadow));
+    }
+
+    // The rim.
+    acc = over(
+        acc,
+        vec4<f32>(ring_colour * ring * ring_strength, ring * ring_strength),
+    );
+
+    // The body, with the beat lifting its fill rather than clipping it.
+    var fill = body_colour * (1.0 + beat_env * 0.14);
+    if (look >= 1.0 && look < 2.0) {
+        fill = fill + vec3<f32>(1.0, 0.92, 0.94) * barb_tip * 0.18;
+    }
+    acc = over(acc, vec4<f32>(fill * body, body));
 
     // Chromatic split: two more taps of the field, pushed apart by glitch and the high band. The
     // taps are skipped when there is no glitch to show, which is most frames.
     if (glitch > 0.06) {
-        let split_px = (0.4 + 3.0 * glitch) * (0.4 + high);
+        let split_px = (0.5 + 3.0 * glitch) * (0.4 + high);
         let split_uv = vec2<f32>(split_px / max(scale, 0.0001) / U.sheet.x, 0.0);
-        let field_r = texel(glyph_uv + split_uv).a;
-        let field_b = texel(glyph_uv - split_uv).a;
-        let edge_r = (0.5 - field_r) * (2.0 * SDF_RANGE) * scale;
-        let edge_b = (0.5 - field_b) * (2.0 * SDF_RANGE) * scale;
-        let body_r = smoothstep(aa, -aa, edge_r - bold);
-        let body_b = smoothstep(aa, -aa, edge_b - bold);
-        colour = colour + vec3<f32>(0.95, 0.12, 0.18) * clamp(body_r - body, 0.0, 1.0) * (0.35 + glitch);
-        colour = colour + vec3<f32>(0.12, 0.40, 1.0) * clamp(body_b - body, 0.0, 1.0) * (0.35 + glitch);
+        let field_r = (0.5 - texel(sheet_uv + split_uv).a) * (2.0 * SDF_RANGE) * scale;
+        let field_b = (0.5 - texel(sheet_uv - split_uv).a) * (2.0 * SDF_RANGE) * scale;
+        let body_r = smoothstep(aa, -aa, field_r - bold);
+        let body_b = smoothstep(aa, -aa, field_b - bold);
+        acc = acc + vec4<f32>(
+            vec3<f32>(0.95, 0.12, 0.18) * clamp(body_r - body, 0.0, 1.0) * (0.30 + glitch)
+                + vec3<f32>(0.10, 0.36, 1.0) * clamp(body_b - body, 0.0, 1.0) * (0.30 + glitch),
+            0.0,
+        );
     }
-
-    colour = colour + ring_colour * ring * ring_strength;
-    colour = colour + glow_colour * glow * 0.6 * glow_amount;
-
-    var alpha = clamp(body + ring * ring_strength * 0.9 + glow * 0.35 * glow_amount, 0.0, 1.0);
 
     // Scramble: at heavy glitch, square holes open and close on the beat clock.
     if (glitch > 0.25) {
-        let blocks = floor(position.xy / (6.0 + 16.0 * glitch));
+        let blocks = floor(screen / (6.0 + 16.0 * glitch));
         let roll = hash21(blocks + vec2<f32>(floor(U.time * 9.0), glitch * 13.0));
         let cut = step(roll, 0.10 * glitch);
-        colour = colour * (1.0 - cut);
-        alpha = alpha * (1.0 - cut);
+        acc = acc * (1.0 - cut);
     }
 
-    // Pixels outside every glyph cell are the sheet's margin: nothing to draw there.
-    return vec4<f32>(colour * present, alpha * present);
+    return vec4<f32>(clamp(acc.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(acc.a, 0.0, 1.0));
 }

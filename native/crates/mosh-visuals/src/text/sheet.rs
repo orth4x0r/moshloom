@@ -1,25 +1,27 @@
-//! The baked text sheet: one image per face, made when the words change.
+﻿//! The baked text sheet: one image per face, made when the words change.
 //!
 //! # What a sheet holds
 //!
 //! The sheet is the laid-out block with a margin, in the byte order `mosh_render::VideoTexture`
-//! takes (B, G, R, A), and every pixel is four things at once:
+//! takes (B, G, R, A). Every pixel carries the field of the **whole line**, not of one glyph's
+//! cell: a stroke that a neighbouring letter's outline, glow or bevel reaches keeps a real
+//! distance there instead of being cut at a cell edge:
 //!
 //! | byte | sampled as | meaning |
 //! | --- | --- | --- |
-//! | 0 | `.r` | the glyph's cell centre x, 0..1 across the sheet |
-//! | 1 | `.g` | the glyph's cell centre y |
-//! | 2 | `.b` | the glyph's own noise value, 0..1 |
+//! | 2 | `.r` | the outward surface direction x, encoded `v * 0.5 + 0.5` |
+//! | 1 | `.g` | the outward surface direction y, encoded `v * 0.5 + 0.5` |
+//! | 0 | `.b` | unused, zero (the bevel's depth is the distance itself, see `text.wgsl`) |
 //! | 3 | `.a` | the signed distance field, 0.5 = the edge |
 //!
-//! The cell channels are what lets the shader work per glyph in a single full-screen pass: a pixel
-//! looks up its own glyph's centre and noise, then resamples the distance field around that
-//! centre for the beat pop, jitter and rotation. `set_text` builds this; `draw` never touches a
-//! glyph again.
+//! # Composing a line from glyph tiles
 //!
-//! Cells are written left to right and the first glyph to reach a pixel owns that pixel's cell
-//! channels; the distance field takes the union (`max`), so a kerned pair's overlapping pixel is
-//! still inked.
+//! Each glyph's field is cached on its [`Face`] as a tile: the ink box plus [`super::layout::PAD`].
+//! A tile is the *true* distance to that glyph's edge out to the field's range, so taking the
+//! nearest tile per pixel (`max` of the distance, which grows inside) gives the line's own
+//! distance field. That is what makes a text change cheap once the characters are known, and it
+//! is why there is no cell to clip at: the tile a pixel belongs to is whichever glyph is actually
+//! nearest, decided per pixel, not by a grid.
 //!
 //! # Size
 //!
@@ -40,8 +42,8 @@ pub const MAX_SHEET_WIDTH: u32 = 1792;
 pub const MAX_SHEET_HEIGHT: u32 = 1024;
 
 /// Sheet sizes round up to these steps (pixels), so a text change usually reuses the texture.
-const WIDTH_STEP: u32 = 256;
-const HEIGHT_STEP: u32 = 64;
+const WIDTH_STEP: u32 = 64;
+const HEIGHT_STEP: u32 = 32;
 
 /// A laid-out string, rasterised into one image.
 pub struct Sheet {
@@ -57,14 +59,17 @@ pub struct Sheet {
 }
 
 impl Sheet {
-    /// Lays `text` out and rasterises it. `None` when there is nothing to draw (empty or
-    /// whitespace-only text), which the layer renders as transparent black.
+    /// Lays `text` out and composes its sheet from the face's cached glyph tiles. `None` when
+    /// there is nothing to draw (empty or whitespace-only text), which the layer renders as
+    /// transparent black.
     pub fn bake(face: &Face, text: &str) -> Option<Sheet> {
         let mut px = BAKE_PX;
         let mut layout = face.layout(text, px);
         if layout.glyphs.is_empty() {
             return None;
         }
+        // A word too long for one texture is re-baked smaller; the field still resolves the edge,
+        // it just measures fewer em pixels.
         for _ in 0..3 {
             let (width, height) = sheet_size(&layout);
             if width <= MAX_SHEET_WIDTH && height <= MAX_SHEET_HEIGHT {
@@ -79,35 +84,35 @@ impl Sheet {
             }
         }
 
-        let (width, height) = sheet_size(&layout);
+        let mask_w = layout.block_w.max(1) as u32 + 2 * MARGIN;
+        let mask_h = layout.block_h.max(1) as u32 + 2 * MARGIN;
+        let width = bucket(mask_w, WIDTH_STEP).min(MAX_SHEET_WIDTH);
+        let height = bucket(mask_h, HEIGHT_STEP).min(MAX_SHEET_HEIGHT);
         let mut pixels = vec![0u8; (width * height * 4) as usize];
+        let pad = PAD;
+
         for glyph in &layout.glyphs {
-            let cell_x = MARGIN as i32 + glyph.x;
-            let cell_y = MARGIN as i32 + glyph.y;
-            let centre_x =
-                quantise((cell_x as f32 + glyph.cell_w as f32 * 0.5) / width.max(1) as f32);
-            let centre_y =
-                quantise((cell_y as f32 + glyph.cell_h as f32 * 0.5) / height.max(1) as f32);
-            let noise = quantise(glyph.random);
-            for row in 0..glyph.cell_h {
-                for column in 0..glyph.cell_w {
-                    let x = cell_x + column as i32;
-                    let y = cell_y + row as i32;
-                    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+            let tile = &glyph.glyph;
+            // The tile starts `PAD` pixels before the glyph's ink box.
+            let origin_x = MARGIN as i32 + glyph.x - pad;
+            let origin_y = MARGIN as i32 + glyph.y - pad;
+            for row in 0..tile.tile_h {
+                let y = origin_y + row as i32;
+                if y < 0 || y >= height as i32 {
+                    continue;
+                }
+                let source = &tile.tile[row * tile.tile_w * 4..][..tile.tile_w * 4];
+                let target = (y as usize * width as usize) * 4;
+                for (column, texel) in source.as_chunks::<4>().0.iter().enumerate() {
+                    let x = origin_x + column as i32;
+                    if x < 0 || x >= width as i32 {
                         continue;
                     }
-                    let offset = ((y as u32 * width + x as u32) * 4) as usize;
-                    if pixels[offset] == 0
-                        && pixels[offset + 1] == 0
-                        && pixels[offset + 2] == 0
-                        && pixels[offset + 3] == 0
-                    {
-                        pixels[offset] = centre_x;
-                        pixels[offset + 1] = centre_y;
-                        pixels[offset + 2] = noise;
+                    let at = target + x as usize * 4;
+                    // The nearest glyph wins the pixel: its distance, its surface direction.
+                    if texel[3] > pixels[at + 3] {
+                        pixels[at..at + 4].copy_from_slice(texel);
                     }
-                    let distance = glyph.sdf[(row * glyph.cell_w + column) as usize];
-                    pixels[offset + 3] = pixels[offset + 3].max(distance);
                 }
             }
         }
@@ -122,19 +127,21 @@ impl Sheet {
         })
     }
 
-    /// The block's inner rectangle in sheet UV: `(min, max)`, the space the shader maps a block
-    /// coordinate into.
-    pub fn inset(&self) -> ([f32; 2], [f32; 2]) {
+    /// The block's inner rectangle in the UV of a `width` x `height` sheet: `(min, max)`, the
+    /// space the shader maps a block coordinate into. The texture may be larger than this bake
+    /// (its size is reused between texts), so the block always sits at its top-left margin.
+    pub fn inset_in(&self, width: u32, height: u32) -> ([f32; 2], [f32; 2]) {
         let min = [
-            self.margin as f32 / self.width as f32,
-            self.margin as f32 / self.height as f32,
+            self.margin as f32 / width as f32,
+            self.margin as f32 / height as f32,
         ];
         let max = [
-            (self.margin + self.block_w) as f32 / self.width as f32,
-            (self.margin + self.block_h) as f32 / self.height as f32,
+            (self.margin + self.block_w) as f32 / width as f32,
+            (self.margin + self.block_h) as f32 / height as f32,
         ];
         (min, max)
     }
+
 }
 
 /// The texture's size for a laid-out block.
@@ -156,21 +163,17 @@ fn bucket(value: u32, step: u32) -> u32 {
     value.div_ceil(step) * step
 }
 
-fn quantise(value: f32) -> u8 {
-    (value.clamp(0.0, 1.0) * 255.0).round() as u8
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ubuntu() -> Face {
-        Face::new(crate::text::FACE_DISPLAY).expect("Ubuntu Light")
+    fn unbounded() -> Face {
+        Face::new(crate::text::FACE_CHROME).expect("Unbounded")
     }
 
     #[test]
     fn an_empty_text_has_no_sheet() {
-        let face = ubuntu();
+        let face = unbounded();
         for text in ["", " ", "\n\n", " \t "] {
             assert!(
                 Sheet::bake(&face, text).is_none(),
@@ -181,7 +184,7 @@ mod tests {
 
     #[test]
     fn the_sheet_holds_the_block_and_its_margin() {
-        let face = ubuntu();
+        let face = unbounded();
         let sheet = Sheet::bake(&face, "ILANA").expect("a sheet");
         assert!(sheet.width >= sheet.block_w + 2 * MARGIN);
         assert!(sheet.height >= sheet.block_h + 2 * MARGIN);
@@ -207,7 +210,7 @@ mod tests {
 
     #[test]
     fn the_margin_is_empty() {
-        let face = ubuntu();
+        let face = unbounded();
         let sheet = Sheet::bake(&face, "ILANA").expect("a sheet");
         let at = |x: u32, y: u32| {
             let offset = ((y * sheet.width + x) * 4) as usize;
@@ -218,8 +221,8 @@ mod tests {
                 sheet.pixels[offset + 3],
             ]
         };
-        // The sheet's outer two pixels are empty: a glyph cell's PAD may reach into the rest of
-        // the margin, but nothing is allowed to touch the edge a bilinear sample clamps at.
+        // The sheet's outer pixels are empty: the glyphs' own padding is inside the sheet, and
+        // nothing is allowed to touch the edge a bilinear sample clamps at.
         for (x, y) in [
             (0, 0),
             (1, 1),
@@ -244,13 +247,13 @@ mod tests {
         );
         assert!(
             middle != [0, 0, 0, 0],
-            "the block's centre should be a glyph cell pixel"
+            "the block's centre should be a field pixel"
         );
     }
 
     #[test]
     fn the_field_is_half_scale_at_the_ink_edge() {
-        let face = ubuntu();
+        let face = unbounded();
         let sheet = Sheet::bake(&face, "I").expect("a sheet");
         let field: Vec<u8> = sheet.pixels.chunks(4).map(|pixel| pixel[3]).collect();
         let inside = field.iter().filter(|value| **value > 160).count();
@@ -261,4 +264,77 @@ mod tests {
             "most of the sheet is void: {outside} vs {inside}"
         );
     }
+
+    /// The defect this task fixes: a per-glyph cell clipped the field at its own border, so the
+    /// sheet had a straight step at every cell edge. A real distance field is 1-Lipschitz: no two
+    /// neighbouring pixels may differ by more than one pixel of distance, which is
+    /// `255 / (2 * SDF_RANGE)` levels. Clipped cells produced steps of 50-200 levels, and two
+    /// glyphs' padded cells overlapping cut each other the same way.
+    #[test]
+    fn a_baked_line_has_no_cell_seams() {
+        let face = unbounded();
+        let step = (255.0 / (2.0 * super::super::layout::SDF_RANGE)).ceil() as i32 + 3;
+        for text in ["ILANA", "MW", "AV", "THE Loom knows"] {
+            let sheet = Sheet::bake(&face, text).expect("a sheet");
+            let a =
+                |x: u32, y: u32| i32::from(sheet.pixels[((y * sheet.width + x) * 4 + 3) as usize]);
+            for y in 0..sheet.height {
+                for x in 1..sheet.width {
+                    let jump = (a(x, y) - a(x - 1, y)).abs();
+                    assert!(
+                        jump <= step,
+                        "{text:?}: the field jumps {jump} levels between ({}, {y}) and ({x}, {y}), \
+                         over the {step} a continuous distance field allows",
+                        x - 1
+                    );
+                }
+            }
+            for y in 1..sheet.height {
+                for x in 0..sheet.width {
+                    let jump = (a(x, y) - a(x, y - 1)).abs();
+                    assert!(
+                        jump <= step,
+                        "{text:?}: the field jumps {jump} levels between ({x}, {}) and ({x}, {y})",
+                        y - 1
+                    );
+                }
+            }
+        }
+    }
+
+    /// The three looks use three faces, so the same words bake different ink. This is the CPU
+    /// half of "each look uses its face"; `tests/text.rs` checks the rendered pictures.
+    #[test]
+    fn each_face_bakes_its_own_glyphs() {
+        let faces = [
+            ("chrome", unbounded()),
+            (
+                "sigil",
+                Face::new(crate::text::FACE_SIGIL).expect("Grenze Gotisch"),
+            ),
+            (
+                "clean",
+                Face::new(crate::text::FACE_CLEAN).expect("Space Grotesk"),
+            ),
+        ];
+        let sheets: Vec<Sheet> = faces
+            .iter()
+            .map(|(_, face)| Sheet::bake(face, "ILANA").expect("a sheet"))
+            .collect();
+        for (index, (name, _)) in faces.iter().enumerate() {
+            for (other, (other_name, _)) in faces.iter().enumerate().skip(index + 1) {
+                let a = &sheets[index];
+                let b = &sheets[other];
+                println!(
+                    "{name}: {}x{} block, {other_name}: {}x{} block",
+                    a.block_w, a.block_h, b.block_w, b.block_h
+                );
+                assert!(
+                    a.block_w != b.block_w || a.block_h != b.block_h,
+                    "{name} and {other_name} bake the same box: the look is not using its face"
+                );
+            }
+        }
+    }
 }
+
