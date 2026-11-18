@@ -120,10 +120,19 @@ fn stroke_sdf(p: vec2<f32>, stroke: Stroke) -> vec4<f32> {
     return select(first, second, second.x < first.x);
 }
 
-// The cheapest way to know a stroke cannot reach `p`: its own bounding circle. Most strokes are
-// rejected by this before the capsule maths runs.
+// The slack `out_of_reach` adds to a stroke's radius, in block heights: a fraction of a baked
+// pixel. `text/thorn.rs::reach_radius` mirrors this formula, and `the_thorn_geometry_constants_
+// match_the_shader` compares this literal with that module's constant.
+const REACH_SLACK: f32 = 0.01;
+
+// The cheapest way to know a stroke cannot reach `p`: one bounding circle around its whole body.
+// The radius is the stroke's **path length** — `|a-b| + |b-c|` — plus its base half-width twice,
+// never the chord `|c-a|`: a bent stroke's chord is shorter than its path, and a bound built from
+// it cuts pixels off the bend. That defect lost two or three baked pixels of a mark barb on `W`
+// and `THE LOOM IS US`, because the early-out rejected them before the capsule maths ran.
 fn out_of_reach(p: vec2<f32>, stroke: Stroke) -> bool {
-    let radius = length(stroke.c - stroke.a) + stroke.width * 2.0 + 0.01;
+    let radius = length(stroke.b - stroke.a) + length(stroke.c - stroke.b)
+        + stroke.width * 2.0 + REACH_SLACK;
     return distance(p, stroke.a) > radius;
 }
 

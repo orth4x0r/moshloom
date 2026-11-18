@@ -1,9 +1,9 @@
-//! Thorns and sigil marks: the sigil look's linework, grown from the block at bake time.
+﻿//! Thorns and sigil marks: the sigil look's linework, grown from the block at bake time.
 //!
 //! # What the linework is
 //!
 //! Cybersigilism is thin tribal linework: long, whip-like spikes that leave the silhouette where it
-//! turns hardest — a stroke's end, a corner, a point — and sweep outward, plus abstract thorny
+//! turns hardest â€” a stroke's end, a corner, a point â€” and sweep outward, plus abstract thorny
 //! marks that flank the word. Both are *geometry*, found or drawn at bake time and handed to the
 //! shader as tapered capsules, so they stay sharp at any size and can never be baked into a
 //! letter's face.
@@ -16,7 +16,7 @@
 //! # Where a thorn may grow
 //!
 //! Only on an **outer** contour (a pixel the block's border can reach through empty space, so a
-//! counter — the hole in `A` — is never an anchor), only so the spike itself stays in that empty
+//! counter â€” the hole in `A` â€” is never an anchor), only so the spike itself stays in that empty
 //! space, and only over its own word: a spike that would reach into another word's column box
 //! would spear the next word across a space, which reads as a scratch, not a thorn. Every pixel a
 //! candidate covers is checked against the block's ink and against the other words' boxes, and a
@@ -51,7 +51,7 @@ pub(crate) const BEND_WIDTH: f32 = 0.7;
 pub(crate) const TIP_WIDTH: f32 = 0.0;
 
 /// One stroke of the sigil look's linework, in block pixels (origin at the block's top-left, y
-/// down — the same space `Layout` places glyphs in, and the space `text.wgsl` maps `block_uv`
+/// down â€” the same space `Layout` places glyphs in, and the space `text.wgsl` maps `block_uv`
 /// into): two tapered capsules from `a` through `b` to `c`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Stroke {
@@ -100,6 +100,30 @@ impl Stroke {
 
 fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
     ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt()
+}
+
+/// The slack `text.wgsl`'s `out_of_reach` adds to a stroke's reach, in block heights. The shader
+/// works in block-height units; this module works in block pixels, so the two copies scale it by
+/// the block's height. `text::tests::the_thorn_geometry_constants_match_the_shader` parses the
+/// shader's literal and compares it with this one.
+pub(crate) const REACH_SLACK: f32 = 0.01;
+
+/// The radius, in block pixels, of the circle the shader's `out_of_reach` rejects a stroke by: the
+/// length of the stroke's **path** — `|a-b| + |b-c|` — plus its base half-width twice and a little
+/// slack. The chord `|c-a|` is shorter than the path whenever the stroke bends, and a bound built
+/// from it skips pixels near the bend: `W`, `I I I` and `THE LOOM IS US` each lost part of a mark
+/// barb that way (two or three baked pixels per stroke).
+pub fn reach_radius(stroke: &Stroke, block_h: f32) -> f32 {
+    distance(stroke.a, stroke.b)
+        + distance(stroke.b, stroke.c)
+        + stroke.width * 2.0
+        + REACH_SLACK * block_h
+}
+
+/// True when the shader's early-out would discard `p` for `stroke`: `p` is farther from the
+/// stroke's root than the bound above allows. This mirrors `out_of_reach` in `text.wgsl`.
+pub fn out_of_reach(p: [f32; 2], stroke: &Stroke, block_h: f32) -> bool {
+    distance(p, stroke.a) > reach_radius(stroke, block_h)
 }
 
 /// The signed distance to a capsule from `a` to `b` whose radius goes from `ra` to `rb`.
@@ -255,8 +279,8 @@ impl<'a> Block<'a> {
     }
 
     /// True when every pixel the stroke covers sits in the block's outside space and stays over
-    /// `own` word. Inside the block's columns a stroke may only cover its own word's columns — no
-    /// gap and no other word — so a spike can lean out of the text but never across a space; outside
+    /// `own` word. Inside the block's columns a stroke may only cover its own word's columns â€” no
+    /// gap and no other word â€” so a spike can lean out of the text but never across a space; outside
     /// the block it may point anywhere (that is where spikes leave the word).
     fn is_clear(
         &self,
@@ -545,7 +569,7 @@ fn flip_side(seed: u32) -> f32 {
 }
 
 /// The sigil marks that flank the word: five strokes in a box just outside the block on the right
-/// (the shader mirrors them for the left), so the pair is symmetric, abstract — a bramble: one
+/// (the shader mirrors them for the left), so the pair is symmetric, abstract â€” a bramble: one
 /// spine in two halves that bends twice, with three barbs on one side, an open line, never a closed
 /// figure, no letterforms and nothing from an alphabet. The same words always draw the same marks
 /// (`text_seed`), and they sit outside the ink's box, so they can never cover a glyph.
@@ -1023,7 +1047,7 @@ mod tests {
     /// The same predicate against the *class* of defect the previous shader had: a diagonal lattice
     /// over the whole block, one barb per cell, gated only by the distance to the nearest edge, so
     /// it grows a barb inside a counter (the hole of an `A`). This is not a transcription of that
-    /// shader — its constants and hashes are gone — it is the shape of the rule, kept so the
+    /// shader â€” its constants and hashes are gone â€” it is the shape of the rule, kept so the
     /// property has something that fails it.
     #[test]
     fn the_old_diagonal_lattice_would_fail_the_same_test() {
@@ -1078,6 +1102,101 @@ mod tests {
     fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
         let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
+    }
+
+    /// Every integer pixel within half a pixel of `stroke`'s body, in block pixels: the body
+    /// itself plus the antialiased fringe a pixel centre at the edge still carries. The bounds are
+    /// the stroke's own, never the block's: a mark sits outside the block's box, and its bounds
+    /// must be checked out there too.
+    fn body_pixels(stroke: &Stroke) -> Vec<[f32; 2]> {
+        let reach = stroke.width + 2.0;
+        let points = [stroke.a, stroke.b, stroke.c];
+        let min = [
+            points.iter().map(|p| p[0]).fold(f32::MAX, f32::min) - reach,
+            points.iter().map(|p| p[1]).fold(f32::MAX, f32::min) - reach,
+        ];
+        let max = [
+            points.iter().map(|p| p[0]).fold(f32::MIN, f32::max) + reach,
+            points.iter().map(|p| p[1]).fold(f32::MIN, f32::max) + reach,
+        ];
+        let mut inside = Vec::new();
+        for y in (min[1].floor() as i32)..=(max[1].ceil() as i32) {
+            for x in (min[0].floor() as i32)..=(max[0].ceil() as i32) {
+                let p = [x as f32 + 0.5, y as f32 + 0.5];
+                if stroke.signed(p) <= 0.5 {
+                    inside.push(p);
+                }
+            }
+        }
+        inside
+    }
+
+    /// The shader rejects a stroke with one bounding circle before it runs the capsule maths
+    /// (`out_of_reach` in `text.wgsl`), so every pixel of every authored stroke must lie inside
+    /// that circle. A bound that is too small drops ink silently: the review found two or three
+    /// baked pixels of a mark barb missing on `W` and `THE LOOM IS US`.
+    ///
+    /// One check covers both copies: the shader draws the left mark by evaluating the *authored*
+    /// stroke at the mirrored position, so the authored body â€” including the part outside the
+    /// block's box â€” is exactly what the bound is applied to.
+    #[test]
+    fn every_authored_stroke_fits_the_shader_reach_bound() {
+        let mut checked = 0usize;
+        for text in ["W", "I I I", "THE LOOM IS US", "ILANA", "SIGIL"] {
+            let probe = Probe::new(text);
+            let block_h = probe.sheet.block_h as f32;
+            for (name, strokes) in [("thorn", probe.thorns()), ("mark", probe.symbols())] {
+                for (index, stroke) in strokes.iter().enumerate() {
+                    for p in body_pixels(stroke) {
+                        let from_root = distance(p, stroke.a);
+                        let bound = reach_radius(stroke, block_h);
+                        assert!(
+                            !out_of_reach(p, stroke, block_h),
+                            "{text:?}: {name} {index} at {p:?} is {from_root:.2}px from its root \
+                             and inside the stroke, but the shader's bound is {bound:.2}px: the \
+                             early-out would drop that pixel"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        println!("{checked} authored-stroke pixels inside the shader's release bound");
+        assert!(checked > 0, "no stroke has any pixels in its own body");
+    }
+
+    /// The bound the review caught, as a number: the chord `|c-a|` instead of the path
+    /// `|a-b| + |b-c|`. A chord is shorter than the path for every bent stroke, so pixels near
+    /// the bend fall outside the circle and the shader never draws them. This is the defect
+    /// `every_authored_stroke_fits_the_shader_reach_bound` fails on with the old formula; it stays
+    /// here so the chord's insufficiency has something that asserts it.
+    #[test]
+    fn the_chord_bound_would_skip_part_of_a_bent_stroke() {
+        let mut total = 0usize;
+        for text in ["W", "I I I", "THE LOOM IS US", "SIGIL"] {
+            let probe = Probe::new(text);
+            let slack = REACH_SLACK * probe.sheet.block_h as f32;
+            for (name, strokes) in [("thorn", probe.thorns()), ("mark", probe.symbols())] {
+                let skipped: usize = strokes
+                    .iter()
+                    .map(|stroke| {
+                        let chord = distance(stroke.a, stroke.c) + stroke.width * 2.0 + slack;
+                        body_pixels(stroke)
+                            .into_iter()
+                            .filter(|p| distance(*p, stroke.a) > chord)
+                            .count()
+                    })
+                    .sum();
+                if skipped > 0 {
+                    println!("{text:?}: {skipped} {name} pixel(s) outside the chord bound");
+                }
+                total += skipped;
+            }
+        }
+        assert!(
+            total > 0,
+            "the chord bound skipped nothing, so it is not the bound this test is about"
+        );
     }
 
     #[test]

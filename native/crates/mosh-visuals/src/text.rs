@@ -554,6 +554,7 @@ mod tests {
         for (name, expected) in [
             ("BEND_WIDTH", thorn::BEND_WIDTH),
             ("TIP_WIDTH", thorn::TIP_WIDTH),
+            ("REACH_SLACK", thorn::REACH_SLACK),
         ] {
             assert_eq!(
                 wgsl_const(SHADER, name),
