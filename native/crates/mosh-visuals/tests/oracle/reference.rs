@@ -299,8 +299,12 @@ pub fn feedback(
 pub struct Web {
     buffer: Option<Frame>,
     previous: Option<Frame>,
+    /// The analysis grid of the frame last stepped — frame N-1 while stepping frame N. That is
+    /// what `WG_ME` matches against: `gpu.js:912` runs it with `cur.v` and `prv.v`, this frame and
+    /// the previous one.
     grid: Vec<f32>,
-    previous_grid: Vec<f32>,
+    /// The field the last P-frame computed, for the tests that pin which two frames it matched.
+    field: Vec<[f32; 2]>,
     mv_scale: f32,
     /// `F.res`: the canvas size. 320x180 for these tests.
     pub res: [f32; 2],
@@ -318,10 +322,21 @@ impl Web {
             buffer: None,
             previous: None,
             grid: vec![0.0; GRID_WIDTH * GRID_HEIGHT],
-            previous_grid: vec![0.0; GRID_WIDTH * GRID_HEIGHT],
+            field: Vec::new(),
             mv_scale: 1.0,
             res: [WIDTH as f32, HEIGHT as f32],
         }
+    }
+
+    /// The mosh buffer as `WG_FB` left it, before `WG_OUT`'s clamp: `-0.15..1.15` after a P-frame,
+    /// whatever the scene wrote after an I-frame.
+    pub fn buffer(&self) -> Option<&Frame> {
+        self.buffer.as_ref()
+    }
+
+    /// The last P-frame's motion field, `mvT`'s 40x23 texels in uv (empty before one).
+    pub fn field(&self) -> &[[f32; 2]] {
+        &self.field
     }
 
     /// One `gpuFrame()` (gpu.js:878-939): returns the picture the output pass would scan out,
@@ -337,23 +352,26 @@ impl Web {
         }
         let grid = luma_grid(cur);
         let buffer = if iframe {
-            // `WG_FB` with `F.iframe >= 0.5`: `c = s`, then the same clamp (gpu.js:324-336).
-            cur.clamped(BUFFER_RANGE[0], BUFFER_RANGE[1])
+            // `WG_FB` with `F.iframe >= 0.5`: `var c = s` and the clamp skipped, because
+            // gpu.js:325-336 has the only `clamp` inside `if (F.iframe < 0.5)`. The display clamp
+            // happens in `WG_OUT`, which is the return value below.
+            cur.clone()
         } else {
-            let field = motion(&grid, &self.previous_grid, plan.gain);
+            // This frame against the previous one (gpu.js:912).
+            self.field = motion(&grid, &self.grid, plan.gain);
             feedback(
                 cur,
                 self.previous
                     .as_ref()
                     .expect("a P-frame has a previous frame"),
                 self.buffer.as_ref().expect("a P-frame has a buffer"),
-                &field,
+                &self.field,
                 plan,
                 self.res,
                 self.mv_scale,
             )
         };
-        self.previous_grid = std::mem::replace(&mut self.grid, grid);
+        self.grid = grid;
         self.previous = Some(cur.clone());
         self.buffer = Some(buffer.clone());
         // `WG_OUT` clamps the buffer into the video range before it is scanned out.
@@ -540,6 +558,219 @@ mod tests {
         // And the feedback rounds that to whole pixels: 8 a frame, not 3.
         let d = (gained[10 * MOTION_WIDTH + 6][0] * WIDTH as f32).round_ties_even();
         assert_eq!(d, -8.0, "the gained vector did not round to 8 pixels");
+    }
+
+    /// Which two frames the block matcher is given: this one and the *previous* one, as
+    /// `gpu.js:912` runs `WG_ME` with `cur.v` and `prv.v`.
+    ///
+    /// One frame stale (`N` against `N-2`) is not a small error on moving content: the square's
+    /// 3-pixels-a-frame translation would answer 6 grid pixels, and on the first P-frame after an
+    /// I-frame the comparison would be against the zero-filled grid.
+    #[test]
+    fn block_matching_compares_this_frame_with_the_last_one() {
+        let plain = Cue {
+            amount: 0.8,
+            entered: None,
+            jump: false,
+        };
+        let mut web = Web::new();
+        // Frame 0 is the I-frame; frame 1 is the first P-frame.
+        web.step(&clips::frame(Clip::A, 0), &decide(&plain, true));
+        web.step(&clips::frame(Clip::A, 1), &decide(&plain, false));
+        let gained = [-3.0 / GRID[0] * (1.0 + 2.2 * 0.8), 0.0];
+        assert_eq!(
+            web.field()[10 * MOTION_WIDTH + 6],
+            gained,
+            "the first P-frame did not match frame 1 against frame 0: a 6-pixel answer means the \
+             match was against frame -1, i.e. the zero-filled grid"
+        );
+        // And it stays one frame back, not two.
+        web.step(&clips::frame(Clip::A, 2), &decide(&plain, false));
+        assert_eq!(
+            web.field()[10 * MOTION_WIDTH + 6],
+            gained,
+            "the second P-frame matched 6 pixels of motion instead of 3: the grid is one frame \
+             stale"
+        );
+    }
+
+    /// A P-frame's plan for the feedback tests: no I-frame, no skip, no freeze, no coarse.
+    fn p_frame(leak: f32) -> Plan {
+        Plan {
+            iframe: false,
+            skipres: false,
+            freeze: false,
+            leak,
+            gain: 1.0,
+            coarse: false,
+        }
+    }
+
+    fn flat(value: f32) -> Frame {
+        Frame::from_fn(WIDTH, HEIGHT, |_, _| [value, value, value])
+    }
+
+    /// A buffer whose red channel is the column number over 320, so a one-pixel shift is visible.
+    fn ramp() -> Frame {
+        Frame::from_fn(WIDTH, HEIGHT, |x, _| [x as f32 / WIDTH as f32, 0.0, 0.0])
+    }
+
+    fn no_field() -> Vec<[f32; 2]> {
+        vec![[0.0; 2]; MOTION_WIDTH * MOTION_HEIGHT]
+    }
+
+    /// `gpu.js:333`: `c = c + s - prv; c = mix(c, s, F.leak)`.
+    ///
+    /// With the buffer at 0.5, the source at 0.6 and the previous source at 0.4, the residual is
+    /// `0.5 + 0.6 - 0.4 = 0.7`; leak 0 leaves the residual exactly, leak 0.004 pulls it to
+    /// `0.7 + (0.6 - 0.7) * 0.004 = 0.6996`. `skipres` skips the whole statement, so the carried
+    /// buffer comes through untouched at 0.5. A static source (`s == prv`) leaves `c` as `c`, and
+    /// the leak alone moves it: `0.5 + (0.6 - 0.5) * 0.004 = 0.5004`.
+    #[test]
+    fn feedback_adds_the_residual_unless_skipres() {
+        let cur = flat(0.6);
+        let prv = flat(0.4);
+        let buffer = flat(0.5);
+        let field = no_field();
+        let at = |plan: &Plan, buffer: &Frame, prv: &Frame| {
+            feedback(&cur, prv, buffer, &field, plan, GRID, 1.0).at(0, 0)[0]
+        };
+
+        let residual = at(&p_frame(0.0), &buffer, &prv);
+        assert!(
+            (residual - 0.7).abs() < 1e-6,
+            "residual only: {residual}, expected 0.5 + 0.6 - 0.4 = 0.7"
+        );
+        let leaked = at(&p_frame(LEAK_FLOOR), &buffer, &prv);
+        assert!(
+            (leaked - 0.6996).abs() < 1e-6,
+            "residual then leak: {leaked}, expected 0.6996"
+        );
+        // `skipres` is the web's Datamosh entry: the carried buffer, no residual, no leak.
+        let skipped = at(
+            &Plan {
+                skipres: true,
+                ..p_frame(LEAK_FLOOR)
+            },
+            &buffer,
+            &prv,
+        );
+        assert!(
+            (skipped - 0.5).abs() < 1e-6,
+            "skipres: {skipped}, expected the carried buffer 0.5"
+        );
+        // A static source: the residual is zero, and only the leak moves the picture.
+        let still = at(&p_frame(LEAK_FLOOR), &buffer, &flat(0.6));
+        assert!(
+            (still - 0.5004).abs() < 1e-6,
+            "static source: {still}, expected 0.5004"
+        );
+    }
+
+    /// `gpu.js:332` samples the buffer at `uv + d`, so a negative `bd` takes the picture from the
+    /// **left** of the pixel: content moves along the motion. `uv - d` would smear the other way.
+    #[test]
+    fn feedback_carries_the_picture_from_the_left() {
+        let buffer = ramp();
+        let cur = flat(0.6);
+        let mut field = no_field();
+        let one_left = [-1.0 / GRID[0], 0.0];
+        field.fill(one_left);
+        let out = feedback(&cur, &cur, &buffer, &field, &p_frame(0.0), GRID, 1.0);
+        let x = 100;
+        assert!(
+            (out.at(x, 4)[0] - (x as f32 - 1.0) / WIDTH as f32).abs() < 1e-6,
+            "the buffer was sampled at {}, expected the pixel to its left ({})",
+            out.at(x, 4)[0] * WIDTH as f32,
+            x as f32 - 1.0
+        );
+        assert!(
+            (out.at(x, 4)[0] - (x as f32 + 1.0) / WIDTH as f32).abs() > 1e-3,
+            "the buffer was sampled to the right: the displacement's sign is flipped"
+        );
+    }
+
+    /// `gpu.js:326`: `bc & vec2i(-2)` pairs the blocks when the amount is above 0.85, so a pixel at
+    /// x = 12 reads block 0's vector, not block 1's.
+    #[test]
+    fn feedback_pairs_the_blocks_when_coarse() {
+        let buffer = ramp();
+        let cur = flat(0.6);
+        let mut field = no_field();
+        // Block (1, 0) moves its pixels 8 to the right; every other block is still.
+        field[1] = [-8.0 / GRID[0], 0.0];
+        let x = 12;
+        let fine = feedback(&cur, &cur, &buffer, &field, &p_frame(0.0), GRID, 1.0);
+        let coarse = feedback(
+            &cur,
+            &cur,
+            &buffer,
+            &field,
+            &Plan {
+                coarse: true,
+                ..p_frame(0.0)
+            },
+            GRID,
+            1.0,
+        );
+        assert!(
+            (fine.at(x, 4)[0] - (x as f32 - 8.0) / WIDTH as f32).abs() < 1e-6,
+            "not coarse: block 1's vector was not used ({} instead of {})",
+            fine.at(x, 4)[0] * WIDTH as f32,
+            x as f32 - 8.0
+        );
+        assert!(
+            (coarse.at(x, 4)[0] - x as f32 / WIDTH as f32).abs() < 1e-6,
+            "coarse: the block index was not paired down to 0 ({} instead of {})",
+            coarse.at(x, 4)[0] * WIDTH as f32,
+            x as f32
+        );
+    }
+
+    /// `gpu.js:325-336` has its only `clamp` inside `if (F.iframe < 0.5)`, so an I-frame stores the
+    /// frame unchanged; the display clamp is `WG_OUT`'s.
+    #[test]
+    fn an_iframe_stores_the_frame_unchanged() {
+        let mut web = Web::new();
+        let bright = flat(1.2);
+        let shown = web.step(
+            &bright,
+            &decide(
+                &Cue {
+                    amount: 0.8,
+                    entered: None,
+                    jump: false,
+                },
+                true,
+            ),
+        );
+        assert_eq!(
+            web.buffer().expect("an I-frame fills the buffer").at(0, 0),
+            [1.2, 1.2, 1.2],
+            "an I-frame clamped the buffer to the feedback range"
+        );
+        assert_eq!(shown.at(0, 0), [1.0, 1.0, 1.0], "the display must clamp");
+    }
+
+    /// Clip C puts 1-pixel detail in the last 8-pixel block row (y 176..180). The web searches
+    /// that row under the odd `lo.y + 8 > 184` bound (gpu.js:307), which allows `dy <= 0` only, so
+    /// the row must still find the leftward-reachable match and never report a downward one.
+    #[test]
+    fn the_matcher_reads_the_bottom_block_row() {
+        let previous = luma_grid(&clips::frame(Clip::C, 0));
+        let current = luma_grid(&clips::frame(Clip::C, 1));
+        let field = motion(&current, &previous, 1.0);
+        // Block (8, 22): x 64..72, y 176..184, inside the checkerboard on both frames.
+        let bottom = field[22 * MOTION_WIDTH + 8];
+        assert_ne!(
+            bottom,
+            [0.0, 0.0],
+            "the last block row found no motion: the 184 bound excludes it"
+        );
+        assert!(
+            bottom[1] <= 0.0,
+            "the last block row searched downwards past the 184 bound: {bottom:?}"
+        );
     }
 
     #[test]

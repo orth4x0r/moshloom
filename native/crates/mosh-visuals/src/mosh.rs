@@ -56,8 +56,12 @@
 //!   `mosh_copy` pass after the feedback pass. The residual needs `src - prv` at the *layer's*
 //!   resolution: the 320x180 grid pair cannot stand in for it, because a static picture would
 //!   then have a non-zero residual wherever the grid copy lost detail, and every edge would ring.
-//!   Cost: one full-size copy pass per layer per frame (measured 0.10 ms at 960x540, 0.18 ms at
-//!   1280x720 on the reference machine, against the ~6 ms 1080p frame budget).
+//!   Cost: one full-size copy pass per layer per frame, measured in `--release` on the reference
+//!   machine at **0.221 ms at 960x540 and 0.378 ms at 1280x720** (the whole mosh apply is 0.640
+//!   and 1.079 ms), against the ~6 ms 1080p frame budget. That is the price of the residual: a
+//!   second source target (a ping-pong `LayerSlot::scene`, which would let the *renderer* hand
+//!   over last frame's picture with no pass at all) is the obvious follow-up, but `LayerSlot`'s
+//!   public fields are frozen and it would move the copy out of this pass's lane.
 //! * the feedback buffer is `dst`'s own previous image: the mosh stage is the only writer of
 //!   `dst`, so its readable image *is* last frame's mosh output and no extra full-size target is
 //!   allocated. `valid` tracks whether that image may be used.
@@ -90,11 +94,20 @@
 //! of the mosh. The old four-bar rule was one of the reasons the native datamosh read as a ghost
 //! trail that kept being reset.
 //!
-//! A *clip change* refreshes too, unless the new clip's transition is a Datamosh:
-//! `Visuals::draw_layer` calls [`MoshPass::invalidate`] for a Cut, a Strobe or a Crossfade (the web
-//! app's `entered -> iframe` rule) and [`MoshPass::carry_over`] for a Datamosh (`entered ->
-//! skipres`: keep the buffer, skip the residual for the entry frame, let the new clip's motion
-//! push the old picture - the classic datamosh cut).
+//! A *clip change* follows `decide()`'s `entered` rule exactly (`engine.c:337`):
+//!
+//! ```text
+//! if (lastK<0 || tr==T_CUT) iframe=1;
+//! else if (tr==T_STROBE) { iframe=1; flash=1; }
+//! else if (tr!=T_XFADE) P.skipres=1;
+//! ```
+//!
+//! So `Visuals::draw_layer` calls [`MoshPass::invalidate`] for a Cut or a Strobe entry (an I-frame)
+//! and for the first clip, which has no transition, and [`MoshPass::carry_over`] for a Datamosh or
+//! a Melt entry (`skipres`: keep the buffer, skip the residual for the entry frame, let the new
+//! clip's motion push the old picture - the classic datamosh cut). A Crossfade entry touches
+//! nothing: it is an ordinary P-frame, residual and all, because the two pictures are blended by
+//! the transition instead.
 //!
 //! # `extra_flow`
 //!
@@ -315,25 +328,26 @@ impl MoshPass {
     }
 
     /// Forgets a layer's buffer, so the next `apply` refreshes it (an I-frame). Called when the
-    /// clip has no mosh to apply, and by `Visuals::draw_layer` when a layer's clip changes on any
-    /// transition but a Datamosh: the web app's `entered -> iframe` rule.
+    /// clip has no mosh to apply, and by `Visuals::draw_layer` on a Cut or Strobe clip entry (and
+    /// on the first clip): the web app's `entered -> iframe` rule.
     pub fn invalidate(&mut self, layer: usize) {
         if let Some(Some(state)) = self.layers.get_mut(layer) {
             state.valid = false;
         }
     }
 
-    /// A Datamosh clip change: keep the layer's buffer, and run the next P-frame without the
-    /// residual. The old picture is then pushed along by whatever motion the new clip makes - the
-    /// web app's `entered -> P.skipres = 1`, and the whole point of a datamosh cut.
+    /// A Datamosh or Melt clip change: keep the layer's buffer, and run the next P-frame without
+    /// the residual. The old picture is then pushed along by whatever motion the new clip makes -
+    /// the web app's `entered -> P.skipres = 1`, and the whole point of a datamosh cut.
     ///
     /// A layer with no buffer yet (the previous clip never moshed) has nothing to carry: its
     /// first frame is an ordinary I-frame. Calling this twice before the next `apply` is the same
     /// as calling it once; the skip covers one P-frame.
     ///
-    /// `Visuals::draw_layer` calls this for a layer whose new clip enters on a Datamosh transition.
-    /// It is the only way to express that entry: `invalidate` is the Cut/Strobe/Crossfade rule (an
-    /// I-frame), and a plain `apply` applies the residual, which is the web's *Crossfade* entry.
+    /// `Visuals::draw_layer` calls this for a layer whose new clip enters on a Datamosh or Melt
+    /// transition. It is the only way to express that entry: `invalidate` is the Cut/Strobe rule
+    /// (an I-frame), and a plain `apply` applies the residual, which is the web's *Crossfade*
+    /// entry.
     pub fn carry_over(&mut self, layer: usize) {
         if let Some(Some(state)) = self.layers.get_mut(layer) {
             state.skipres_frames = SKIPRES_FRAMES;
@@ -514,6 +528,3 @@ mod tests {
         );
     }
 }
-
-
-

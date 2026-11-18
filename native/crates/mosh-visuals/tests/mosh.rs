@@ -287,6 +287,63 @@ fn static_scene_stays_static() {
     assert_no_validation_messages(&gpu);
 }
 
+/// The residual, pinned on its own: a *still* picture that changes to a *still* picture leaves
+/// `src - prv` as a full replacement, so with the residual on the new picture is there at once,
+/// and with the residual skipped (`skipres`, which is what a clip entry does) the old one stays.
+///
+/// Neither the leak nor the motion can produce this: the source does not move, so every vector is
+/// zero, and `leak = 0.004` would take hundreds of frames to show anything. This is the one
+/// behaviour in the P-frame that only the residual explains.
+#[test]
+fn the_residual_brings_a_still_change_in_at_once() {
+    let gpu = gpu();
+    let (width, height) = (320, 180);
+    let pattern = pipeline(&gpu, PATTERN_WGSL, 16, 0);
+    let mut mosh = MoshPass::new(&gpu, width, height).expect("mosh pass");
+    let src = LayerTarget::new(&gpu, width, height);
+    let dst = LayerTarget::new(&gpu, width, height);
+    let frame = AnalysisFrame::default();
+    let old = vec4_uniform([40.0, 60.0, 0.0, 0.0]);
+    let new = vec4_uniform([240.0, 300.0, 0.0, 0.0]);
+
+    // Warm the buffer on the old still, then hand the pass the new one.
+    let mut entry = |carry: bool| -> f32 {
+        for _ in 0..3 {
+            let mut rec = FrameRecorder::new(&gpu);
+            rec.draw(&pattern, &src, &old, &[]).expect("pattern");
+            mosh.apply(&mut rec, 0, &src, &dst, 0.8, &frame, None)
+                .expect("mosh");
+            gpu.wait_frame(rec.submit());
+        }
+        if carry {
+            mosh.carry_over(0);
+        }
+        let mut rec = FrameRecorder::new(&gpu);
+        rec.draw(&pattern, &src, &new, &[]).expect("pattern");
+        mosh.apply(&mut rec, 0, &src, &dst, 0.8, &frame, None)
+            .expect("mosh");
+        gpu.wait_frame(rec.submit());
+        mean_abs_difference(&gpu.read_back(&dst), &gpu.read_back(&src))
+    };
+
+    let with_residual = entry(false);
+    let with_skipres = entry(true);
+    println!(
+        "{width}x{height}, amount 0.8, a still picture replaced by another still: mean |output - \
+         fresh| {with_residual:.2}/255 with the residual, {with_skipres:.2}/255 with `skipres`"
+    );
+    assert!(
+        with_residual < 1.0,
+        "the residual did not bring the new still in ({with_residual:.2}/255): it is not being \
+         applied"
+    );
+    assert!(
+        with_skipres > 10.0,
+        "`skipres` did not keep the old still ({with_skipres:.2}/255): the two paths are the same"
+    );
+    assert_no_validation_messages(&gpu);
+}
+
 /// A bar moving right: the mosh buffer is carried *ahead* of it, because the web app scales the
 /// displacement by `gain = 1 + 2.2 * amount` (`decide()`), 2.76x at amount 0.8. The sign check
 /// catches the two failure modes that matter: a pass that does not carry the buffer at all (the
@@ -369,17 +426,19 @@ fn moving_pattern_is_carried_ahead_by_the_gain() {
     assert_no_validation_messages(&gpu);
 }
 
-/// (a) Residual + leak: after N P-frames the mosh output holds a picture the fresh frame does not
-/// have. The metric is the mean absolute channel difference between the output and the frame the
-/// pass was given, in 0..255 units, over a striped picture scrolling 8 px/frame at amount 0.8.
+/// The pass **carries** the picture: after N P-frames the mosh output still holds a picture the
+/// fresh frame does not have. The metric is the mean absolute channel difference between the
+/// output and the frame the pass was given, in 0..255 units, over a striped picture scrolling
+/// 8 px/frame at amount 0.8.
 ///
-/// A crossfade (`out = mix(fresh, carried, amount)`) can only differ from `fresh` where the
-/// carried picture is a *shifted* copy of it, so its difference is a thin, fading trail. The web
-/// app's P-frame adds the motion residual (`carried + src - prv`) and then mixes towards `src` by
-/// `leak = (1 - amount)^5`, so the whole carried picture and a per-frame residual survive, and
-/// `gain = 1 + 2.2 * amount` carries it *ahead* of the motion: the output is a mosh, not a fade.
+/// What this pins is the *carry*: `leak = (1 - amount)^5` floored at 0.004 and
+/// `gain = 1 + 2.2 * amount`, so the picture is kept and pushed ahead of its own motion. A
+/// crossfade (`out = mix(fresh, carried, amount)`) fails it: it measures 3.55/255 here, against
+/// 46/255 for the port. The residual is a different behaviour and is pinned on its own, sharper,
+/// by `the_residual_brings_a_still_change_in_at_once` - removing it from this scene's pass would
+/// not move this number much, because the carried smear is what this measures.
 #[test]
-fn p_frames_accumulate_a_picture_the_fresh_frame_does_not_have() {
+fn p_frames_keep_the_carried_picture() {
     let gpu = gpu();
     let (width, height) = (640, 360);
     let stripes = pipeline(&gpu, STRIPES_WGSL, 16, 0);
@@ -436,7 +495,8 @@ fn p_frames_accumulate_a_picture_the_fresh_frame_does_not_have() {
 
 /// `amount == 0` is the "no mosh slot" case: no pass is recorded at all.
 #[test]
-fn amount_zero_returns_false() {    let gpu = gpu();
+fn amount_zero_returns_false() {
+    let gpu = gpu();
     let (width, height) = (64, 36);
     let pattern = pipeline(&gpu, PATTERN_WGSL, 16, 0);
     let mut mosh = MoshPass::new(&gpu, width, height).expect("mosh pass");
@@ -724,6 +784,128 @@ fn iframes_come_from_a_first_frame_a_jump_or_amount_zero() {
     assert!(
         after_zero < 1.0,
         "after amount 0 the next mosh frame was not an I-frame ({after_zero:.2}/255)"
+    );
+    assert_no_validation_messages(&gpu);
+}
+
+/// `decide()`'s `entered` rule, through the facade, on pictures this test owns: only Cut, Strobe
+/// and the first clip take an I-frame. A **Crossfade** entry is an ordinary P-frame with the
+/// residual on (the transition blends the two pictures itself); **Datamosh** and **Melt** keep the
+/// buffer and skip the residual, so the old clip's picture is still there.
+///
+/// The *entry frame itself* cannot tell Cut from Crossfade apart: the residual (`buf + s - prv`)
+/// reconstructs a changed source exactly, which is the whole point of it. So this measures the
+/// frame *after* the entry, once the new clip is still and its vectors are zero:
+///
+/// * `ghost`, the difference from the picture the layer was given, is 0 only after an I-frame;
+/// * `lit`, the mean over the new picture's own bar, is ~0 when the old clip is still carried.
+#[test]
+fn clip_entry_rules_follow_decide() {
+    let gpu = gpu();
+    let (width, height) = (320u32, 180u32);
+    // A 20 px bright bar on black, in `OverlayLayer::set_frame`'s BGRA order.
+    let bar = |x0: u32| -> Vec<u8> {
+        let mut bytes = Vec::with_capacity((width * height * 4) as usize);
+        for _y in 0..height {
+            for x in 0..width {
+                let lit = if (x0..x0 + 20).contains(&x) { 255 } else { 0 };
+                bytes.extend_from_slice(&[lit, lit, lit, 255]);
+            }
+        }
+        bytes
+    };
+
+    let state = |clip: u32, kind: Option<TransitionKind>| LayerState {
+        layer: 0,
+        clip: Some(clip),
+        visualizer: Some("overlay".to_string()),
+        params: ClipParams::default(),
+        effects: vec![EffectSlot {
+            kind: EffectKind::Mosh,
+            amount: 0.9,
+            param: 0.0,
+        }],
+        transition: kind.map(|kind| ActiveTransition {
+            kind,
+            progress: 1.0,
+            from: Some(1),
+        }),
+        blend: BlendMode::Normal,
+        opacity: 1.0,
+        seed: 0,
+    };
+
+    // Four frames of clip 1 (the bar slides 4 px a frame, so the buffer holds a real smear), then
+    // the entry frame of clip 2 with `kind`. `x0` is where clip 2's bar is: 76 is the last warm
+    // frame's position (a picture that does not change), 240 is somewhere else entirely.
+    let entry_frame = |kind: Option<TransitionKind>, x0: u32| -> (f32, f32) {
+        let mut visuals = Visuals::new(&gpu, width, height).expect("visuals");
+        let mut slot = LayerSlot::new(&gpu, 0, width, height);
+        let mut frame = AnalysisFrame::default();
+        let draw = |visuals: &mut Visuals,
+                        slot: &mut LayerSlot,
+                        frame: &AnalysisFrame,
+                        clip: u32,
+                        kind: Option<TransitionKind>,
+                        x0: u32|
+         -> (f32, f32) {
+            let picture = bar(x0);
+            visuals
+                .overlay
+                .set_frame(&gpu, 0, width, height, &picture)
+                .expect("overlay frame");
+            let mut rec = FrameRecorder::new(&gpu);
+            visuals
+                .draw_layer(&mut rec, slot, &state(clip, kind), frame, 0.0)
+                .expect("draw layer");
+            gpu.wait_frame(rec.submit());
+            let output = gpu.read_back(slot.output());
+            let row = red_row(&output, width, height / 2);
+            (mean(&row, 240, 260), mean_abs_difference(&output, &picture))
+        };
+        for step in 0..4u32 {
+            draw(&mut visuals, &mut slot, &frame, 1, None, 60 + 4 * step);
+            frame.time_s += 1.0 / 60.0;
+        }
+        draw(&mut visuals, &mut slot, &frame, 2, kind, x0)
+    };
+
+    // A picture that does not change across the change: an I-frame is an exact copy, a P-frame
+    // with the residual is not (the residual is zero, so the carried smear comes through whole).
+    let cut_same = entry_frame(None, 76);
+    let crossfade_same = entry_frame(Some(TransitionKind::Crossfade), 76);
+    // A picture that does change: the residual brings the new one straight in, `skipres` keeps
+    // the old one.
+    let cut_new = entry_frame(None, 240);
+    let crossfade_new = entry_frame(Some(TransitionKind::Crossfade), 240);
+    let datamosh_new = entry_frame(Some(TransitionKind::Datamosh), 240);
+    let melt_new = entry_frame(Some(TransitionKind::Melt), 240);
+    println!(
+        "{width}x{height}, mosh 0.9, the entry frame: (new bar's columns, distance from the given \
+         picture), 0..255: Cut/same {cut_same:?}, Crossfade/same {crossfade_same:?}, Cut/new \
+         {cut_new:?}, Crossfade/new {crossfade_new:?}, Datamosh/new {datamosh_new:?}, Melt/new \
+         {melt_new:?}"
+    );
+    assert!(
+        cut_same.1 < 1.0,
+        "a Cut entry is not an exact copy of an unchanged picture ({cut_same:?})"
+    );
+    assert!(
+        crossfade_same.1 > 1.0,
+        "a Crossfade entry took an I-frame ({crossfade_same:?}): the buffer should have been kept, \
+         so the carried smear should still be there"
+    );
+    assert!(
+        cut_new.0 > 200.0,
+        "a Cut entry did not show the new picture ({cut_new:?})"
+    );
+    assert!(
+        crossfade_new.0 > 200.0,
+        "a Crossfade entry lost the new picture ({crossfade_new:?}): its residual was skipped"
+    );
+    assert!(
+        datamosh_new.0 < 60.0 && melt_new.0 < 60.0,
+        "a Datamosh ({datamosh_new:?}) or Melt ({melt_new:?}) entry did not carry the old picture"
     );
     assert_no_validation_messages(&gpu);
 }

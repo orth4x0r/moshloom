@@ -26,6 +26,11 @@
 //
 // I-frames do not come through this pass; `mosh_copy` refreshes the buffer instead.
 //
+// Not ported from `WG_FB`, none of it the mosh's picture content: the feedback zoom and spin
+// (`fxa.z`/`fxa.w`), the `F.ops` rect remaps, and `fxb` (streak, crush, echo, negative) - those are
+// effect slots of their own in this port, or V-fx's. Nor the vector clamp in `WG_ME`, which cannot
+// bind at this search range (see the module docs of `MoshPass`).
+//
 // Bindings follow mosh-render's descriptor layout: the uniform at 0, then one sampled image and
 // one sampler per input.
 
@@ -95,8 +100,9 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     // The web samples the buffer with `G.nm` - nearest, mirror-repeat (`gpu.js:639`), so a
     // displacement of whole pixels is exactly a texel, and a smear that leaves the frame mirrors
-    // back in instead of clamping. `textureLoad` at the mirrored index is that sample exactly.
-    let offset = vec2<i32>(i32(-shift.x + floor(flow.x)), i32(-shift.y + floor(flow.y)));
+    // back in instead of clamping. `textureLoad` at the mirrored index is that sample exactly;
+    // the fluid term is rounded like a displacement, not floored like a coordinate.
+    let offset = vec2<i32>(i32(-shift.x + round(flow.x)), i32(-shift.y + round(flow.y)));
     let at = vec2<i32>(mirror(pixel.x + offset.x, res.x), mirror(pixel.y + offset.y, res.y));
 
     var c = textureLoad(bufT, at, 0).rgb;

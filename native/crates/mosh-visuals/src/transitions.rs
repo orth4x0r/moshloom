@@ -231,11 +231,12 @@ struct TransitionUniforms {
     res: [f32; 2],
     /// 0..1, smoothstepped by the shader.
     progress: f32,
-    /// 0 crossfade, 1 datamosh, 2 melt.
+    /// 0 crossfade, 2 melt. 1 is retired: Datamosh is the mosh pass's carry-over and never reaches
+    /// this shader.
     mode: f32,
     /// 0 none, 1 invert, 2 tint.
     flash: f32,
-    /// Reserved for a per-kind parameter (melt drip, datamosh strength).
+    /// Reserved for a per-kind parameter (the melt drip).
     param: f32,
     pad0: f32,
     pad1: f32,
