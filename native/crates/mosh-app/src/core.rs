@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 use mosh_analysis::{AnalysisConfig, Analyzer};
 use mosh_capture::Loopback;
 use mosh_core::{
-    ArrClip, AudioBlock, BlendMode, Clip, ClipId, ClipParams, ControlEvent, EventFlags,
-    FollowAction, LaunchQuantize, Layer, MidiEvent, ParamRange, Project, RenderPlan, SceneRow,
-    SessionGrid, ShowMode, ShowRole, SongMarker, Transition,
+    ArrClip, AudioBlock, BlendMode, Clip, ClipId, ClipParams, ControlEvent, EffectKind, EffectSlot,
+    EventFlags, FollowAction, LaunchQuantize, Layer, MidiEvent, ParamRange, Project, RenderPlan,
+    SceneRow, SessionGrid, ShowMode, ShowRole, SongMarker, Transition, TransitionKind,
 };
 use mosh_ipc::IpcReader;
 use mosh_show::Show;
@@ -1037,6 +1037,10 @@ fn restore_cells(show: &Show, playing: &[Option<ClipId>]) -> Vec<ControlEvent> {
 /// The project the app runs with when it is started without one: an empty show in Autopilot over
 /// a 16-scene grid, so pressing play on nothing still draws something. Twelve web scenes and four
 /// abstract style scenes; the retro web scenes (`catalog::LEGACY`) are left out.
+///
+/// Every scene clip carries the show's datamosh, so a show opened and played is a datamosh show
+/// from its first clip (the web app's Auto Arrange gives every block `mosh` 0.35-0.95). The
+/// amounts are in `SCENE_MOSH` and about four clips in five enter on a Datamosh (`default_transition`).
 pub fn default_project() -> Project {
     const SCENES: [&str; 16] = [
         "tunnel",
@@ -1081,8 +1085,12 @@ pub fn default_project() -> Project {
                 params: ClipParams::default(),
                 ranges: [[ParamRange::default(); 8]; 4],
                 pulse_depth: [0.25; 4],
-                effects: Vec::new(),
-                transition_in: Transition::default(),
+                effects: vec![EffectSlot {
+                    kind: EffectKind::Mosh,
+                    amount: default_mosh(visualizer).0,
+                    param: 0.5,
+                }],
+                transition_in: default_transition(row, visualizer),
                 follow: FollowAction::None,
                 follow_after_bars: 8,
                 react_to_events: true,
@@ -1105,6 +1113,65 @@ pub fn default_project() -> Project {
             quantize: LaunchQuantize::Bar,
         },
         ..Project::default()
+    }
+}
+
+/// The default show's datamosh per scene: `(amount, transition beats)`.
+///
+/// The web app's Auto Arrange draws both at random inside an intensity tier (`mosh` 0.35-0.50 in
+/// a quiet section, 0.55-0.70 in a mid one, 0.75-0.95 in a loud one, and a Datamosh transition
+/// about four blocks in five). This app has no random draws, so the table is fixed and follows
+/// each scene's character instead: a soft, symmetric look takes a light mosh (`kaleido` 0.35,
+/// `glass-refract` 0.40, where a strong mosh would smear the symmetry away) and a dense, moving
+/// one takes a heavy mosh (`swarm` 0.95, `reaction` 0.90). The beats rise with the amount, which
+/// is what `mosh-show` needs: the transition's length is the clip's `Transition::beats`, and
+/// `mosh-visuals` keeps the carried buffer running for the whole of a Datamosh.
+const SCENE_MOSH: [(&str, f32, f32); 16] = [
+    ("tunnel", 0.55, 2.0),
+    ("loom", 0.72, 3.0),
+    ("numogram", 0.45, 2.0),
+    ("flesh", 0.80, 3.0),
+    ("rotor", 0.68, 3.0),
+    ("moire", 0.60, 2.0),
+    ("spectrum", 0.75, 3.0),
+    ("cells", 0.78, 3.0),
+    ("aura-mesh", 0.50, 2.0),
+    ("vortex", 0.82, 4.0),
+    ("kaleido", 0.35, 1.0),
+    ("reaction", 0.90, 4.0),
+    ("contour-field", 0.65, 3.0),
+    ("glass-refract", 0.40, 1.0),
+    ("silk-ribbon", 0.85, 4.0),
+    ("swarm", 0.95, 4.0),
+];
+
+/// The mosh the default show puts on `visualizer`, as `(amount, transition beats)`.
+///
+/// The fluid is a layer visualizer rather than one of the grid's scenes: it stirs the mosh with
+/// its own velocity instead of being smeared by it, so it keeps a moderate amount if a show puts
+/// it in the default grid. Anything the table does not name gets the same moderate amount.
+fn default_mosh(visualizer: &str) -> (f32, f32) {
+    if visualizer == "fluid" {
+        return (0.5, 2.0);
+    }
+    SCENE_MOSH
+        .iter()
+        .find(|(id, ..)| *id == visualizer)
+        .map(|&(_, amount, beats)| (amount, beats))
+        .unwrap_or((0.5, 2.0))
+}
+
+/// How a default clip enters: a Datamosh on four grid rows in five, a Cut on the fifth
+/// (rows 4, 9 and 14 of the sixteen scene rows), which is the web app's `R()<.2?0:2` without the
+/// random draw.
+fn default_transition(row: usize, visualizer: &str) -> Transition {
+    if row % 5 == 4 {
+        Transition::default()
+    } else {
+        Transition {
+            kind: TransitionKind::Datamosh,
+            beats: default_mosh(visualizer).1,
+        }
     }
 }
 

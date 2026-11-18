@@ -117,11 +117,12 @@ fn demo_project() -> EditorModel {
         );
     }
 
-    // A clip with a look worth a detail panel.
+    // A clip with a look worth a detail panel. The mosh is already on it: `new_clip` starts a
+    // scene clip with the web's `mosh:.6` default, so adding it here would be a duplicate.
     let span = SpanRef { lane: 0, index: 1 };
     apply(&mut model, Command::SelectSpan(span));
     let clip = model.selected().expect("the fluid block");
-    for kind in [EffectKind::Mirror, EffectKind::Echo, EffectKind::Mosh] {
+    for kind in [EffectKind::Mirror, EffectKind::Echo] {
         apply(&mut model, Command::AddEffect { clip, kind });
     }
     apply(
