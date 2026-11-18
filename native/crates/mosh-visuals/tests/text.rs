@@ -822,7 +822,7 @@ fn three_looks_write_previews() {
     let (width, height) = (960u32, 540u32);
     let frame = audio_frame();
     let looks = [("chrome", 0.05), ("sigil", 0.45), ("clean", 0.85)];
-    let shots = [("ilana", "ILANA"), ("phrase", "the loom\nknows what")];
+    let shots = [("ilana", "ILANA"), ("phrase", "the loom\nis us")];
 
     for (name, font) in looks {
         for (shot_name, text) in shots {
@@ -859,6 +859,7 @@ fn three_looks_write_previews() {
     }
     assert_no_validation_messages(&gpu);
 }
+
 
 fn preview_path(name: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -942,9 +943,10 @@ fn adler32(bytes: &[u8]) -> u32 {
 }
 
 /// The budget test: `set_text` is the one-off CPU cost of a text change (a clip starting, a lyric
-/// changing) and must stay under 2 ms in release for a 20-character change once the glyphs are
-/// cached, which is the cost the app pays on the render thread. `draw` is one GPU pass and must
-/// stay under 0.5 ms median at 960x540.
+/// being typed) and must stay under 2 ms in release once the glyphs are cached, which is the cost
+/// the app pays on the render thread (`mosh-app/src/shell.rs` calls `set_text` every frame; the
+/// same-text path is a no-op). `draw` is one GPU pass and is measured against an empty pass of the
+/// same pipeline on the same machine.
 #[test]
 fn set_text_and_draw_costs() {
     let gpu = gpu();
@@ -957,48 +959,55 @@ fn set_text_and_draw_costs() {
 
     let mut layer = TextLayer::new(&gpu).expect("text layer");
     let dst = LayerTarget::new(&gpu, width, height);
-    // Two 20-character lines, both warmed first: the measurement below is the cost of a text
-    // *change* with every character already rasterised and cached on its face.
-    let first = "the loom knows which";
-    let second = "and the loom is here";
-    assert_eq!(first.chars().count(), 20);
-    assert_eq!(second.chars().count(), 20);
-    layer.set_text(&gpu, 0, first);
-    layer.set_text(&gpu, 0, second);
-    layer.set_text(&gpu, 0, first);
 
-    let mut set_samples = Vec::new();
-    for step in 0..10 {
-        let text = if step % 2 == 0 { second } else { first };
-        let start = Instant::now();
-        layer.set_text(&gpu, 0, text);
-        set_samples.push(start.elapsed().as_secs_f64() * 1000.0);
-    }
-    // The app may call `set_text` every frame: the same words again must cost nothing.
-    let repeat = {
-        let start = Instant::now();
-        layer.set_text(&gpu, 0, first);
-        start.elapsed().as_secs_f64() * 1000.0
-    };
-    // A text whose characters are all new: the first frame of a clip whose words the show has
-    // never used. This is the cost the glyph cache cannot remove, printed so the PR can quote it.
+    // First use: every character is new to the face, so this is the hitch a clip pays once. One
+    // face is baked (the look last drawn), not three.
+    let cold_text = "ZYXWVUTSRQPONMLKJIHG";
+    assert_eq!(cold_text.chars().count(), 20);
+    layer.set_text(&gpu, 0, "warm up");
     let cold = {
         let start = Instant::now();
-        layer.set_text(&gpu, 0, "ZYXWVUTSRQPONMLKJIHG");
+        layer.set_text(&gpu, 0, cold_text);
         start.elapsed().as_secs_f64() * 1000.0
     };
-    layer.set_text(&gpu, 0, first);
+
+    // A line typed one character at a time, the way the editor changes a text clip, from a cold
+    // cache: every keystroke may introduce a character, and the wrap keeps the em size — and so
+    // the glyph cache — the same across the whole length range.
+    let phrase = "the loom knows what the flesh wants and the loom is us and more";
+    // The clip's first text arrives as one change (that is the cold case above, reported
+    // separately); what follows is typing. Every later keystroke adds a character or two, which is
+    // where the cache has to hold.
+    let first_text: String = phrase.chars().take(18).collect();
+    layer.set_text(&gpu, 0, &first_text);
+    let mut typing = Vec::new();
+    for len in 19..=59usize {
+        let text: String = phrase.chars().take(len).collect();
+        let start = Instant::now();
+        layer.set_text(&gpu, 0, &text);
+        typing.push((len, start.elapsed().as_secs_f64() * 1000.0));
+    }
+
+    // The app calls `set_text` every frame: the same words again must cost nothing. The phrase
+    // is baked first (that is the typing loop's last state, a prefix), then the *next* call is
+    // the no-op the app makes every frame.
+    layer.set_text(&gpu, 0, phrase);
+    let repeat = {
+        let start = Instant::now();
+        layer.set_text(&gpu, 0, phrase);
+        start.elapsed().as_secs_f64() * 1000.0
+    };
+    layer.set_text(&gpu, 0, "the loom knows which");
 
     // The pass's floor on this machine: the same pipeline and target with a block so small that
     // almost every pixel takes the empty-space early-out. Measured the same way as the real pass,
     // so the two numbers share one GPU clock state.
-    let mut floor_samples: Vec<f64> = Vec::new();
     let tiny = params(0.02, 0.85, 0.5, 0.0, 0.0, 0.35, 0.0, 0.0);
+    let mut floor_samples: Vec<f64> = Vec::new();
     let mut gpu_samples: Vec<f64> = Vec::new();
     let mut record_samples = Vec::new();
     for step in 0..20 {
         let t = step as f32 / 60.0;
-        // The floor: the same pass, a block too small to shade.
         let mut recorder = FrameRecorder::new(&gpu);
         layer
             .draw(&mut recorder, 0, &dst, &frame, &tiny, t)
@@ -1032,39 +1041,67 @@ fn set_text_and_draw_costs() {
         gpu_samples.push(f64::from(pass.expect("checked just above")));
     }
     // One read-back after the timing loop: a read-back is its own submission and would contend
-    // with the pass being timed, which is what made the median jump between runs.
+    // with the pass being timed.
     let measured = Shot {
         pixels: gpu.read_back(&dst),
         width,
         height,
     };
+
     let stats = |samples: &mut Vec<f64>| {
         samples.sort_by(|a, b| a.total_cmp(b));
         (samples[0], samples[samples.len() / 2])
     };
-    let (set_min, set_median) = stats(&mut set_samples);
+    let mut typing_ms: Vec<f64> = typing.iter().map(|(_, ms)| *ms).collect();
+    let typing_worst = typing
+        .iter()
+        .map(|(len, ms)| (*len, *ms))
+        .fold((0usize, 0.0f64), |worst, next| {
+            if next.1 > worst.1 { next } else { worst }
+        });
+    let (typing_min, typing_median) = stats(&mut typing_ms);
     let (record_min, record_median) = stats(&mut record_samples);
     let (draw_min, draw_median) = stats(&mut gpu_samples);
     let (_, floor_median) = stats(&mut floor_samples);
     let lit = measured.lit();
 
     println!(
-        "text at {width}x{height}: set_text (20 chars, warmed) {set_min:.3} / {set_median:.3} ms \
-         min/median over {} changes, a first-use text {cold:.3} ms, a repeated text {repeat:.4} \
-         ms, draw record {record_min:.3} / {record_median:.3} ms on the CPU, GPU `text.glyphs` \
-         {draw_min:.4} / {draw_median:.4} ms min/median (an empty pass of the same pipeline: \
+        "text at {width}x{height}: set_text typing 18..59 chars {typing_min:.3} / \\
+         {typing_median:.3} ms min/median, worst {:.3} ms at {} chars; a first-use 20-character \\
+         text ({cold_text:?}) {cold:.3} ms; a repeated text {repeat:.4} ms; \\
+         draw record {record_min:.3} / {record_median:.3} ms on the CPU, GPU `text.glyphs` \\
+         {draw_min:.4} / {draw_median:.4} ms min/median (an empty pass of the same pipeline: \\
          {floor_median:.4} ms), {lit} lit px",
-        set_samples.len()
+        typing_worst.1,
+        typing_worst.0,
     );
 
     assert!(lit > 0, "the measured frame is blank");
     // Release bound from the brief. The debug test binary is 5-20x slower, so it gets its own,
     // much looser bound that still catches a per-frame mistake (a bake inside `draw`).
-    let set_bound = if cfg!(debug_assertions) { 60.0 } else { 2.0 };
+    // The median is the number the budget is stated in; a shared machine doubles every sample
+    // when another lane's GPU test is running. The worst is still bounded: it is a keystroke that
+    // rasterises a glyph the cache has never seen.
+    let typing_bound = if cfg!(debug_assertions) { 60.0 } else { 2.0 };
     assert!(
-        set_median < set_bound,
-        "set_text must stay under {set_bound} ms for a 20-character change, median \
-         {set_median:.3} ms (min {set_min:.3})"
+        typing_median < typing_bound,
+        "the median keystroke must stay under {typing_bound} ms, median {typing_median:.3} ms (worst {:.3} at {} characters)",
+        typing_worst.1,
+        typing_worst.0
+    );
+    let typing_worst_bound = if cfg!(debug_assertions) { 90.0 } else { 2.5 };
+    assert!(
+        typing_worst.1 < typing_worst_bound,
+        "no keystroke may cost more than {typing_worst_bound} ms, worst {:.3} ms at {} characters (median {typing_median:.3})",
+        typing_worst.1,
+        typing_worst.0
+    );
+    // The cold hitch is the price of a character the cache has never seen; it must not also pay
+    // for two faces that will not be drawn.
+    let cold_bound = if cfg!(debug_assertions) { 400.0 } else { 40.0 };
+    assert!(
+        cold < cold_bound,
+        "a first-use 20-character text must stay under {cold_bound} ms, took {cold:.3}"
     );
     assert!(
         repeat < 0.05,
@@ -1072,27 +1109,106 @@ fn set_text_and_draw_costs() {
     );
     // The median is the number the budget is stated in: 0.5 ms on a quiet machine. A pass of this
     // layer cannot cost less than a pass of the same pipeline, so the bound never goes below an
-    // empty pass's measured cost — on a loaded machine (other agents, other GPU tests, or an
-    // integrated GPU that has downclocked between isolated submissions) the floor alone can be
-    // 0.6 ms, and the run says which bound it used.
+    // empty pass's measured cost — on a loaded machine that floor alone can be 0.6 ms.
     let draw_median_bound = if cfg!(debug_assertions) {
         1.0
     } else {
         0.5f64.max(floor_median * 1.2)
     };
-    println!(
-        "text pass bound {draw_median_bound:.3} ms (empty pass on this machine: \
-         {floor_median:.3} ms)"
-    );
     assert!(
         draw_median < draw_median_bound,
-        "the text pass must stay under {draw_median_bound} ms median at 960x540, median \
+        "the text pass must stay under {draw_median_bound} ms median at 960x540, median \\
          {draw_median:.4} ms (min {draw_min:.4}, an empty pass measures {floor_median:.4})"
     );
     assert!(
         record_min < 0.5,
-        "recording the pass on the CPU must stay under 0.5 ms, min {record_min:.3} ms (median \
+        "recording the pass on the CPU must stay under 0.5 ms, min {record_min:.3} ms (median \\
          {record_median:.3})"
+    );
+    assert_no_validation_messages(&gpu);
+}
+
+/// The pair that exposed the merge: with the stroke dilation at its old weight the `a` and the
+/// `t` welded into one blob through their outlines. They must stay two letters, and the gap must
+/// be a real gap in the picture.
+#[test]
+fn a_tight_pair_keeps_its_gap() {
+    let gpu = gpu();
+    let (width, height) = (960u32, 540u32);
+    let frame = audio_frame();
+    for text in ["at", "To", "AV"] {
+        let shot = draw_once(
+            &gpu,
+            text,
+            &params(0.9, 0.05, 0.5, 0.0, 0.0, 0.45, 0.0, 0.0),
+            &frame,
+            0.0,
+            width,
+            height,
+        );
+        let (x0, y0, x1, y1) = shot.ink_box().expect("the pair is visible");
+        // Columns through the middle of the pair that carry no solid ink: a welded pair has none.
+        let mut gaps = 0;
+        for x in x0..=x1 {
+            if (y0..=y1).all(|y| !is_solid_ink(&shot.pixel(x, y))) {
+                gaps += 1;
+            }
+        }
+        println!("{text:?}: {gaps} empty columns between the glyphs");
+        assert!(
+            gaps >= 2,
+            "{text:?} welded its two glyphs together: no empty column inside the pair"
+        );
+    }
+    assert_no_validation_messages(&gpu);
+}
+
+/// Long lines: 100 characters wrap into several lines and stay a readable size, and a text far
+/// past the cap still draws a bounded block instead of a smear or nothing.
+#[test]
+fn long_lines_wrap_and_a_huge_text_is_capped() {
+    let gpu = gpu();
+    let (width, height) = (960u32, 540u32);
+    let frame = AnalysisFrame::default();
+    let params = params(0.6, 0.85, 0.5, 0.0, 0.0, 0.35, 0.0, 0.0);
+
+    let hundred = "the loom knows what the flesh wants and the loom is us and the flesh is the loom".to_string();
+    assert!(hundred.chars().count() >= 70);
+    let shot = draw_once(&gpu, &hundred, &params, &frame, 0.0, width, height);
+    let (x0, y0, x1, y1) = shot.ink_box().expect("a long line is visible");
+    let box_height = y1 - y0 + 1;
+    println!(
+        "{} chars: box {}x{} at ({x0},{y0})",
+        hundred.chars().count(),
+        x1 - x0 + 1,
+        box_height
+    );
+    assert!(
+        box_height > height * 12 / 100,
+        "a long line must wrap into a readable block, got {box_height}px tall in a {height}px frame"
+    );
+    assert!(
+        x0 >= 2 && y0 >= 2 && x1 + 2 < width && y1 + 2 < height,
+        "the wrapped block must stay inside the frame"
+    );
+
+    let huge = "lorem ipsum dolor sit amet ".repeat(100);
+    let shot = draw_once(&gpu, &huge, &params, &frame, 0.0, width, height);
+    let (x0, y0, x1, y1) = shot.ink_box().expect("a capped text still draws its visible part");
+    println!(
+        "{} chars: lit {} px, box {}x{}",
+        huge.chars().count(),
+        shot.lit(),
+        x1 - x0 + 1,
+        y1 - y0 + 1
+    );
+    assert!(
+        x0 >= 2 && y0 >= 2 && x1 + 2 < width && y1 + 2 < height,
+        "a capped text must not smear into the frame's edge"
+    );
+    assert!(
+        (y1 - y0 + 1) < height * 90 / 100,
+        "a capped text must be a bounded block"
     );
     assert_no_validation_messages(&gpu);
 }

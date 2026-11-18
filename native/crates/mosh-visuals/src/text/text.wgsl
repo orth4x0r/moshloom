@@ -122,12 +122,12 @@ fn over(base: vec4<f32>, src: vec4<f32>) -> vec4<f32> {
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let res = U.dst;
-    // A layer target is V-mirrored relative to what the stage shows: the compositor flips every
-    // layer once when it writes the output (mosh-render's `fullscreen.vert` puts uv 0 at the
-    // bottom, so sampling a layer into the output reverses it). Every other visualizer flips its
-    // own source for the same reason (see `camera/overlay_camera.wgsl`). So the word is drawn
-    // mirrored here and reads upright on the stage; `screen` is the audience's coordinate, y
-    // down from the top of the picture.
+    // A layer target is V-mirrored relative to the picture an audience sees. There is exactly one
+    // flip: the compositor samples every layer with `fullscreen.vert`'s uv, which is 0 at the
+    // bottom of the output, so a layer's row 0 lands at the bottom of the frame (the present pass
+    // adds no second flip). `the_word_is_upright_on_the_stage` measures this through the real
+    // compositor. So the word is drawn mirrored in the layer here and reads upright on the stage:
+    // `screen` is the audience's coordinate, y down from the top of the picture.
     let screen = vec2<f32>(position.x, res.y - position.y);
     let look = clamp(U.p0.y, 0.0, 0.999) * 3.0;
     let size = clamp(U.p0.x, 0.0, 1.0);
@@ -217,12 +217,14 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let depth = clamp(-d0 / bevel, 0.0, 1.0);
 
     // The stroke's weight, before anything is added to the silhouette.
-    var bold = 0.011 * block_h;
+    // The dilation is what gives the hairline default instances a display weight, and it also
+    // closes any gap narrower than twice itself: a pair like "at" must stay two letters, so it is
+    // a fraction of the stroke and never more than a couple of percent of the block.
+    var bold = 0.008 * block_h;
     if (look < 1.0) {
-        bold = (0.017 + 0.006 * low) * block_h;
+        bold = (0.009 + 0.003 * low) * block_h;
     } else if (look < 2.0) {
-        // The blackletter face's default instance is a hairline; a polished metal needs a stroke.
-        bold = 0.020 * block_h;
+        bold = 0.012 * block_h;
     }
 
     // Barbs (sigil only): sharp accents that grow out of the strokes. They are geometry in the
@@ -232,16 +234,30 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     var shape = d0;
     var barb_tip = 0.0;
     if (look >= 1.0 && look < 2.0) {
-        // Short enough to stay inside the field's range, so a spike is always attached to a
-        // stroke and never a band of its own out in the margin.
-        let barb_len = min((0.045 + 0.015 * glitch) * block_h, 0.40 * field_reach);
-        let lattice = dot(offset * block_h, vec2<f32>(0.82, 0.57)) / max(barb_len * 2.6, 0.001);
-        let teeth = pow(abs(sin(lattice * 3.14159)), 34.0);
+        // A thorn: a tapered spike growing out of the silhouette. The lattice runs along the
+        // edge, one cell per thorn, with two incommensurate hashes so the spacing never lines up
+        // like hatching; each thorn bends its own way as it rises, is thick at the stroke and
+        // comes to a point, and most cells grow nothing at all.
+        let barb_len = min((0.075 + 0.020 * glitch) * block_h, 0.45 * field_reach);
+        let along = dot(offset * block_h, vec2<f32>(0.94, 0.34)) / max(barb_len, 0.001);
+        let cell = floor(along);
+        let bend_hash = hash11(cell * 7.13 + 3.7);
+        let grow_hash = hash11(cell * 3.71 + 9.1);
+        let phase = fract(along) - 0.5;
         let beyond = d0 - bold;
-        let outside = smoothstep(0.05 * barb_len, 0.55 * barb_len, beyond);
-        let near_edge = outside * (1.0 - smoothstep(0.9 * barb_len, 1.3 * barb_len, beyond));
-        shape = d0 - teeth * near_edge * barb_len;
-        barb_tip = clamp(smoothstep(0.0, 0.7 * barb_len, beyond), 0.0, 1.0) * teeth * near_edge;
+        let rise = clamp(beyond / max(barb_len, 0.001), 0.0, 1.0);
+        // The spike leans as it rises, so it is a curve, not a comb tooth.
+        let curved = phase + (bend_hash - 0.5) * 1.2 * rise;
+        // Thick where it leaves the stroke, a point at the tip.
+        let width = mix(0.30, 0.01, rise);
+        let pointed = 1.0 - smoothstep(0.0, width, abs(curved));
+        // Few cells grow a thorn, at their own length: sparse and asymmetric, not a fringe.
+        let sparse = smoothstep(0.74, 0.88, grow_hash);
+        let length = 0.6 + 0.4 * bend_hash;
+        let present = smoothstep(-0.02, 0.08, beyond) * (1.0 - smoothstep(0.9, 1.0, rise));
+        let spike = pointed * sparse * present * (1.0 - rise * rise);
+        shape = d0 - spike * length * barb_len;
+        barb_tip = spike * (0.35 + 0.65 * rise);
     }
 
     // The antialiasing width in distance units: the field is in screen pixels and its gradient
@@ -325,13 +341,14 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
             0.35,
         );
         let silver = mix(
-            vec3<f32>(0.14, 0.15, 0.18),
-            vec3<f32>(0.94, 0.95, 0.98),
-            smoothstep(0.02, 0.55, depth),
+            vec3<f32>(0.30, 0.31, 0.35),
+            vec3<f32>(0.99, 0.995, 1.0),
+            smoothstep(0.0, 0.34, depth),
         );
-        let brush = 0.5 + 0.5 * sin((offset.y * 9.0 + offset.x * 2.0) + facing.y * 3.0);
-        var c = silver * (0.74 + 0.32 * brush);
-        c = c + film * fresnel * 0.70;
+        let brush = 0.5 + 0.5 * sin((offset.y * 7.0 + offset.x * 1.5));
+        // A darker rim and a bright core: polished metal needs the falloff, not a flat plate.
+        var c = silver * (0.86 + 0.18 * brush) * mix(0.55, 1.05, smoothstep(0.0, 0.40, depth));
+        c = c + film * fresnel * 0.45;
         c = c + vec3<f32>(1.0) * specular * 1.10;
         c = c + vec3<f32>(0.70, 0.05, 0.10) * barb_tip * 0.9;
         body_colour = tonemap(c * 1.05);

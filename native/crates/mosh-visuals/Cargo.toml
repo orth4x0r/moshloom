@@ -12,6 +12,9 @@ mosh-core = { path = "../mosh-core" }
 mosh-render = { path = "../mosh-render" }
 mosh-shaders = { path = "../mosh-shaders" }
 mosh-video = { path = "../mosh-video" }
+# GPOS pair kerning: fontdue reads only the legacy `kern` table, and none of the three display
+# faces has one (they are all OpenType GPOS fonts). ttf-parser is already fontdue's own parser.
+ttf-parser = "0.25"
 
 [dev-dependencies]
 # Test fixtures are WGSL too, compiled in the test (frozen patterns, solid colours).

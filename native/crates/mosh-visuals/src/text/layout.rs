@@ -1,62 +1,58 @@
-//! Font loading, glyph rasterising, the signed distance field and line layout.
+//! Font loading, glyph rasterising, pair kerning, line wrapping, the signed distance field and the
+//! block layout.
 //!
 //! Everything in this module runs inside [`crate::text::TextLayer::set_text`], when a text clip
 //! starts or its words change. Nothing here runs per frame: `draw` only records one pass.
 //!
-//! # One field per glyph tile, composed into one field for the line
+//! # One field per glyph tile, composed into one field for the block
 //!
 //! Each glyph is rasterised into its own *tile*: its ink box plus [`PAD`] on every side, and the
 //! distance transform runs over that tile. A tile therefore holds the true distance to that
 //! glyph's edge out to [`SDF_RANGE`], which is what lets the sheet take the nearest tile per pixel
-//! (`Sheet::bake`): the result is the line's own distance field, and there is no cell for an
+//! (`Sheet::compose`): the result is the block's own distance field, and there is no cell for an
 //! outline, a glow or a bevel to be cut at. A tile is a pure function of (face, character, em
-//! size), so it is cached and a new text re-rasters only the characters it introduces — the old
-//! per-cell sheet had to redo every glyph on every text change, and cut each one at its cell.
+//! size), so it is cached and a new text re-rasterises only the characters it introduces.
 //!
-//! # Why an SDF and not a coverage bitmap
+//! # Kerning
 //!
-//! The sheet is baked once, at [`BAKE_PX`] em, while `size` (`p0`) scales it every frame. A signed
-//! distance field stays smooth under that scaling: the shader thresholds the distance with a
-//! screen-space antialiasing width, so a glyph three times its baked size still has a clean edge,
-//! and the same distance drives the outline, the glow and the bevel.
+//! Spacing is the font's own: every glyph's advance width plus the pair adjustment the font's
+//! **GPOS** table gives for the pair before it. `fontdue` only reads the legacy `kern` table, and
+//! none of the three display faces has one, so the GPOS lookup (PairPos formats 1 and 2) is read
+//! here through `ttf-parser` — fontdue's own parser, already on the dependency graph. Pair values
+//! are cached per (left, right) in font units; the pixel value is `units * px / units_per_em`.
 //!
-//! The distance field is a 3-4 chamfer transform: two sweeps over the mask, each pixel taking the
-//! cheapest of its already-visited neighbours plus 3 (across) or 4 (diagonal). That is a handful of
-//! `u8` adds per pixel, not a quadratic search, so the whole bake stays inside a text change.
+//! # Wrapping and the length cap
 //!
-//! # Layout
+//! A display line is wrapped to [`WRAP_EM`] em of advance width (word wrap, breaking a word that is
+//! longer than a whole line), because the shader fits the block to the frame: an unwrapped 100
+//! character line would be fitted down to a stripe a few percent of the frame tall. Explicit `\n`
+//! breaks are kept. At most [`MAX_LINES`] visual lines are drawn and at most [`MAX_CHARS`]
+//! characters are laid out; anything beyond is dropped and logged once, so a pasted essay cannot
+//! produce a smear or an empty frame.
 //!
-//! Lines come from `\n`. Within a line the pen advances by the font's own advance widths plus its
-//! kerning pairs, which is what keeps letter spacing typographically right instead of whatever a
-//! cell grid happens to produce; each line is then centred inside the block by its *advance* width
-//! (not its ink width, which excludes side bearings and would sit the line visibly off centre) and
-//! the block keeps the union of the ink boxes so a glyph that overhangs its advance cannot be cut.
+//! # Sub-pixel edges
 //!
-//! # The glyph cache
-//!
-//! A tile is a pure function of (face, character, em size), so it is cached on the [`Face`] and
-//! reused by the next text: a lyric changing one word re-rasters (and re-transforms) only the
-//! characters that are new to it, and composing the sheet is a blit per glyph. This is what keeps
-//! `set_text` under the 2 ms budget it has on the render thread (see `tests/text.rs`,
-//! `set_text_and_draw_costs`).
+//! The rasteriser's antialiased coverage says where inside a pixel the edge is, so a pixel whose
+//! coverage is partial gets its distance from the coverage instead of from the pixel grid. Without
+//! that, every edge is quantised to whole baked pixels, which is visible as stair-stepping once
+//! the shader scales the block up (the sheet is baked at [`BAKE_PX`] em and a fitted line at 540p
+//! draws it 3-4x larger).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use fontdue::{Font, FontSettings};
 
 /// Em size the glyphs are rasterised at. The sheet is a distance field, so a layer that draws at
 /// 2x this size is still crisp; this is the one number that trades `set_text` time for sharpness.
-pub const BAKE_PX: f32 = 112.0;
+pub const BAKE_PX: f32 = 96.0;
 
 /// How far, in baked pixels, a distance sample stays meaningful on each side of the edge. The
-/// shader reads the sheet as `0.5 = edge` and converts back with the same constant. An outline at
-/// its maximum is about 3.5 baked pixels wide and a glow is dead by 10, so 12 leaves headroom.
+/// shader reads the sheet as `0.5 = edge` and converts back with the same constant.
 pub const SDF_RANGE: f32 = 12.0;
 
-/// Baked pixels over which the bevel's height falls from the stroke's centre to its edge. Baked
-/// into the sheet's blue channel as the "depth" the shader turns into a surface normal.
+/// Baked pixels over which the bevel's height falls from the stroke's centre to its edge.
 pub const BEVEL_PX: f32 = 9.0;
 
 /// Room around a glyph's ink for the distance field's outside half, in baked pixels: the field's
@@ -64,28 +60,73 @@ pub const BEVEL_PX: f32 = 9.0;
 /// texture's clamp.
 pub const PAD: i32 = SDF_RANGE as i32 + 2;
 
-/// A loaded face. `fontdue::Font` is the parser and rasteriser; the face's licence is in
-/// `native/assets/fonts/`.
+/// A visual line wraps at this many characters' worth of advance (measured on the face's `o`), so
+/// every face gets a similar number of letters per line — a fixed em count gives the wide
+/// blackletter seven characters and the narrow grotesque twenty.
+pub const WRAP_CHARS: f32 = 9.0;
+
+/// The most visual lines a block draws (explicit `\n` breaks included).
+pub const MAX_LINES: usize = 7;
+
+/// The most characters a block lays out; the rest is dropped and logged.
+pub const MAX_CHARS: usize = 600;
+
+/// Tiles kept per face. A few hundred glyphs at one em size is far more than a show uses; the cap
+/// is there so a long lyric cannot grow the cache without bound.
+pub const CACHE_TILES: usize = 192;
+
+/// A loaded face: fontdue for rasterising, ttf-parser for the GPOS pair adjustments.
 pub struct Face {
     font: Font,
-    /// Rasterised glyphs, keyed by character and em size. Pure data, so sharing one bake between
-    /// two texts of the same face is exact, not an approximation.
-    glyphs: RefCell<HashMap<CacheKey, Rc<CachedGlyph>>>,
+    outline: ttf_parser::Face<'static>,
+    units_per_em: f32,
+    /// GPOS pair adjustment in font units, cached per (left, right).
+    kerning: RefCell<HashMap<(char, char), i16>>,
+    glyphs: RefCell<GlyphCache>,
+    /// True when this face's look shades with the baked surface direction (chrome, sigil). The
+    /// clean look only needs the distance, so its bake skips the gradient pass.
+    normals: bool,
+    /// One line of text at [`BAKE_PX`], ascent to the next baseline.
+    line_height: f32,
+}
+
+/// Tiles on one face, least recently used first.
+struct GlyphCache {
+    map: HashMap<CacheKey, Rc<CachedGlyph>>,
+    order: VecDeque<CacheKey>,
+}
+
+impl GlyphCache {
+    fn get(&mut self, key: &CacheKey) -> Option<Rc<CachedGlyph>> {
+        let glyph = self.map.get(key).cloned()?;
+        if let Some(at) = self.order.iter().position(|held| held == key) {
+            self.order.remove(at);
+        }
+        self.order.push_back(*key);
+        Some(glyph)
+    }
+
+    fn insert(&mut self, key: CacheKey, glyph: Rc<CachedGlyph>) {
+        self.map.insert(key, glyph);
+        self.order.push_back(key);
+        while self.order.len() > CACHE_TILES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.map.remove(&oldest);
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct CacheKey {
     ch: char,
-    /// The em size in 1/16 pixel, so a float size that differs only by rounding noise is a hit.
-    px_16: u32,
+    /// The em size in 1/256 pixel. The size is a fixed [`BAKE_PX`] for every text, so this is
+    /// effectively per face and character; the field keeps a later ladder honest.
+    px_256: u32,
 }
 
 /// One rasterised glyph: its baked field tile and the metrics needed to place it.
-///
-/// The tile is the glyph's ink box plus [`PAD`] on every side, already in the sheet's BGRA field
-/// encoding. It is the true signed distance to *this* glyph's edge within [`SDF_RANGE`] of it,
-/// which is what lets [`crate::text::sheet::Sheet::bake`] compose a line by taking the nearest
-/// tile per pixel: the composed field is the line's distance field, not a grid of clipped cells.
 pub struct CachedGlyph {
     /// BGRA, `tile_w * tile_h * 4` bytes: `(unused, normal.y, normal.x, distance)`.
     pub tile: Vec<u8>,
@@ -97,15 +138,15 @@ pub struct CachedGlyph {
     /// Bitmap ink box relative to the pen, y up (font units scaled to pixels).
     pub xmin: i32,
     pub ymin: i32,
-    /// The font's advance for this character, in pixels. Spacing comes from here, not from a cell.
+    /// The font's advance for this character, in pixels.
     pub advance: f32,
 }
 
 /// One glyph placed in the laid-out block.
 pub struct Glyph {
     pub glyph: Rc<CachedGlyph>,
-    /// Cell top-left in block pixels, y down. The cell is the ink box; the distance field's padding
-    /// lives in the sheet, not per glyph, so these boxes are allowed to overlap (kerning does).
+    /// Cell top-left in block pixels, y down. The cell is the ink box; the field's padding lives
+    /// in the tile, not per glyph, so these boxes are allowed to overlap (kerning does).
     pub x: i32,
     pub y: i32,
 }
@@ -131,9 +172,12 @@ pub struct Layout {
     /// "the string is as wide as the font says" is measured against.
     #[cfg_attr(not(test), allow(dead_code))]
     pub advance_w: f32,
-    /// One entry per line, in reading order, already centred in the block.
+    /// One entry per visual line, in reading order, already centred in the block.
     #[cfg_attr(not(test), allow(dead_code))]
     pub lines: Vec<Line>,
+    /// Characters the length cap dropped from the end of the text (0 for a text that fits).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub dropped: usize,
 }
 
 /// One glyph before the block's origin and the per-line centring are known.
@@ -144,47 +188,138 @@ struct Placed {
     line: usize,
 }
 
+/// One visual line: the character range it draws, and its advance width.
+struct VisualLine {
+    first: usize,
+    end: usize,
+    advance: f32,
+}
+
 impl Face {
     /// Loads a face from the bytes committed under `native/assets/fonts/`. Returns `None` when the
     /// font cannot be parsed; the layer then draws black instead of failing to start.
-    pub fn new(bytes: &'static [u8]) -> Option<Face> {
-        Font::from_bytes(bytes, FontSettings::default())
-            .ok()
-            .map(|font| Face {
-                font,
-                glyphs: RefCell::new(HashMap::new()),
-            })
+    ///
+    /// `normals` asks for the baked surface direction in the tiles (the chrome and sigil looks);
+    /// the clean look passes `false` and its bake skips that pass.
+    pub fn new(bytes: &'static [u8], normals: bool) -> Option<Face> {
+        let font = Font::from_bytes(bytes, FontSettings::default()).ok()?;
+        let outline = ttf_parser::Face::parse(bytes, 0).ok()?;
+        let units_per_em = f32::from(outline.units_per_em());
+        let line_height = font
+            .horizontal_line_metrics(BAKE_PX)
+            .map(|metrics| metrics.new_line_size + BAKE_PX * 0.10)
+            .unwrap_or(BAKE_PX * 1.2);
+        Some(Face {
+            font,
+            outline,
+            units_per_em,
+            kerning: RefCell::new(HashMap::new()),
+            glyphs: RefCell::new(GlyphCache {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            }),
+            normals,
+            line_height,
+        })
     }
 
-    /// Number of glyphs currently cached, for the cache test.
-    #[cfg(test)]
-    fn cached(&self) -> usize {
-        self.glyphs.borrow().len()
+    /// One line of text at [`BAKE_PX`], ascent to the next baseline. The sheet's capacity is
+    /// derived from this.
+    pub fn line_height(&self) -> f32 {
+        self.line_height
     }
 
-    /// One character's rasterised coverage, from the cache when this face already baked it.
+    /// The advance width a visual line wraps to, at `px`: [`WRAP_CHARS`] of this face's own
+    /// letters, clamped so no face gets a silly line.
+    pub fn wrap_width(&self, px: f32) -> f32 {
+        let reference = self.advance('o', px).max(px * 0.35);
+        (WRAP_CHARS * reference).clamp(px * 5.0, px * 16.0)
+    }
+
+    /// The GPOS pair adjustment for `left` followed by `right`, in em. Zero when the face has no
+    /// such pair. This is the real kerning: `fontdue`'s own call reads only the legacy `kern`
+    /// table, which none of the display faces has.
+    pub fn kern_em(&self, left: char, right: char) -> f32 {
+        let units = {
+            let cache = self.kerning.borrow();
+            cache.get(&(left, right)).copied()
+        };
+        let units = match units {
+            Some(units) => units,
+            None => {
+                let units = self.gpos_pair(left, right);
+                self.kerning.borrow_mut().insert((left, right), units);
+                units
+            }
+        };
+        f32::from(units) / self.units_per_em
+    }
+
+    /// The `kern` feature's PairPos adjustment for the pair, in font units.
+    fn gpos_pair(&self, left: char, right: char) -> i16 {
+        let Some(table) = self.outline.tables().gpos else {
+            return 0;
+        };
+        let (Some(left), Some(right)) = (
+            self.outline.glyph_index(left),
+            self.outline.glyph_index(right),
+        ) else {
+            return 0;
+        };
+        // Only the pair-positioning lookups the `kern` feature names: mark attachment and the
+        // other GPOS lookups move glyphs in ways a display line does not want here.
+        let kern_tag = u32::from_be_bytes(*b"kern");
+        let mut total = 0i16;
+        for feature_index in 0..table.features.len() {
+            let Some(feature) = table.features.get(feature_index) else {
+                continue;
+            };
+            if feature.tag.0 != kern_tag {
+                continue;
+            }
+            for slot in 0..feature.lookup_indices.len() {
+                let Some(index) = feature.lookup_indices.get(slot) else {
+                    continue;
+                };
+                let Some(lookup) = table.lookups.get(index) else {
+                    continue;
+                };
+                if let Some(value) = pair_value(&lookup, left, right) {
+                    total += value;
+                    break;
+                }
+            }
+        }
+        total
+    }
+
+    /// The font's advance for `ch`, in pixels, without rasterising it.
+    fn advance(&self, ch: char, px: f32) -> f32 {
+        self.font.metrics(ch, px).advance_width
+    }
+
+    /// One character's baked field tile, from the cache when this face already baked it.
     fn glyph(&self, ch: char, px: f32) -> Rc<CachedGlyph> {
         let key = CacheKey {
             ch,
-            px_16: (px * 16.0).round().max(1.0) as u32,
+            px_256: (px * 256.0).round().max(1.0) as u32,
         };
-        if let Some(hit) = self.glyphs.borrow().get(&key) {
-            return Rc::clone(hit);
+        if let Some(hit) = self.glyphs.borrow_mut().get(&key) {
+            return hit;
         }
         let (metrics, coverage) = self.font.rasterize(ch, px);
         let (width, height) = (metrics.width, metrics.height);
         let pad = PAD as usize;
-        let mut mask = vec![0u8; (width + 2 * pad) * (height + 2 * pad)];
-        for row in 0..height {
-            let source = row * width;
-            let target = (row + pad) * (width + 2 * pad) + pad;
-            mask[target..target + width]
-                .copy_from_slice(&coverage[source..source + width]);
-        }
         let tile_w = width + 2 * pad;
         let tile_h = height + 2 * pad;
+        let mut mask = vec![0u8; tile_w * tile_h];
+        for row in 0..height {
+            let source = row * width;
+            let target = (row + pad) * tile_w + pad;
+            mask[target..target + width].copy_from_slice(&coverage[source..source + width]);
+        }
         let mut tile = vec![0u8; tile_w * tile_h * 4];
-        write_field(&mask, tile_w, tile_h, tile_w, &mut tile);
+        write_field(&mask, tile_w, tile_h, tile_w, self.normals, &mut tile);
         let glyph = Rc::new(CachedGlyph {
             tile,
             tile_w,
@@ -199,41 +334,135 @@ impl Face {
         glyph
     }
 
-    /// Lays `text` out at `px` em. Empty (or whitespace-only) text has no glyphs and no block.
+    /// Lays `text` out at `px` em: wrapped, capped and centred. Empty (or whitespace-only) text
+    /// has no glyphs and no block.
     pub fn layout(&self, text: &str, px: f32) -> Layout {
-        let line_metrics = self.font.horizontal_line_metrics(px);
-        let (ascent, line_height) = match line_metrics {
-            Some(metrics) => (metrics.ascent, metrics.new_line_size + px * 0.10),
-            None => (px * 0.8, px * 1.2),
-        };
+        let ascent = self
+            .font
+            .horizontal_line_metrics(px)
+            .map(|metrics| metrics.ascent)
+            .unwrap_or(px * 0.8);
+        let line_height = self.line_height * (px / BAKE_PX);
 
+        // The characters the cap allows, with the per-glyph step (advance + the kern it takes
+        // from the character before it) so a line's width is a prefix-sum lookup.
+        let chars: Vec<char> = text
+            .chars()
+            .map(|ch| if ch == '\t' { ' ' } else { ch })
+            .filter(|ch| !ch.is_control() || *ch == '\n')
+            .take(MAX_CHARS)
+            .collect();
+        let dropped = text.chars().count().saturating_sub(chars.len());
+        let mut steps = Vec::with_capacity(chars.len());
+        let mut previous = None;
+        for ch in &chars {
+            let advance = if *ch == '\n' {
+                continue;
+            } else {
+                self.advance(*ch, px)
+            };
+            let kern = previous
+                .filter(|_| *ch != '\n')
+                .map(|left: char| self.kern_em(left, *ch) * px)
+                .unwrap_or(0.0);
+            steps.push(advance + kern);
+            previous = Some(*ch);
+        }
+
+        // Greedy wrap on the advance width, preferring the last space in the line.
+        let wrap = self.wrap_width(px);
+        let mut lines: Vec<VisualLine> = Vec::new();
+        let mut first = 0usize;
+        let mut widths = vec![0.0f32; chars.len() + 1];
+        let mut step_index = 0usize;
+        for (index, ch) in chars.iter().enumerate() {
+            widths[index + 1] = widths[index]
+                + if *ch == '\n' {
+                    0.0
+                } else {
+                    let value = steps[step_index];
+                    step_index += 1;
+                    value
+                };
+        }
+        while first < chars.len() {
+            if lines.len() == MAX_LINES {
+                break;
+            }
+            if chars[first] == '\n' {
+                // A blank line: two breaks in a row, or one right at the start.
+                lines.push(VisualLine {
+                    first,
+                    end: first,
+                    advance: 0.0,
+                });
+                first += 1;
+                continue;
+            }
+            // The furthest character that still fits, and the last space before it.
+            let mut end = first;
+            while end < chars.len()
+                && chars[end] != '\n'
+                && widths[end + 1] - widths[first] <= wrap
+            {
+                end += 1;
+            }
+            if end == first {
+                end = first + 1;
+            }
+            // The last space, but only when the line has to be broken at all: a line that ends
+            // the text (or reaches an explicit break) is not re-broken at its own space.
+            let mut break_at = end;
+            let must_break = end < chars.len() && chars[end] != '\n';
+            if must_break {
+                for index in (first + 1..=end).rev() {
+                    if chars[index - 1] == ' ' {
+                        break_at = index - 1;
+                        break;
+                    }
+                }
+                if break_at == first {
+                    break_at = end;
+                }
+            }
+            lines.push(VisualLine {
+                first,
+                end: break_at,
+                advance: widths[break_at] - widths[first],
+            });
+            first = break_at;
+            if first < chars.len() && chars[first] == '\n' {
+                // The break this line was measured up to.
+                first += 1;
+            } else {
+                while first < chars.len() && chars[first] == ' ' {
+                    first += 1;
+                }
+            }
+        }
+        // A text that ends in a break has a last, empty line, and `\n` alone is one empty line.
+        if first == chars.len() && chars.last() == Some(&'\n') && lines.len() < MAX_LINES {
+            lines.push(VisualLine {
+                first,
+                end: first,
+                advance: 0.0,
+            });
+        }
+        let dropped = dropped + chars.len().saturating_sub(first.min(chars.len()));
+
+        // Place every glyph, line by line. Kerning is the font's, and only inside a line.
         let mut placed: Vec<Placed> = Vec::new();
-        let mut advances: Vec<f32> = Vec::new();
         let mut baseline = ascent;
-
-        for line_text in text.split('\n') {
-            let line_text = line_text.trim_end_matches('\r');
-            let line_index = advances.len();
+        for (line_index, line) in lines.iter().enumerate() {
             let mut pen = 0.0f32;
             let mut previous: Option<char> = None;
-
-            for mut ch in line_text.chars() {
-                if ch == '\t' {
-                    ch = ' ';
+            for ch in &chars[line.first..line.end.max(line.first)] {
+                if let Some(left) = previous {
+                    pen += self.kern_em(left, *ch) * px;
                 }
-                if ch.is_control() {
-                    continue;
-                }
-                if let Some(previous) = previous
-                    && let Some(kern) = self.font.horizontal_kern(previous, ch, px)
-                {
-                    pen += kern;
-                }
-                previous = Some(ch);
-                let glyph = self.glyph(ch, px);
+                previous = Some(*ch);
+                let glyph = self.glyph(*ch, px);
                 if glyph.width > 0 && glyph.height > 0 {
-                    // The cell's top-left, y down: the pen plus the bitmap's own left bearing,
-                    // and the baseline minus the bitmap's top.
                     let x = pen.round() as i32 + glyph.xmin;
                     let y = baseline.round() as i32 - (glyph.ymin + glyph.height as i32);
                     placed.push(Placed {
@@ -245,16 +474,18 @@ impl Face {
                 }
                 pen += glyph.advance;
             }
-            advances.push(pen);
             baseline += line_height;
         }
 
-        let block_advance = advances.iter().copied().fold(0.0f32, f32::max);
+        let block_advance = lines
+            .iter()
+            .map(|line| line.advance)
+            .fold(0.0f32, f32::max);
 
         // Centre every line by its advance width, not by its ink: a line's side bearings are part
         // of its width, and centring by ink is what puts a line visibly off the block's centre.
         for glyph in &mut placed {
-            let line_advance = advances[glyph.line];
+            let line_advance = lines[glyph.line].advance;
             glyph.x += ((block_advance - line_advance) * 0.5).round() as i32;
         }
 
@@ -273,16 +504,15 @@ impl Face {
         let block_w = (ink_right - ink_left).max(0);
         let block_h = (ink_bottom - ink_top).max(0);
 
-        // Line ink boxes and advances, in block space.
-        let mut lines: Vec<Line> = advances
+        let mut extents: Vec<Line> = lines
             .iter()
-            .map(|advance| Line {
+            .map(|line| Line {
                 ink_left: 0,
                 ink_right: 0,
-                advance: *advance,
+                advance: line.advance,
             })
             .collect();
-        for (line, extent) in lines.iter_mut().enumerate() {
+        for (line, extent) in extents.iter_mut().enumerate() {
             let of_line = placed.iter().filter(|glyph| glyph.line == line);
             let left = of_line.clone().map(|glyph| glyph.x).min();
             let right = of_line
@@ -308,31 +538,33 @@ impl Face {
             block_w,
             block_h,
             advance_w: block_advance,
-            lines,
+            lines: extents,
+            dropped,
         }
     }
 }
 
-/// Rasterises a laid-out block into one coverage mask, then derives the distance field and the
-/// bevel data from it.
-///
-/// `mask_w`/`mask_h` include the block's [`PAD`] on every side, so the field's outside half is
-/// real samples instead of a clamp at the block's border. The returned field is `mask_w * mask_h`
-/// entries per channel.
-/// Turns a laid-out block's antialiased coverage into a text sheet in place: one distance field
-/// for the whole block plus the bevel's surface direction, written straight into the sheet's BGRA
-/// bytes (see `text/sheet.rs` for the channel layout).
+/// Turns a laid-out block's antialiased coverage into field tiles in place: one distance field for
+/// the mask plus, when `normals`, the bevel's surface direction, written as BGRA (see
+/// `text/sheet.rs` for the channel layout).
 ///
 /// `width`/`height` include the block's [`PAD`] on every side, so the field's outside half is real
 /// samples instead of a clamp at the block's border. `stride` is the sheet's width in pixels: rows
-/// past `width` and the area below `height` stay zero, which is what makes the sheet's margin
-/// empty. `out` must be `stride * height * 4` bytes, zeroed.
-pub fn write_field(coverage: &[u8], width: usize, height: usize, stride: usize, out: &mut [u8]) {
+/// past `width` stay zero, which is what makes the margin empty. `out` must be `stride * height *
+/// 4` bytes, zeroed.
+pub fn write_field(
+    coverage: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    normals: bool,
+    out: &mut [u8],
+) {
     debug_assert_eq!(coverage.len(), width * height);
     debug_assert!(out.len() >= stride * height * 4);
 
-    /// Chamfer units: 3 = one pixel across, 4 = one pixel diagonally. `u8` saturates at 255
-    /// units (85 px), far past [`SDF_RANGE`], so the whole transform is one byte array.
+    /// Chamfer units: 3 = one pixel across, 4 = one pixel diagonally. `u8` saturates at 255 units
+    /// (85 px), far past [`SDF_RANGE`], so the whole transform is one byte array.
     const ACROSS: u8 = 3;
     const DIAGONAL: u8 = 4;
     const FAR: u8 = u8::MAX;
@@ -369,9 +601,7 @@ pub fn write_field(coverage: &[u8], width: usize, height: usize, stride: usize, 
         }
     }
 
-    // A 3-4 chamfer transform: one sweep from the top-left, one from the bottom-right. Each row is
-    // walked with `windows(3)` (the row above/below) and `iter_mut()` (this row), so no index is
-    // bounds-checked inside the loop.
+    // A 3-4 chamfer transform: one sweep from the top-left, one from the bottom-right.
     for y in 1..=height {
         let (head, tail) = distance.split_at_mut(y * padded);
         let above = &head[(y - 1) * padded..];
@@ -404,68 +634,105 @@ pub fn write_field(coverage: &[u8], width: usize, height: usize, stride: usize, 
         }
     }
 
-    // The distance byte for every chamfer unit, once: `0.5 = edge`, brighter inside, 0 past the
-    // field's range. Inside and outside pixels are one pixel apart when they touch, but the edge
-    // runs halfway between two pixel centres, so both sides are pulled in by half a pixel.
-    let range = (SDF_RANGE * 3.0).ceil() as i32 + 3;
-    let lut_len = (range * 2 + 1) as usize;
-    let mut sdf_lut = [0u8; 96];
-    for (index, value) in sdf_lut.iter_mut().enumerate().take(lut_len) {
-        let units = index as i32 - range;
-        let pixels = (units as f32 - (units.signum() as f32) * 1.5) / 3.0;
-        let encoded = 0.5 - pixels / (2.0 * SDF_RANGE);
-        *value = (encoded * 255.0).round().clamp(0.0, 255.0) as u8;
-    }
-    let band_units = ((BEVEL_PX + 2.0) * 3.0) as i32;
-
+    let band_units = (BEVEL_PX + 2.0) * 3.0;
     for y in 0..height {
-        let row = (y + 1) * padded;
-        let dist = &distance[row + 1..][..width];
-        let side = &inside[row + 1..][..width];
-        let up = &distance[row - padded..];
-        let down = &distance[row + padded..];
-        let up_side = &inside[row - padded..];
-        let down_side = &inside[row + padded..];
         let out_row = &mut out[y * stride * 4..][..width * 4];
         for x in 0..width {
-            let units = if side[x] == 1 {
-                -(i32::from(dist[x]))
-            } else {
-                i32::from(dist[x])
-            };
-            let index = (units + range).clamp(0, range * 2) as usize;
-            let sdf = sdf_lut[index];
-            // B, G, R, A: (unused), normal.y, normal.x, distance.
+            let pixels = signed_at(x, y, width, padded, &distance, &inside, coverage);
+            let encoded = 0.5 - pixels / (2.0 * SDF_RANGE);
+            let sdf = (encoded * 255.0).round().clamp(0.0, 255.0) as u8;
             let at_out = x * 4;
             out_row[at_out + 3] = sdf;
             // Beyond the field's range (and so in the sheet's margin) every byte stays zero: the
             // sheet's outer pixels are empty, and a bilinear tap there decodes to no surface.
-            if sdf == 0 {
+            if sdf == 0 || !normals {
                 continue;
             }
             // The outward surface direction only matters within a bevel of the edge; deeper
             // inside the surface faces the viewer, which is the encoded (0.5, 0.5).
             out_row[at_out + 1] = 128;
             out_row[at_out + 2] = 128;
-            if x > 0 && x + 1 < width && units.abs() < band_units {
-                let signed = |value: u8, is_inside: u8| -> f32 {
-                    if is_inside == 1 {
-                        -f32::from(value)
-                    } else {
-                        f32::from(value)
-                    }
-                };
-                let gx = signed(dist[x + 1], side[x + 1]) - signed(dist[x - 1], side[x - 1]);
-                let gy =
-                    signed(down[x + 1], down_side[x + 1]) - signed(up[x + 1], up_side[x + 1]);
-                let length = (gx * gx + gy * gy).sqrt();
-                if length > 0.001 {
-                    out_row[at_out + 1] = ((gy / length * 0.5 + 0.5) * 255.0).round() as u8;
-                    out_row[at_out + 2] = ((gx / length * 0.5 + 0.5) * 255.0).round() as u8;
-                }
+            if x == 0 || x + 1 >= width || y == 0 || y + 1 >= height {
+                continue;
+            }
+            if pixels.abs() * 3.0 >= band_units {
+                continue;
+            }
+            let gx = signed_at(x + 1, y, width, padded, &distance, &inside, coverage)
+                - signed_at(x - 1, y, width, padded, &distance, &inside, coverage);
+            let gy = signed_at(x, y + 1, width, padded, &distance, &inside, coverage)
+                - signed_at(x, y - 1, width, padded, &distance, &inside, coverage);
+            let length = (gx * gx + gy * gy).sqrt();
+            if length > 0.001 {
+                out_row[at_out + 1] = ((gy / length * 0.5 + 0.5) * 255.0).round() as u8;
+                out_row[at_out + 2] = ((gx / length * 0.5 + 0.5) * 255.0).round() as u8;
             }
         }
     }
+}
+
+/// The GPOS PairPos adjustment a lookup gives the pair, in font units, if it applies.
+fn pair_value(
+    lookup: &ttf_parser::opentype_layout::Lookup<'_>,
+    left: ttf_parser::GlyphId,
+    right: ttf_parser::GlyphId,
+) -> Option<i16> {
+    use ttf_parser::gpos::PositioningSubtable as Subtable;
+    for slot in 0..lookup.subtables.len() {
+        let Some(subtable) = lookup.subtables.get::<Subtable<'_>>(slot) else {
+            continue;
+        };
+        let Subtable::Pair(pair) = subtable else {
+            continue;
+        };
+        let Some(index) = pair.coverage().get(left) else {
+            continue;
+        };
+        let value = match pair {
+            ttf_parser::gpos::PairAdjustment::Format1 { sets, .. } => sets
+                .get(index)
+                .and_then(|set| set.get(right))
+                .map(|(first, _)| first.x_advance),
+            ttf_parser::gpos::PairAdjustment::Format2 {
+                classes, matrix, ..
+            } => matrix
+                .get((classes.0.get(left), classes.1.get(right)))
+                .map(|(first, _)| first.x_advance),
+        };
+        if let Some(value) = value {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// The signed distance of one mask pixel, in pixels, positive outside.
+///
+/// The chamfer transform measures the distance to the nearest *boundary pixel*, which puts every
+/// edge on the rasteriser's grid; scaling that up 3-4x at 540p is visible as stair-steps. The
+/// antialiased coverage says where inside a pixel the edge really is, so within a couple of pixels
+/// of the edge the two are blended, weighted by how close the pixel is. Both estimates agree at
+/// a pixel or two out (the transform is exact there, the coverage saturates), so the blend has no
+/// seam of its own — unlike using the coverage for partial pixels only, which made the neighbours
+/// of a partial pixel disagree by a whole pixel and scalloped the outline.
+fn signed_at(
+    x: usize,
+    y: usize,
+    width: usize,
+    padded: usize,
+    distance: &[u8],
+    inside: &[u8],
+    coverage: &[u8],
+) -> f32 {
+    let index = (y + 1) * padded + x + 1;
+    let value = f32::from(distance[index]);
+    let signed = if inside[index] == 1 { -value } else { value };
+    // Half a pixel in chamfer units is 1.5; the edge runs between pixel centres.
+    let transform = (signed - signed.signum() * 1.5) / 3.0;
+    let coverage = f32::from(coverage[y * width + x]) / 255.0;
+    let from_coverage = (0.5 - coverage) * 2.0;
+    let weight = (1.0 - transform.abs() / 2.5).clamp(0.0, 1.0);
+    transform * (1.0 - weight) + from_coverage * weight
 }
 
 #[cfg(test)]
@@ -473,7 +740,11 @@ mod tests {
     use super::*;
 
     fn unbounded() -> Face {
-        Face::new(crate::text::FACE_CHROME).expect("Unbounded")
+        Face::new(crate::text::FACE_CHROME, true).expect("Unbounded")
+    }
+
+    fn space_grotesk() -> Face {
+        Face::new(crate::text::FACE_CLEAN, false).expect("Space Grotesk")
     }
 
     #[test]
@@ -486,6 +757,45 @@ mod tests {
     }
 
     #[test]
+    fn gpos_kerning_is_read_from_the_font() {
+        // All three faces are OpenType fonts with GPOS and no legacy `kern` table, so fontdue's
+        // own `horizontal_kern` returns zero for every pair. These pairs really kern.
+        let face = space_grotesk();
+        let mut kerned = Vec::new();
+        for (left, right) in [('A', 'V'), ('T', 'o'), ('T', 'y'), ('V', 'a'), ('A', 'T')] {
+            let kern = face.kern_em(left, right);
+            println!("{left}{right}: {kern:+.4} em");
+            if kern != 0.0 {
+                kerned.push((left, right, kern));
+            }
+        }
+        assert!(
+            kerned.len() >= 2,
+            "the face's GPOS kern feature must move at least two of those pairs: {kerned:?}"
+        );
+        // And the layout must apply it: the line's width is the advances plus those kerns.
+        let text = "AV";
+        let layout = face.layout(text, BAKE_PX);
+        let advances = face.advance('A', BAKE_PX) + face.advance('V', BAKE_PX);
+        let kern = face.kern_em('A', 'V') * BAKE_PX;
+        println!(
+            "AV: line {:.2}px, advances {advances:.2}px, kern {kern:+.2}px",
+            layout.advance_w
+        );
+        assert!(
+            (layout.advance_w - (advances + kern)).abs() < 0.01,
+            "the pen must be the advances plus the GPOS pair value, got {:.3} vs {:.3}",
+            layout.advance_w,
+            advances + kern
+        );
+        assert!(
+            (layout.advance_w - advances).abs() > 0.5,
+            "this pair must actually kern: the line is {:.2}px, the advances alone {advances:.2}px",
+            layout.advance_w
+        );
+    }
+
+    #[test]
     fn each_line_is_centred_in_the_block() {
         let face = unbounded();
         let layout = face.layout("I\nWWWW\nILANA", BAKE_PX);
@@ -495,7 +805,6 @@ mod tests {
             widths.iter().any(|width| *width != widths[0]) && widths.len() == 3,
             "the three lines need different advances to test centring: {widths:?}"
         );
-        // The centred line's ink sits on the block's centre up to its side bearings.
         for line in &layout.lines {
             let centre = (line.ink_left + line.ink_right) as f32 * 0.5;
             let block_centre = layout.block_w as f32 * 0.5;
@@ -507,34 +816,59 @@ mod tests {
     }
 
     #[test]
-    fn spacing_comes_from_the_font_advances() {
+    fn a_long_line_wraps_instead_of_shrinking() {
         let face = unbounded();
-        let text = "ILANA";
+        let text = "the loom knows what the flesh wants and the loom is us";
         let layout = face.layout(text, BAKE_PX);
-        // The font's own answer, computed without this module's layout: advance widths plus the
-        // GPOS kerning pairs. `block_advance` must be that, to within rounding of the pen.
-        let mut expected = 0.0f32;
-        let mut previous = None;
-        for ch in text.chars() {
-            if let Some(previous) = previous
-                && let Some(kern) = face.font.horizontal_kern(previous, ch, BAKE_PX)
-            {
-                expected += kern;
-            }
-            expected += face.font.metrics(ch, BAKE_PX).advance_width;
-            previous = Some(ch);
-        }
-        let error = (layout.advance_w - expected).abs() / expected;
         assert!(
-            error < 0.02,
-            "the line is {:.2}px wide, the font's advances say {expected:.2}px ({:.1}% off)",
-            layout.advance_w,
-            error * 100.0
+            layout.lines.len() > 1,
+            "a {}-character line must wrap, got {} line(s)",
+            text.chars().count(),
+            layout.lines.len()
         );
-        // The ink is inside the advance box (side bearings push it in, never out past 2%).
+        let aspect = layout.block_w as f32 / layout.block_h.max(1) as f32;
+        println!(
+            "{} chars: {} lines, {}x{} block, aspect {aspect:.2}, no input dropped ({})",
+            text.chars().count(),
+            layout.lines.len(),
+            layout.block_w,
+            layout.block_h,
+            layout.dropped
+        );
+        assert_eq!(layout.dropped, 0, "a text this short must not be truncated");
         assert!(
-            layout.block_w as f32 <= expected * 1.02,
-            "glyph ink {}px is wider than the font's advances {expected:.2}px",
+            aspect < 8.0,
+            "a wrapped block's aspect must stay readable, got {aspect:.2}"
+        );
+    }
+
+    #[test]
+    fn a_too_long_text_is_truncated_and_logged() {
+        let face = unbounded();
+        let text = "lorem ipsum dolor sit amet ".repeat(80);
+        let layout = face.layout(&text, BAKE_PX);
+        println!(
+            "{} chars in: {} dropped, {} lines, {}x{} block",
+            text.chars().count(),
+            layout.dropped,
+            layout.lines.len(),
+            layout.block_w,
+            layout.block_h
+        );
+        assert!(
+            layout.dropped > 0,
+            "a {} character text must be truncated",
+            text.chars().count()
+        );
+        assert!(!layout.glyphs.is_empty(), "the visible part must still draw");
+        assert!(
+            layout.lines.len() <= MAX_LINES,
+            "the line cap must hold, got {}",
+            layout.lines.len()
+        );
+        assert!(
+            layout.block_w as f32 <= face.wrap_width(BAKE_PX) * 1.3,
+            "the wrapped block must stay inside the wrap width: {}",
             layout.block_w
         );
     }
@@ -551,21 +885,39 @@ mod tests {
     }
 
     #[test]
+    fn the_glyph_cache_is_bounded() {
+        let face = unbounded();
+        let mut drawn = 0usize;
+        for seed in 0..CACHE_TILES * 3 {
+            let ch = char::from_u32(0x21 + (seed % 90) as u32).unwrap_or('x');
+            let glyph = face.glyph(ch, BAKE_PX);
+            drawn += usize::from(glyph.width > 0);
+        }
+        let cached = face.glyphs.borrow().map.len();
+        println!(
+            "{drawn} glyphs drawn, {cached} tiles cached (cap {CACHE_TILES})"
+        );
+        assert!(
+            cached <= CACHE_TILES,
+            "the tile cache must stay bounded, got {cached}"
+        );
+    }
+
+    #[test]
     fn a_repeated_character_is_rasterised_once() {
         let face = unbounded();
         face.layout("ILANA", BAKE_PX);
-        let after_first = face.cached();
+        let after_first = face.glyphs.borrow().map.len();
         assert_eq!(after_first, 4, "ILANA has four distinct characters");
         face.layout("BANANA", BAKE_PX);
         assert_eq!(
-            face.cached(),
+            face.glyphs.borrow().map.len(),
             after_first + 1,
-            "a second text must only rasterise the characters it adds (B), got {} cached",
-            face.cached()
+            "a second text must only rasterise the characters it adds (B)"
         );
         face.layout("ILANA", BAKE_PX);
         assert_eq!(
-            face.cached(),
+            face.glyphs.borrow().map.len(),
             after_first + 1,
             "laying out a known text must not rasterise anything"
         );
@@ -582,10 +934,9 @@ mod tests {
                 coverage[(y + PAD as usize) * width + x + PAD as usize] = 255;
             }
         }
-        let stride = width;
-        let mut pixels = vec![0u8; stride * height * 4];
-        write_field(&coverage, width, height, stride, &mut pixels);
-        let at = |x: usize, y: usize| pixels[(y * stride + x) * 4 + 3];
+        let mut pixels = vec![0u8; width * height * 4];
+        write_field(&coverage, width, height, width, true, &mut pixels);
+        let at = |x: usize, y: usize| pixels[(y * width + x) * 4 + 3];
         let middle = at(PAD as usize + 12, PAD as usize + 12);
         assert!(
             middle > 200,
@@ -598,8 +949,10 @@ mod tests {
             "a pixel just outside the edge should be near 0.5, got {outside}"
         );
         // The field is 1-Lipschitz: one pixel can only move the distance by one pixel, which is
-        // 255 / (2 * SDF_RANGE) ~ 11 levels. A clipped cell shows up as a jump far larger.
-        let step = (255.0 / (2.0 * SDF_RANGE)).ceil() as i32 + 2;
+        // 255 / (2 * SDF_RANGE) ~ 11 levels. Clipped cells would show up as jumps far larger.
+        // Two and a half pixels: the antialiased coverage moves a pixel's edge by up to half a
+        // pixel against its neighbour's grid value. A clipped cell jumps 50-200 levels.
+        let step = (255.0 / (2.0 * SDF_RANGE) * 2.5).ceil() as i32;
         for y in 0..height {
             for x in 1..width {
                 let jump = i32::from(at(x, y)) - i32::from(at(x - 1, y));
@@ -624,3 +977,5 @@ mod tests {
         }
     }
 }
+
+
