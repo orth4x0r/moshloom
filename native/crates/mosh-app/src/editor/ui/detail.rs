@@ -26,6 +26,72 @@ const EFFECT_COLUMN: f32 = 236.0;
 const LAST_COLUMN: f32 = 204.0;
 /// The parameters column never gets narrower than this; the panel scrolls sideways instead.
 const PARAMS_MIN: f32 = 372.0;
+/// The gap between columns.
+const GAP: f32 = 12.0;
+
+/// Which half of a clip the detail panel shows beside the clip column when the panel is too
+/// narrow for all of it at once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DetailPage {
+    /// The eight parameters and their ranges.
+    #[default]
+    Parameters,
+    /// Effects, transition and follow action.
+    Effects,
+}
+
+/// How the detail panel divides a given width.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DetailPlan {
+    /// The panel is too narrow for its four columns: the clip column gets a switch, and the
+    /// rest shows one page at a time. Nothing is cut off and nothing needs a sideways scroll.
+    pub paged: bool,
+    pub clip: f32,
+    pub params: f32,
+    pub effects: f32,
+    pub last: f32,
+}
+
+impl DetailPlan {
+    /// The width the columns that are shown together add up to, gaps included.
+    pub fn used(&self, page: DetailPage) -> f32 {
+        if !self.paged {
+            return self.clip + self.params + self.effects + self.last + GAP * 3.0;
+        }
+        match page {
+            DetailPage::Parameters => self.clip + GAP + self.params,
+            DetailPage::Effects => self.clip + GAP + self.effects + GAP + self.last,
+        }
+    }
+}
+
+/// Divide `width` between the detail panel's columns.
+///
+/// Wide enough for all four (1052 points): clip, parameters (which take the spare room),
+/// effects, transition. Narrower (the control window beside the stage on a laptop is 605): the
+/// clip column and one page, with every column a little slimmer.
+pub fn detail_plan(width: f32) -> DetailPlan {
+    let all = CLIP_COLUMN + PARAMS_MIN + EFFECT_COLUMN + LAST_COLUMN + GAP * 3.0;
+    if width >= all {
+        return DetailPlan {
+            paged: false,
+            clip: CLIP_COLUMN,
+            params: PARAMS_MIN + (width - all),
+            effects: EFFECT_COLUMN,
+            last: LAST_COLUMN,
+        };
+    }
+    let clip = 180.0;
+    let right = (width - clip - GAP).max(PARAMS_MIN);
+    let last = 190.0;
+    DetailPlan {
+        paged: true,
+        clip,
+        params: right,
+        effects: (right - GAP - last).max(176.0),
+        last,
+    }
+}
 
 /// The nine effects the renderer has a slot for, in `mosh_core::EffectKind` order.
 const EFFECTS: [EffectKind; 9] = [
@@ -77,16 +143,26 @@ pub fn draw(ui: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel, out: &
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let height = ui.available_height();
-            let spare = ui.available_width() - CLIP_COLUMN - EFFECT_COLUMN - LAST_COLUMN - 36.0;
-            let params_width = spare.max(PARAMS_MIN);
+            let plan = detail_plan(ui.available_width());
+            let page = state.detail_page;
             ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-                column(ui, CLIP_COLUMN, height, |ui| clip_column(ui, state, clip, out));
-                column(ui, params_width, height, |ui| {
-                    params_column(ui, state, model, clip, out);
+                ui.spacing_mut().item_spacing.x = GAP;
+                column(ui, plan.clip, height, |ui| {
+                    clip_column(ui, state, clip, plan, out);
                 });
-                column(ui, EFFECT_COLUMN, height, |ui| effects_column(ui, clip, out));
-                column(ui, LAST_COLUMN, height, |ui| last_column(ui, clip, out));
+                if !plan.paged || page == DetailPage::Parameters {
+                    column(ui, plan.params, height, |ui| {
+                        params_column(ui, state, model, clip, out);
+                    });
+                }
+                if !plan.paged || page == DetailPage::Effects {
+                    column(ui, plan.effects, height, |ui| {
+                        effects_column(ui, clip, plan.effects, out);
+                    });
+                    column(ui, plan.last, height, |ui| {
+                        last_column(ui, clip, plan.last, out);
+                    });
+                }
             });
         });
 }
@@ -111,7 +187,14 @@ fn heading(ui: &mut egui::Ui, text: &str) {
 }
 
 /// Picture, name, visualizer, palette, seed, media source, save as preset.
-fn clip_column(ui: &mut egui::Ui, state: &mut EditorUi, clip: &Clip, out: &mut Vec<Command>) {
+fn clip_column(
+    ui: &mut egui::Ui,
+    state: &mut EditorUi,
+    clip: &Clip,
+    plan: DetailPlan,
+    out: &mut Vec<Command>,
+) {
+    let column_width = plan.clip;
     let id = clip.id;
     heading(ui, "CLIP");
     ui.horizontal(|ui| {
@@ -184,7 +267,7 @@ fn clip_column(ui: &mut egui::Ui, state: &mut EditorUi, clip: &Clip, out: &mut V
         &mut state.draft,
         widgets::field_key(("clip_name", id)),
         &clip.name,
-        CLIP_COLUMN - 12.0,
+        column_width - 12.0,
         "clip name",
         1,
     ) {
@@ -193,7 +276,7 @@ fn clip_column(ui: &mut egui::Ui, state: &mut EditorUi, clip: &Clip, out: &mut V
 
     let current = catalog_entry(&clip.visualizer).map_or(clip.visualizer.as_str(), |entry| entry.name);
     egui::ComboBox::from_id_salt("visualizer")
-        .width(CLIP_COLUMN - 12.0)
+        .width(column_width - 12.0)
         .height(320.0)
         .selected_text(current)
         .show_ui(ui, |ui| {
@@ -217,14 +300,14 @@ fn clip_column(ui: &mut egui::Ui, state: &mut EditorUi, clip: &Clip, out: &mut V
             }
         });
 
-    media_source(ui, state, clip, out);
+    media_source(ui, state, clip, column_width - 12.0, out);
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = theme::GAP;
         ui.add(
             egui::TextEdit::singleline(&mut state.preset_name)
                 .hint_text("preset name")
-                .desired_width(CLIP_COLUMN - 12.0 - 96.0),
+                .desired_width(column_width - 12.0 - 96.0),
         );
         if ui
             .button("Save preset")
@@ -237,15 +320,42 @@ fn clip_column(ui: &mut egui::Ui, state: &mut EditorUi, clip: &Clip, out: &mut V
             state.preset_name.clear();
         }
     });
+
+    // Too narrow for everything at once: this switch says which half is beside this column.
+    if plan.paged {
+        ui.add_space(2.0);
+        heading(ui, "SHOWING");
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(column_width - 12.0, 24.0), Sense::hover());
+        let pages = [DetailPage::Parameters, DetailPage::Effects];
+        if let Some(index) = widgets::segmented(
+            ui,
+            rect,
+            "detail_page",
+            &["Parameters", "Effects"],
+            pages.iter().position(|page| *page == state.detail_page),
+            &[
+                "the eight parameters and the range each moves in",
+                "effects, the transition in and the follow action",
+            ],
+        ) {
+            state.detail_page = pages[index];
+        }
+    }
 }
 
 /// The clip's media source, for the visualizers that have one: a video file, a camera, words.
-fn media_source(ui: &mut egui::Ui, state: &mut EditorUi, clip: &Clip, out: &mut Vec<Command>) {
+fn media_source(
+    ui: &mut egui::Ui,
+    state: &mut EditorUi,
+    clip: &Clip,
+    width: f32,
+    out: &mut Vec<Command>,
+) {
     let id = clip.id;
     let kind = MediaKind::of(&clip.visualizer);
     let stored = clip.video.as_deref().unwrap_or("");
     let value = stored.strip_prefix(kind.prefix()).unwrap_or(stored);
-    let width = CLIP_COLUMN - 12.0;
     match kind {
         MediaKind::None => {}
         MediaKind::File => {
@@ -471,7 +581,9 @@ fn params_column(
 }
 
 /// Effect chips, and amount + parameter for the ones that are on.
-fn effects_column(ui: &mut egui::Ui, clip: &Clip, out: &mut Vec<Command>) {
+fn effects_column(ui: &mut egui::Ui, clip: &Clip, width: f32, out: &mut Vec<Command>) {
+    // Two sliders beside an effect's name, sharing what the name leaves.
+    let slider = ((width - 58.0 - 26.0) * 0.5).clamp(40.0, 70.0);
     let id = clip.id;
     heading(ui, "EFFECTS   click to add or remove");
     ui.horizontal_wrapped(|ui| {
@@ -501,7 +613,7 @@ fn effects_column(ui: &mut egui::Ui, clip: &Clip, out: &mut Vec<Command>) {
             for (index, slot) in clip.effects.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    ui.spacing_mut().slider_width = 70.0;
+                    ui.spacing_mut().slider_width = slider;
                     let (name, _) = ui.allocate_exact_size(Vec2::new(58.0, 22.0), Sense::hover());
                     widgets::clipped_text(
                         ui.painter(),
@@ -532,10 +644,10 @@ fn effects_column(ui: &mut egui::Ui, clip: &Clip, out: &mut Vec<Command>) {
 }
 
 /// How the clip comes in, and what happens after it.
-fn last_column(ui: &mut egui::Ui, clip: &Clip, out: &mut Vec<Command>) {
+fn last_column(ui: &mut egui::Ui, clip: &Clip, width: f32, out: &mut Vec<Command>) {
     let id = clip.id;
     heading(ui, "TRANSITION IN");
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(LAST_COLUMN - 6.0, 24.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width - 6.0, 24.0), Sense::hover());
     let labels: Vec<&str> = TRANSITIONS.iter().map(|(_, name)| *name).collect();
     if let Some(index) = widgets::segmented(
         ui,

@@ -620,11 +620,24 @@ fn a_visualizer_dragged_from_the_browser_becomes_a_clip() {
 /// windowed run showed the opacity control cut off by the stop button.
 #[test]
 fn layer_headers_fit_their_columns_from_two_to_eight_layers() {
-    use mosh_app::editor::ui::{MIN_COLUMN, column_width, header_layout};
+    use mosh_app::editor::ui::{
+        MIN_COLUMN, TWO_ROW_COLUMN, column_width, header_height, header_layout,
+    };
 
-    // The layout itself, at the narrowest column and at a roomy one.
-    for width in [MIN_COLUMN - 2.0, 178.0, 238.0] {
-        let column = Rect::from_min_size(Pos2::new(40.0, 60.0), Vec2::new(width, 56.0));
+    // The layout itself: the narrowest column (three rows), just under and at the width where
+    // it becomes two rows, and a roomy one.
+    for width in [
+        MIN_COLUMN - 2.0,
+        118.0,
+        TWO_ROW_COLUMN - 3.0,
+        TWO_ROW_COLUMN - 2.0,
+        178.0,
+        238.0,
+    ] {
+        let column = Rect::from_min_size(
+            Pos2::new(40.0, 60.0),
+            Vec2::new(width, header_height(width) - 2.0),
+        );
         let rects = header_layout(column);
         let all = rects.all();
         for (index, rect) in all.iter().enumerate() {
@@ -637,7 +650,10 @@ fn layer_headers_fit_their_columns_from_two_to_eight_layers() {
         // The pickers get what the fixed controls leave, and it is enough for a short label.
         assert!(rects.kind.width() >= 64.0, "{width}: kind {:?}", rects.kind);
         assert!(rects.blend.width() >= 64.0, "{width}: blend {:?}", rects.blend);
-        assert_eq!(rects.opacity.width(), 48.0, "room for \"100%\"");
+        assert!(rects.opacity.width() >= 48.0, "{width}: room for \"100%\"");
+        // Three rows below the threshold, two from it on.
+        let rows = if rects.stop.top() > rects.blend.top() { 3 } else { 2 };
+        assert_eq!(rows, if width < TWO_ROW_COLUMN - 2.0 { 3 } else { 2 }, "{width}");
     }
 
     for layers in 2..=8usize {
@@ -715,6 +731,174 @@ fn layer_headers_fit_their_columns_from_two_to_eight_layers() {
             }
         }
     }
+}
+
+/// The second windowed run: the stress project's four layers in the control window as it opens
+/// on the reference laptop (1485x1516 px at 175% is 833 points wide, the browser open). Only
+/// three layer columns were in view and the video overlay's needed a sideways scroll. Every
+/// layer has to be in view at this width, with the scene column beside them.
+#[test]
+fn four_layers_are_all_in_view_beside_the_browser_on_the_laptop() {
+    use mosh_app::editor::ui::{MIN_COLUMN, column_width, scene_width};
+
+    let view = 833.0 - 212.0;
+    let scenes = scene_width(view);
+    for layers in 1..=4usize {
+        let column = column_width(view, layers, true);
+        // The columns, the add-layer button and the scene column fit the view: no scroll.
+        assert!(
+            column * layers as f32 + 30.0 + scenes <= view,
+            "{layers} layers: {column} each + {scenes}"
+        );
+        assert!(column >= MIN_COLUMN);
+    }
+    assert_eq!(scenes, 104.0, "the scene column gives way at this width");
+    assert!((column_width(view, 4, true) - 119.75).abs() < 0.01);
+    // A wide view keeps the wide columns and the roomy scene column it had.
+    assert_eq!(scene_width(1068.0), 148.0);
+    assert_eq!(column_width(1068.0, 4, true), 220.5);
+
+    let mut model = EditorModel::new(default_project());
+    model.apply(Command::AddLayer).expect("layer 3");
+    model.apply(Command::AddLayer).expect("layer 4");
+    model
+        .apply(Command::SetLayerKind {
+            layer: 3,
+            kind: LayerKind::Overlay,
+        })
+        .expect("the video overlay");
+    model
+        .apply(Command::SetLayerBlend {
+            layer: 3,
+            blend: BlendMode::LumaKey,
+        })
+        .expect("luma key");
+    model
+        .apply(Command::SetCell {
+            layer: 3,
+            scene: 0,
+            source: ClipSource::Visualizer("overlay".to_string()),
+        })
+        .expect("the overlay clip");
+    let mut harness = Harness::new((833.0, 827.0));
+    harness.idle(&model);
+    harness.idle(&model);
+    let drawn = harness.state.header_probe.clone();
+    assert_eq!(drawn.len(), 4);
+    let scenes_left = 833.0 - scenes;
+    for header in &drawn {
+        let column = header.column;
+        assert!(
+            column.left() >= 212.0 && column.right() <= scenes_left,
+            "layer {} is not wholly in view: {column:?} (browser to 212, scenes from {scenes_left})",
+            header.layer + 1
+        );
+        // In its narrow, three-row form every control still has its place and stays in it.
+        for rect in header.planned.all() {
+            assert!(column.expand(0.5).contains_rect(rect), "{rect:?} in {column:?}");
+        }
+        assert!(header.planned.kind.expand(1.0).contains_rect(header.kind));
+        assert!(header.planned.blend.expand(1.0).contains_rect(header.blend));
+    }
+    // Launching the fourth layer's slot works where it now is: its triangle is in view.
+    let column = column_width(view, 4, true);
+    let header = mosh_app::editor::ui::header_height(column - 2.0);
+    let at = Pos2::new(212.0 + column * 3.0 + 14.0, 56.0 + header + 22.0);
+    harness.pointer(&model, at, None);
+    harness.pointer(&model, at, Some(true));
+    let out = harness.pointer(&model, at, Some(false));
+    assert!(
+        out.commands.contains(&Command::Launch { layer: 3, scene: 0 }),
+        "{:?}",
+        out.commands
+    );
+}
+
+/// The detail panel never cuts a column off: wide enough, all four columns side by side;
+/// narrower, the clip column and one page, each of which fits.
+#[test]
+fn the_detail_panel_pages_instead_of_cutting_its_effects_off() {
+    use mosh_app::editor::ui::{DetailPage, detail_plan};
+
+    // The panel's inner width in the laptop's control window, browser open: 833 - 212 - 16.
+    let laptop = detail_plan(605.0);
+    assert!(laptop.paged);
+    for page in [DetailPage::Parameters, DetailPage::Effects] {
+        assert!(laptop.used(page) <= 605.0, "{page:?}: {} of 605", laptop.used(page));
+    }
+    // From the smallest window (800 wide, browser open: 572) up, whatever is shown fits.
+    for width in (572..=2000).step_by(4) {
+        let plan = detail_plan(width as f32);
+        for page in [DetailPage::Parameters, DetailPage::Effects] {
+            assert!(
+                plan.used(page) <= width as f32 + 0.01,
+                "{width}: {page:?} needs {}",
+                plan.used(page)
+            );
+        }
+        assert_eq!(plan.paged, width < 1052, "{width}");
+    }
+
+    // Both pages build at the laptop's size, the switch is in the clip column, and a click on
+    // "Effects" turns the page (it is widget state: no command, nothing lands on the show).
+    let model = demo_project();
+    let mut harness = Harness::new((833.0, 827.0));
+    harness.idle(&model);
+    assert_eq!(harness.state.detail_page, DetailPage::Parameters);
+    let before = harness.idle(&model).primitives.len();
+    harness.state.detail_page = DetailPage::Effects;
+    let out = harness.idle(&model);
+    assert!(out.commands.is_empty());
+    assert!(!out.primitives.is_empty() && out.primitives.len() != before);
+}
+
+/// Eight groups and some forty scenes: a group folds away on a click on its heading, and a
+/// filter shows matches in every group, folded or not.
+#[test]
+fn browser_groups_fold_away() {
+    let model = demo_project();
+    let groups: Vec<&str> = {
+        let mut names: Vec<&str> = mosh_app::editor::model::catalog()
+            .iter()
+            .map(|entry| entry.group)
+            .collect();
+        names.dedup();
+        names
+    };
+    println!("catalog groups: {groups:?}");
+    assert!(groups.len() >= 3, "{groups:?}");
+    let vertices = |out: &FrameOut| -> usize {
+        out.primitives
+            .iter()
+            .map(|primitive| match &primitive.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => mesh.vertices.len(),
+                egui::epaint::Primitive::Callback(_) => 0,
+            })
+            .sum()
+    };
+    let mut harness = Harness::new((1280.0, 1400.0));
+    harness.idle(&model);
+    let open = vertices(&harness.idle(&model));
+
+    // A click on the first group's heading ("Classic", under the filter field and the section
+    // heading) folds it: its rows are gone and the next group moves up.
+    let heading = Pos2::new(100.0, 124.0);
+    harness.pointer(&model, heading, None);
+    harness.pointer(&model, heading, Some(true));
+    harness.pointer(&model, heading, Some(false));
+    assert_eq!(harness.state.folded, vec![groups[0].to_string()]);
+    harness.idle(&model);
+    let folded = vertices(&harness.idle(&model));
+    assert!(folded < open, "{folded} vertices folded, {open} open");
+
+    // A filter looks inside folded groups too.
+    harness.state.filter = "tunnel".to_string();
+    harness.idle(&model);
+    let filtered = vertices(&harness.idle(&model));
+    harness.state.filter = "no such scene".to_string();
+    harness.idle(&model);
+    let nothing = vertices(&harness.idle(&model));
+    assert!(filtered > nothing, "the folded group's match is shown");
 }
 
 /// What one frame of the control window costs on this machine, with no window: layout and
@@ -922,8 +1106,10 @@ fn screenshots() {
     std::fs::create_dir_all(&folder).expect("shots folder");
     /// One screenshot: file name, window size, view, browser open, detail open, help open.
     type Shot = (&'static str, (f32, f32), View, bool, bool, bool);
-    let shots: [Shot; 7] = [
+    let shots: [Shot; 9] = [
         ("session-833", (833.0, 827.0), View::Session, true, true, false),
+        ("session-833-effects", (833.0, 827.0), View::Session, true, true, false),
+        ("browser-packs", (1280.0, 1500.0), View::Session, true, true, false),
         ("session-1280", (1280.0, 800.0), View::Session, true, true, false),
         ("arrangement-1280", (1280.0, 800.0), View::Arrangement, true, true, false),
         ("arrangement-1920", (1920.0, 1080.0), View::Arrangement, true, true, false),
@@ -939,6 +1125,9 @@ fn screenshots() {
         model.apply(Command::SetHelp(help)).expect("help");
         model.set_status(busy_status(&model, 37.5));
         let mut harness = Harness::new(size);
+        if name.ends_with("-effects") {
+            harness.state.detail_page = mosh_app::editor::ui::DetailPage::Effects;
+        }
         harness.state.recent = vec!["C:/shows/spring tour.ron".into(), "C:/shows/demo.ron".into()];
         let preview = synthetic_picture(96, 54, 0x5e_e6_c8_40_90_c0_11);
         let ctx = harness.ctx.clone();

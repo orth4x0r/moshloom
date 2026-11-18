@@ -22,20 +22,37 @@ use crate::editor::theme;
 use crate::editor::ui::widgets::{self, clipped_text};
 use crate::editor::ui::{DragPayload, EditorUi, clip_slot, thumb_params};
 
-const HEADER: f32 = 58.0;
 const CELL: f32 = 46.0;
-const SCENES: f32 = 148.0;
 const ADD: f32 = 30.0;
 const LAUNCH: f32 = 30.0;
-/// A column is never narrower than this: its header's controls and a clip's name need the
-/// room. With more layers than fit, the grid scrolls sideways.
-pub const MIN_COLUMN: f32 = 156.0;
+/// A column is never narrower than this: below it a clip's name is a few letters and the
+/// header's pickers cannot say what they are. Only with more layers than fit at this width do
+/// the layer columns scroll sideways.
+pub const MIN_COLUMN: f32 = 104.0;
 const MAX_COLUMN: f32 = 240.0;
+/// A column at least this wide has its header on two rows; a narrower one stacks it on three.
+pub const TWO_ROW_COLUMN: f32 = 150.0;
+/// A view narrower than this gets the narrow scene column.
+const NARROW_VIEW: f32 = 760.0;
 
-/// The width of a session column for `layers` layers in a view `width` wide.
+/// The scene column's width in a view `width` wide: room for a scene's name where there is
+/// room, the launch button and a short name where the layers need the space.
+pub fn scene_width(width: f32) -> f32 {
+    if width >= NARROW_VIEW { 148.0 } else { 104.0 }
+}
+
+/// The width of a session column for `layers` layers in a view `width` wide: the layers share
+/// what the scene column leaves, so that all of them are in view whenever each can have
+/// [`MIN_COLUMN`].
 pub fn column_width(width: f32, layers: usize, can_add: bool) -> f32 {
     let add = if can_add { ADD } else { 0.0 };
-    ((width - SCENES - add - 8.0) / layers.max(1) as f32).clamp(MIN_COLUMN, MAX_COLUMN)
+    ((width - scene_width(width) - add - 8.0) / layers.max(1) as f32)
+        .clamp(MIN_COLUMN, MAX_COLUMN)
+}
+
+/// The height of a layer header in a column `column` wide.
+pub fn header_height(column: f32) -> f32 {
+    if column >= TWO_ROW_COLUMN { 58.0 } else { 84.0 }
 }
 
 /// Blend modes: the name, and the short one a narrow header shows.
@@ -68,15 +85,17 @@ impl HeaderRects {
     }
 }
 
-/// Lay a layer header's controls out in `rect`, in two rows:
+/// Lay a layer header's controls out in `rect`. A column of [`TWO_ROW_COLUMN`] or more gets
+/// two rows, a narrower one three, so that four layers fit beside the browser on a laptop:
 ///
 /// ```text
-/// | 1 | Visualizer      v | [] |     number, kind, stop
-/// | Normal        v | 100%     |     blend, opacity
+/// | 1 | Visualizer      v | [] |        | 1 | Visual     v |     number, kind
+/// | Normal        v | 100%     |        | Luma key       v |     blend
+///                                       | 100%        | [] |     opacity, stop
 /// ```
 ///
-/// The number, the stop button and the opacity bar have fixed widths; the two pickers take
-/// what is left of their row, so nothing is ever pushed out of the column.
+/// The number, the stop button and (on two rows) the opacity bar have fixed widths; the
+/// pickers take what is left of their row, so nothing is ever pushed out of the column.
 pub fn header_layout(rect: Rect) -> HeaderRects {
     const ROW: f32 = 22.0;
     const GAP: f32 = 4.0;
@@ -90,6 +109,16 @@ pub fn header_layout(rect: Rect) -> HeaderRects {
         )
     };
     let badge = row(0.0, inner.left(), inner.left() + BADGE);
+    if rect.width() < TWO_ROW_COLUMN - 2.0 {
+        let stop = row(2.0, inner.right() - ROW, inner.right());
+        return HeaderRects {
+            badge,
+            kind: row(0.0, badge.right() + GAP, inner.right()),
+            stop,
+            blend: row(1.0, inner.left(), inner.right()),
+            opacity: row(2.0, inner.left(), stop.left() - GAP),
+        };
+    }
     let stop = row(0.0, inner.right() - ROW, inner.right());
     let kind = row(0.0, badge.right() + GAP, stop.left() - GAP);
     let opacity = row(1.0, inner.right() - OPACITY, inner.right());
@@ -342,6 +371,9 @@ pub fn draw(ui: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel, out: &
     let add = if can_add { ADD } else { 0.0 };
     let column = column_width(area.width(), layers, can_add);
     let columns_width = column * layers as f32 + add;
+    let header_h = header_height(column - 2.0);
+    let scenes_w = scene_width(area.width());
+    let narrow = scenes_w < 130.0;
 
     // The rows scroll up and down as one. The layer columns scroll sideways on their own when
     // there are more of them than fit, so the scene column (the launch buttons) stays in view.
@@ -349,13 +381,13 @@ pub fn draw(ui: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel, out: &
         .id_salt("session_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            let height = HEADER + CELL * grid.scenes.len() as f32 + CELL + 8.0;
+            let height = header_h + CELL * grid.scenes.len() as f32 + CELL + 20.0;
             let (rect, _) =
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
-            let scenes_x = (rect.left() + columns_width).min(rect.right() - SCENES);
+            let scenes_x = (rect.left() + columns_width).min(rect.right() - scenes_w);
             let columns = Rect::from_min_max(
                 rect.min,
-                Pos2::new(scenes_x - 4.0, rect.top() + HEADER + CELL * grid.scenes.len() as f32 + 12.0),
+                Pos2::new(scenes_x - 4.0, rect.top() + header_h + CELL * grid.scenes.len() as f32 + 12.0),
             );
             ui.scope_builder(UiBuilder::new().max_rect(columns).id_salt("columns"), |ui| {
                 egui::ScrollArea::horizontal()
@@ -371,7 +403,7 @@ pub fn draw(ui: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel, out: &
                         for (index, layer) in grid.layers.iter().enumerate() {
                             let header = Rect::from_min_size(
                                 Pos2::new(column_x(index), rect.top()),
-                                Vec2::new(column - 2.0, HEADER - 2.0),
+                                Vec2::new(column - 2.0, header_h - 2.0),
                             );
                             layer_header(
                                 ui,
@@ -404,7 +436,7 @@ pub fn draw(ui: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel, out: &
                         }
                         // The slots.
                         for (scene, row) in grid.scenes.iter().enumerate() {
-                            let y = rect.top() + HEADER + CELL * scene as f32;
+                            let y = rect.top() + header_h + CELL * scene as f32;
                             for layer in 0..layers {
                                 let cell = Rect::from_min_size(
                                     Pos2::new(column_x(layer), y),
@@ -420,20 +452,24 @@ pub fn draw(ui: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel, out: &
                     });
             });
             ui.painter().text(
-                Pos2::new(scenes_x + 8.0, rect.top() + HEADER - 12.0),
+                Pos2::new(scenes_x + 8.0, rect.top() + header_h - 12.0),
                 Align2::LEFT_BOTTOM,
-                "SCENES   keys 1-9 launch",
+                if narrow {
+                    "SCENES  1-9"
+                } else {
+                    "SCENES   keys 1-9 launch"
+                },
                 theme::small(),
                 theme::FAINT,
             );
 
             // The scene column.
             for (scene, row) in grid.scenes.iter().enumerate() {
-                let y = rect.top() + HEADER + CELL * scene as f32;
+                let y = rect.top() + header_h + CELL * scene as f32;
                 // The scene's launch button.
                 let button = Rect::from_min_size(
                     Pos2::new(scenes_x, y),
-                    Vec2::new(SCENES - 2.0, CELL - 2.0),
+                    Vec2::new(scenes_w - 2.0, CELL - 2.0),
                 );
                 if !ui.is_rect_visible(button) {
                     continue;
@@ -506,12 +542,22 @@ pub fn draw(ui: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel, out: &
                     });
             }
 
-            // The bottom row: stop buttons, and a new scene.
-            let y = rect.top() + HEADER + CELL * grid.scenes.len() as f32 + 4.0;
-            let stop_all = Rect::from_min_size(
-                Pos2::new(scenes_x, y),
-                Vec2::new((SCENES - 6.0) * 0.5, CELL - 12.0),
-            );
+            // Under the scene column: stop everything, and a new scene (side by side where the
+            // column is wide enough for both labels, one under the other where it is not).
+            let y = rect.top() + header_h + CELL * grid.scenes.len() as f32 + 4.0;
+            let (stop_all, add_scene) = if narrow {
+                let size = Vec2::new(scenes_w - 2.0, 24.0);
+                (
+                    Rect::from_min_size(Pos2::new(scenes_x, y), size),
+                    Rect::from_min_size(Pos2::new(scenes_x, y + 28.0), size),
+                )
+            } else {
+                let size = Vec2::new((scenes_w - 6.0) * 0.5, CELL - 12.0);
+                (
+                    Rect::from_min_size(Pos2::new(scenes_x, y), size),
+                    Rect::from_min_size(Pos2::new(scenes_x + size.x + 4.0, y), size),
+                )
+            };
             if widgets::flat_button(ui, stop_all, "stop_all", "Stop all", false)
                 .on_hover_text("stop every layer (0)")
                 .clicked()
@@ -520,10 +566,6 @@ pub fn draw(ui: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel, out: &
                     out.push(Command::StopLayer(layer));
                 }
             }
-            let add_scene = Rect::from_min_size(
-                Pos2::new(stop_all.right() + 4.0, y),
-                Vec2::new((SCENES - 6.0) * 0.5, CELL - 12.0),
-            );
             if widgets::flat_button(ui, add_scene, "add_scene", "+ Scene", false)
                 .on_hover_text("add a scene row")
                 .clicked()

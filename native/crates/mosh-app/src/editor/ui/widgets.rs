@@ -54,6 +54,9 @@ pub fn segmented(
     let mut clicked = None;
     let width = rect.width() / labels.len().max(1) as f32;
     ui.painter().rect_filled(rect, theme::RADIUS, theme::RAISED);
+    // Words in narrow cells are all set smaller, rather than some of them running into their
+    // neighbours (numbers and three-letter labels fit as they are).
+    let small = width < 40.0 && labels.iter().any(|label| label.len() > 3);
     for (index, label) in labels.iter().enumerate() {
         let cell = Rect::from_min_size(
             Pos2::new(rect.left() + width * index as f32, rect.top()),
@@ -76,7 +79,7 @@ pub fn segmented(
             cell.center(),
             Align2::CENTER_CENTER,
             *label,
-            theme::body(),
+            if small { theme::small() } else { theme::body() },
             if on { theme::ON_ACCENT } else { theme::TEXT },
         );
         if response.clicked() {

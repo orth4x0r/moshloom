@@ -2,6 +2,9 @@
 //!
 //! * **Visualizers**, grouped as `mosh_visuals::catalog` groups them (the web scenes, the layer
 //!   visualizers, the style packs), so a scene another worker adds appears here with no change.
+//!   Each group is a heading with its count that folds on a click: with eight groups and some
+//!   forty scenes the list is three screens long, and a pack that is not in tonight's show can
+//!   be put away. A filter opens every group that has a match.
 //!   Drag one onto a session slot or an arrangement lane to make a clip; double-click to use it
 //!   for the selected clip.
 //! * **Presets**: saved looks. Drag one to make a clip of it; double-click to put it on the
@@ -43,17 +46,23 @@ pub fn draw(ui: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel, out: &
                     }
                     if entry.group != group {
                         group = entry.group;
-                        let (rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), 18.0),
-                            Sense::hover(),
-                        );
-                        ui.painter().text(
-                            rect.left_bottom() + Vec2::new(2.0, -2.0),
-                            Align2::LEFT_BOTTOM,
-                            group,
-                            theme::small(),
-                            theme::DIM,
-                        );
+                        let count = catalog()
+                            .iter()
+                            .filter(|other| other.group == group)
+                            .filter(|other| matches(other.name) || matches(other.group))
+                            .count();
+                        let folded = filter.is_empty() && state.folded.iter().any(|name| name == group);
+                        if group_heading(ui, group, count, !folded) {
+                            if folded {
+                                state.folded.retain(|name| name != group);
+                            } else if filter.is_empty() {
+                                state.folded.push(group.to_string());
+                            }
+                        }
+                    }
+                    // A folded group shows its heading only (a filter unfolds everything).
+                    if filter.is_empty() && state.folded.iter().any(|name| name == group) {
+                        continue;
                     }
                     let sample = new_clip(0, entry.id);
                     let texture = state.thumbs.get(
@@ -141,6 +150,55 @@ pub fn draw(ui: &mut egui::Ui, state: &mut EditorUi, model: &EditorModel, out: &
                 show_file(ui, state, model, out);
             }
         });
+}
+
+/// A group's heading inside the visualizer list: its name, how many it holds, and a marker
+/// that says whether it is folded. Returns whether it was clicked.
+fn group_heading(ui: &mut egui::Ui, name: &str, count: usize, open: bool) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), Sense::click());
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect, theme::RADIUS, theme::RAISED);
+    }
+    let c = Pos2::new(rect.left() + 7.0, rect.center().y + 1.0);
+    let points = if open {
+        vec![c + Vec2::new(-3.5, -2.0), c + Vec2::new(3.5, -2.0), c + Vec2::new(0.0, 2.5)]
+    } else {
+        vec![c + Vec2::new(-2.0, -3.5), c + Vec2::new(2.5, 0.0), c + Vec2::new(-2.0, 3.5)]
+    };
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        theme::FAINT,
+        egui::Stroke::NONE,
+    ));
+    let text = Rect::from_min_max(
+        Pos2::new(rect.left() + 16.0, rect.top()),
+        Pos2::new(rect.right() - 4.0, rect.bottom()),
+    );
+    clipped_text(
+        painter,
+        text,
+        Align2::LEFT_CENTER,
+        name,
+        theme::small(),
+        if response.hovered() { theme::TEXT } else { theme::DIM },
+    );
+    clipped_text(
+        painter,
+        text,
+        Align2::RIGHT_CENTER,
+        &count.to_string(),
+        theme::small(),
+        theme::FAINT,
+    );
+    response
+        .on_hover_text(if open {
+            "click to fold this group away"
+        } else {
+            "click to show this group"
+        })
+        .clicked()
 }
 
 /// A collapsible section header. Returns whether the section is open.
