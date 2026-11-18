@@ -1,112 +1,146 @@
-//! Cybersigilism + glitch scenes. Owner: S-cyber. Add scenes to `SCENES`; bodies live in
-//! `styles/cyber/*.wgsl` and are included with `include_str!`.
+//! Sigil + Smear scenes. Owner: S-cyber. Add scenes to `SCENES`; bodies live in `styles/cyber/*.wgsl`
+//! and are included with `include_str!`.
 //!
 //! # The two packs
 //!
-//! **Cybersigil** is sharp, thorny, mirrored linework: sigils built from distance fields, lit as
-//! chrome (`sigil_thorn`, `sigil_halo`, `sigil_rune`, `sigil_fang`). Cold silver and ice blue with
-//! blood-red accents on a near-black plate; tattoo-flash energy rather than neon glow.
+//! **Sigil** is thorny, mirrored linework cast in metal: sigils built from distance fields and lit as
+//! polished chrome rods (`sigil_thorn`, `sigil_halo`, `sigil_glyph`, `sigil_fang`). Cold silver, a
+//! blood-red rim and an iridescent turn, on a grainy plum plate with an aura pool — tattoo-flash energy
+//! with weight, not neon wire.
 //!
-//! **Glitch** is signal failure: pixel sorting (`glitch_sort`), horizontal tearing with corrupt
-//! macroblocks and RGB splits (`glitch_tear`), a curved broken CRT (`glitch_crt`) and an ASCII
-//! glyph raster with databent colour quantisation (`glitch_glyph`).
+//! **Smear** is the abstract side of signal failure: pixel sorting as painting (`glitch_sort`: long
+//! luminous sorted streaks over a melt) and datamosh as collage (`glitch_tear`: soft band warps and
+//! stretched trails over woven ribbons). No scanlines, no cathode-ray curve, no glyph raster, no block
+//! corruption: those read as a broken screen, and a broken screen is not the brief.
 //!
 //! # What every scene in this pack does
 //!
-//! * reads `P(0)` as the clock (the app maps it into `U.T`), `U.dens`/`U.vari` from `p1`/`p3`, and
-//!   the mel bands (`mel`, `melh`) and `U.bass`/`U.mid`/`U.high` for its shape;
-//! * gets harder at high energy: energy (bands + pulse) widens thorns, lengthens runs, deepens
-//!   tears, and lifts contrast;
-//! * answers `U.pulse` on the beat with a ring, a flare, a displacement or a channel split;
-//! * never flashes the whole frame on its own: global brightness moves at the beat's rate or
-//!   slower, so nothing here strobes inside the 400 ms safety limit (the Strobe layer is the one
-//!   place a fast flash is allowed).
+//! * reads `P(0)` as the clock (the app maps it into `U.T`), `U.dens`/`U.vari` from `p1`/`p3`, and the
+//!   mel bands (`mel`) and `U.bass`/`U.mid`/`U.high` for its shape;
+//! * gets harder at high energy: energy widens strokes, lengthens runs, deepens warps, lifts contrast;
+//! * answers `U.pulse` on the beat with a rim flare, a wider stroke, a longer drag or a shock ring;
+//! * never flashes the whole frame on its own: global brightness moves at the beat's rate or slower,
+//!   so nothing here strobes inside the 400 ms safety limit (the Strobe layer is the one place a fast
+//!   flash is allowed);
+//! * keeps its highlights under a shoulder (see `shoulder` in `styles/paint.wgsl`), so a specular is
+//!   hot without a clipped white patch: `tests/styles_cyber.rs` measures the clipped share.
 //!
 //! # `p0..p7` and the effects lane
 //!
-//! `scenes.rs` documents `p4..p7` as "the layer's post amounts and left in `p` for the effects
-//! lane". This pack reads all eight because the style pack's contract is the whole clip's
-//! parameter block, and each scene names what it does with `p4..p7` in `params`. If the app starts
-//! writing the effect amounts into `p4..p7`, these four controls follow them; the scenes are built
-//! so every value looks intentional (reported to the coordinator in the PR).
+//! `scenes.rs` documents `p4..p7` as "the layer's post amounts and left in `p` for the effects lane".
+//! This pack reads all eight because the style pack's contract is the whole clip's parameter block,
+//! and each scene names what it does with `p4..p7` in `params`. If the app starts writing the effect
+//! amounts into `p4..p7`, these four controls follow them; the scenes are built so every value looks
+//! intentional (reported to the coordinator in the PR).
 
 use super::StyleScene;
 
+/// A scene body: the packs' shared paint, then this scene's own WGSL.
+macro_rules! style_body {
+    ($file:literal) => {
+        concat!(include_str!("paint.wgsl"), "\n", include_str!(concat!("cyber/", $file)))
+    };
+}
+
 /// The pack a scene belongs to, as `catalog()` shows it.
-const CYBERSIGIL: &str = "Cybersigil";
-const GLITCH: &str = "Glitch";
+const SIGIL: &str = "Sigil";
+const SMEAR: &str = "Smear";
 
 pub const SCENES: &[StyleScene] = &[
     StyleScene {
         id: "sigil_thorn",
-        name: "Thorn Sigil",
-        pack: CYBERSIGIL,
+        name: "Thorn Crest",
+        pack: SIGIL,
         params: [
-            "Spin", "Arms", "Hue", "Sway", "Spikes", "Bloom", "Frame", "Grain",
+            "Spin",
+            "Arms",
+            "Hue",
+            "Sway",
+            "Thorn length",
+            "Bloom",
+            "Gate",
+            "Grain",
         ],
-        body: include_str!("cyber/sigil_thorn.wgsl"),
+        body: style_body!("sigil_thorn.wgsl"),
     },
     StyleScene {
         id: "sigil_halo",
         name: "Barbed Halo",
-        pack: CYBERSIGIL,
+        pack: SIGIL,
         params: [
-            "Spin", "Rings", "Hue", "Twist", "Thorns", "Core", "Spacing", "Grain",
+            "Spin",
+            "Rings",
+            "Hue",
+            "Twist",
+            "Thorn length",
+            "Core glow",
+            "Spacing",
+            "Grain",
         ],
-        body: include_str!("cyber/sigil_halo.wgsl"),
+        body: style_body!("sigil_halo.wgsl"),
     },
     StyleScene {
         id: "sigil_glyph",
-        name: "Sigil Glyph",
-        pack: CYBERSIGIL,
+        name: "Chrome Rune",
+        pack: SIGIL,
         params: [
-            "Rewrite", "Density", "Hue", "Curl", "Hook length", "Flash", "Ring", "Grain",
+            "Spin",
+            "Density",
+            "Hue",
+            "Curl",
+            "Stroke weight",
+            "Flash",
+            "Ring",
+            "Grain",
         ],
-        body: include_str!("cyber/sigil_glyph.wgsl"),
+        body: style_body!("sigil_glyph.wgsl"),
     },
     StyleScene {
         id: "sigil_fang",
         name: "Chrome Fangs",
-        pack: CYBERSIGIL,
+        pack: SIGIL,
         params: [
-            "Lunge", "Columns", "Hue", "Shear", "Fang length", "Backlight", "Depth", "Grain",
+            "Lunge",
+            "Columns",
+            "Hue",
+            "Shear",
+            "Fang length",
+            "Backlight",
+            "Depth",
+            "Grain",
         ],
-        body: include_str!("cyber/sigil_fang.wgsl"),
+        body: style_body!("sigil_fang.wgsl"),
     },
     StyleScene {
         id: "glitch_sort",
-        name: "Pixel Sort",
-        pack: GLITCH,
+        name: "Sorted Streaks",
+        pack: SMEAR,
         params: [
-            "Seed drift", "Run length", "Hue", "Threshold", "Smear", "RGB split", "Blocks", "Scanlines",
+            "Speed",
+            "Run length",
+            "Hue",
+            "Threshold",
+            "Drag",
+            "Dispersion",
+            "Melt",
+            "Grain",
         ],
-        body: include_str!("cyber/glitch_sort.wgsl"),
+        body: style_body!("glitch_sort.wgsl"),
     },
     StyleScene {
         id: "glitch_tear",
-        name: "Scan Tear",
-        pack: GLITCH,
+        name: "Melt Drag",
+        pack: SMEAR,
         params: [
-            "Sweep", "Band height", "Hue", "Tear", "Macroblocks", "RGB split", "Contrast", "Scanlines",
+            "Speed",
+            "Band height",
+            "Hue",
+            "Warp",
+            "Drag",
+            "Bloom",
+            "Melt",
+            "Grain",
         ],
-        body: include_str!("cyber/glitch_tear.wgsl"),
-    },
-    StyleScene {
-        id: "glitch_crt",
-        name: "Broken CRT",
-        pack: GLITCH,
-        params: [
-            "Roll", "Curvature", "Hue", "Tracking", "Grille", "Aberration", "Brightness", "Noise",
-        ],
-        body: include_str!("cyber/glitch_crt.wgsl"),
-    },
-    StyleScene {
-        id: "glitch_glyph",
-        name: "Glyph Raster",
-        pack: GLITCH,
-        params: [
-            "Churn", "Cell size", "Hue", "Churn rate", "Row shift", "Quantise", "Cursor", "Scanlines",
-        ],
-        body: include_str!("cyber/glitch_glyph.wgsl"),
+        body: style_body!("glitch_tear.wgsl"),
     },
 ];

@@ -3,8 +3,16 @@
 //!
 //! | pack | module | lane |
 //! | --- | --- | --- |
-//! | cybersigilism + glitch | `cyber` | S-cyber |
-//! | Y2K + Frutiger Aero | `aero` | S-aero |
+//! | Sigil + Smear | `cyber` | S-cyber |
+//! | Chrome + Glass + Aura + Fold | `aero` | S-aero |
+//!
+//! Sixteen abstract scenes in six packs. The palette is contemporary abstract digital art — chrome
+//! sigil linework, liquid metal, iridescent foil, gradient meshes, glass dispersion, silk, topographic
+//! contours, sorted streaks — and there is deliberately nothing retro-literal in here: no synthwave
+//! grid or sun, no CRT, no scanlines, no VHS, no glyph rain, no pixel font, no hills, globes or skies.
+//! The look is carried by `paint.wgsl` (shared chrome, iridescence, grain and the highlight shoulder)
+//! and by the per-scene bodies; `tests/styles_cyber.rs` and `tests/styles_aero.rs` hold both packs to
+//! lit, beat-reactive, unclipped pixels and to the 0.5 ms budget.
 //!
 //! A style scene's `body` is WGSL written on top of [`prelude`]: the native scene prelude
 //! (`scenes/prelude.wgsl`: `U`, `lut`, `mel`, `melh`, `XY`, `h1`, `h2`, the five inputs palT,

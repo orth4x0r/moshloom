@@ -71,13 +71,23 @@ pub fn line() -> Stroke {
 /// The hue is a hash of the id (FNV-1a) spread with the golden angle, so neighbours in the
 /// catalog do not get neighbouring hues and a new scene gets a colour without a table to edit.
 pub fn clip_color(visualizer: &str) -> Color32 {
-    let mut hash: u32 = 0x811c_9dc5;
-    for byte in visualizer.bytes() {
-        hash ^= u32::from(byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    // The whole hash picks the hue: `% 360` folded 37 ids onto 32 colours.
-    let hue = (f64::from(hash) / f64::from(u32::MAX)) as f32;
+    // A catalog entry takes its hue from its position, stepped by the golden ratio: every entry
+    // is a different colour however many style packs land, and the same entry is always the same
+    // colour. A hash (the old rule) put several of 37 entries on one RGB colour.
+    let hue = match crate::editor::model::catalog()
+        .iter()
+        .position(|entry| entry.id == visualizer)
+    {
+        Some(index) => (index as f32 * 0.618_034).fract(),
+        None => {
+            let mut hash: u32 = 0x811c_9dc5;
+            for byte in visualizer.bytes() {
+                hash ^= u32::from(byte);
+                hash = hash.wrapping_mul(0x0100_0193);
+            }
+            (f64::from(hash) / f64::from(u32::MAX)) as f32
+        }
+    };
     egui::ecolor::Hsva::new(hue, 0.52, 0.78, 1.0).into()
 }
 

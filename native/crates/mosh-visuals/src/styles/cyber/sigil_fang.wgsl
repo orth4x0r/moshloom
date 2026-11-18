@@ -1,133 +1,134 @@
-// Sigil Fangs: a curtain of chrome fangs hung from the top and bottom edges, mirrored, beak to
-// beak, in front of a blood-red backlight.
+// Sigil Fangs: a curtain of tapered chrome fangs hung from the top and bottom edges, mirrored, beak
+// to beak, in front of a blood-red backlight on a grainy plate.
 //
-// Each fang is a tapered capsule (a capsule whose radius falls to zero at the tip), so the whole
-// curtain is 24 cheap distance evaluations rather than 24 triangles, and the field's gradient
-// gives each fang a rounded chrome facet with a black core and an ice rim. The columns are
-// mirrored, the fangs hang at different lengths per column, and the row behind them is shorter and
-// darker, so the curtain has depth.
+// Each fang is one tapered rod: a segment distance, and a half width that falls to nothing at the tip,
+// so the whole curtain is a dozen cheap evaluations rather than a dozen triangles. The rod is lit
+// across its full width (`chrome_ridge` in `styles/paint.wgsl`), which is what makes it read as a
+// polished fang with a specular streak down one flank, a shadowed edge, a blood-red backlight rim and
+// an iridescent turn — where the old build had a flat chrome fill. The columns are mirrored, the fangs
+// hang at different lengths per column, and a barb on each flank gives the curtain its bite. `Depth`
+// thins the fangs and pushes the gum away from the frame edge instead of paying for a second row. A
+// shoulder on the highlights keeps the specular from clipping to white.
 //
-// Audio: each column's fang length is one mel band, `U.bass` drops the whole curtain and widens the
-// gap, `U.pulse` makes the fangs lunge and the backlight flare. The backlight moves at the beat's
-// rate or slower, never inside the 400 ms flash limit.
+// Audio: each column's fang length is one mel band, `U.bass` opens the gap and drops the curtain,
+// `U.pulse` makes the fangs lunge and the backlight flare. The backlight moves at the beat's rate or
+// slower, never inside the 400 ms flash limit.
 //
 // P(0) clock rate, P(1) density, P(2) hue, P(3) shear, P(4) fang length, P(5) backlight,
 // P(6) curtain depth, P(7) grain.
 
-const RED = vec3f(0.76, 0.045, 0.070);
-const ICE = vec3f(0.62, 0.82, 1.0);
-const STEEL = vec3f(0.60, 0.66, 0.76);
+const STEEL = vec3f(0.88, 0.91, 0.97);
+const RED = vec3f(0.86, 0.050, 0.075);
 
-fn seg(p: vec2f, a: vec2f, b: vec2f) -> f32 {
-  let pa = p - a;
-  let ba = b - a;
-  let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-7), 0.0, 1.0);
-  return length(pa - ba * h);
-}
-
-/// A fang: a capsule tapering from `w` at `root` to a point at `tip`.
-fn fang(p: vec2f, root: vec2f, tip: vec2f, w: f32) -> f32 {
+/// A rod: its centreline distance and its local half width, plus where along the rod the pixel is.
+fn rod(p: vec2f, root: vec2f, tip: vec2f, w0: f32) -> vec3f {
   let pa = p - root;
   let ba = tip - root;
-  let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-7), 0.0, 1.0);
-  return length(pa - ba * h) - w * (1.0 - h * h * 0.9);
+  let hl = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-7), 0.0, 1.0);
+  let d = length(pa - ba * hl);
+  return vec3f(d, max(w0 * (1.0 - hl * hl * 0.88), 0.0030), hl);
 }
 
-/// The curtain: fangs from the top edge and from the bottom edge, in mirrored columns.
-fn curtain(p: vec2f, cols: f32, cw: f32, shear: f32, grow: f32, back: f32) -> f32 {
-  var d = 1e6;
+/// One row of the curtain: fangs from the top edge and from the bottom edge in every column.
+/// Returns the winning rod's (distance, half width) as `xy`, plus the tooth's own mask in `z`.
+fn curtain(p: vec2f, cw: f32, shear: f32, grow: f32, back: f32) -> vec3f {
+  var best = 1e6;
+  var bw = 0.01;
+  var tooth = 0.0;
+
   let ix = floor(p.x / cw);
   let cx = (ix + 0.5) * cw;
+  // One hash per column, with its other values derived by multiplication: a hash is a `sin`, and this
+  // scene's whole budget is spent on how few of them it needs.
   let seed = h1(ix * 3.71 + 1.30);
-  let seed2 = h1(ix * 9.13 + 4.70);
+  let seed2 = fract(seed * 37.13);
+  let seed3 = fract(seed * 91.70);
+  let band0 = mel(i32(ix * 2.0 + 1.0));
+  let band1 = mel(i32(ix * 2.0 + 8.0));
 
-  // The front row: a long fang from the top and from the bottom in every column.
-  let top_len = (0.40 + 0.34 * seed + 0.26 * mel(i32(ix * 2.0 + 1.0)) + 0.22 * U.bass) * grow;
-  let bot_len = (0.34 + 0.32 * seed2 + 0.26 * mel(i32(ix * 2.0 + 8.0))) * grow;
+  let top_len = (0.42 + 0.32 * seed + 0.24 * band0 + 0.20 * U.bass) * grow;
+  let bot_len = (0.36 + 0.30 * seed2 + 0.24 * band1) * grow;
   // Alternating columns bite deeper, so the curtain has a rhythm instead of a fringe.
-  let parity = select(0.78, 1.25, fract(ix * 0.5) > 0.25);
-  let lean = shear * (0.5 - seed) * 0.30 + P(3) * 0.02;
-  let top_root = vec2f(cx + lean * 0.2, 1.12);
-  let bot_root = vec2f(cx - lean * 0.2, -1.12);
-  let top_tip = top_root + vec2f(lean, -top_len * parity);
-  let bot_tip = bot_root + vec2f(lean, bot_len / parity);
-  d = min(d, fang(p, top_root, top_tip, cw * 0.29));
-  d = min(d, fang(p, bot_root, bot_tip, cw * 0.29));
-  // A barb on the flank of the top fang: the thorn that makes a fang a fang.
-  let along = normalize(top_tip - top_root);
-  let flank = vec2f(-along.y, along.x);
-  let at = mix(top_root, top_tip, 0.55);
-  d = min(d, seg(p, at, at + flank * (0.045 + 0.045 * seed2) * parity) - 0.0042);
+  let parity = select(0.80, 1.22, fract(ix * 0.5) > 0.25);
+  let lean = shear * (0.5 - seed) * 0.26;
 
-  // The row behind is drawn only when the clip asks for depth: each extra fang is a square root.
-  if (back > 0.75) {
-    let bx = cx + cw * 0.5;
-    let seed3 = h1((ix + 0.5) * 5.53 + 2.10);
-    let back_len = (0.18 + 0.30 * seed3 + 0.18 * mel(i32(ix * 2.0 + 4.0))) * grow * back;
-    d = min(d, fang(p, vec2f(bx, 1.12), vec2f(bx + lean * 0.7, 1.12 - back_len), cw * 0.21));
-    d = min(d, fang(p, vec2f(bx, -1.12), vec2f(bx + lean * 0.7, -1.12 + back_len * 0.8), cw * 0.21));
+  let top_root = vec2f(cx + lean * 0.25, 1.10);
+  let top_tip = top_root + vec2f(lean, -top_len * parity);
+  let bot_root = vec2f(cx - lean * 0.25, -1.10);
+  let bot_tip = bot_root + vec2f(lean, bot_len / parity);
+
+  // Front row: the long fang from the top and from the bottom of this column.
+  let f0 = rod(p, top_root, top_tip, cw * 0.23);
+  best = f0.x - f0.y;
+  bw = f0.y;
+  tooth = 1.0;
+  let f1 = rod(p, bot_root, bot_tip, cw * 0.21);
+  if (f1.x - f1.y < best) {
+    best = f1.x - f1.y;
+    bw = f1.y;
   }
 
-  // The gum: two thin chains along the top and bottom edges that the fangs hang from.
-  d = min(d, abs(p.y - 1.06) - 0.006);
-  d = min(d, abs(p.y + 1.06) - 0.006);
-  return d;
-}
+  // A barb on the flank of the top fang: the thorn that makes a fang a fang. `Depth` shifts it and the
+  // gum down, so the curtain reads deeper without a second row of rods (two more square roots per pixel,
+  // which this budget cannot afford).
+  let along = normalize(top_tip - top_root);
+  let flank = vec2f(-along.y, along.x);
+  let at = mix(top_root, top_tip, 0.50);
+  let f2 = rod(p, at, at + flank * (0.050 + 0.050 * seed2 + 0.030 * back) * parity, 0.0075);
+  if (f2.x - f2.y < best) {
+    best = f2.x - f2.y;
+    bw = f2.y;
+  }
+  bw = bw * (1.0 - 0.22 * clamp(back, 0.0, 1.0));
+  tooth = tooth * (0.75 + 0.25 * clamp(back, 0.0, 1.0));
 
-/// A soft cold studio for a chrome facet: bright ceiling, dark floor, one hard strip light.
-fn chrome(n: vec3f, refl: vec3f) -> vec3f {
-  let up = smoothstep(0.05, 0.92, refl.y);
-  let down = smoothstep(0.0, -0.85, refl.y);
-  var env = mix(vec3f(0.18, 0.21, 0.28), vec3f(0.95, 0.98, 1.0), up);
-  env = mix(env, vec3f(0.03, 0.035, 0.055), down * 0.85);
-  let strip = smoothstep(0.45, 0.05, abs(n.x)) * smoothstep(-0.35, 0.55, n.y);
-  env += vec3f(0.95, 0.98, 1.0) * strip * 0.9;
-  return env;
+  // The gum: the heavy chain along the top and bottom edges the fangs hang from.
+  let gum = min(abs(p.y - (1.05 - 0.04 * back)), abs(p.y + 1.05));
+  if (gum - 0.012 < best) {
+    best = gum - 0.012;
+    bw = 0.012;
+    tooth = 0.0;
+  }
+  return vec3f(best, bw, tooth);
 }
 
 @fragment fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let q = XY(pos);
   let px = 2.0 / U.res.y;
-  let aa = px * 1.15;
-  let e = px * 2.2;
-  let asp = U.res.x / U.res.y;
+  let aa = px * 1.10;
   let dens = clamp(U.dens, 0.0, 1.0);
   let p = vec2f(abs(q.x), q.y);
 
   let cols = 5.0 + floor(dens * 5.0);
-  let cw = asp / cols;
+  let cw = (U.res.x / U.res.y) / cols;
   let shear = 1.0 + 0.6 * P(3) * sin(U.T * (0.20 + 0.25 * P(0)));
-  let grow = 0.72 + 0.45 * P(4) + 0.22 * clamp(U.mid, 0.0, 1.0) + 0.20 * U.pulse;
+  let grow = 0.78 + 0.40 * P(4) + 0.20 * clamp(U.mid, 0.0, 1.0) + 0.22 * U.pulse;
   let back = 0.55 + 0.45 * P(6);
-  let d = curtain(p, cols, cw, shear, grow, back);
+  let hit = curtain(p, cw, shear, grow, back);
+  let g = vec2f(dpdx(hit.x), dpdy(hit.x));
 
-  // --- the backlight: a hot red band between the two rows of fangs, a cold top light, grain.
-  let band = exp(-abs(q.y) * 2.3);
-  var c = vec3f(0.006, 0.006, 0.010);
-  c += RED * (0.10 + 0.16 * P(5)) * band * (0.30 + 1.00 * U.pulse * U.pulse);
-  c += RED * 0.035 * exp(-length(vec2f(q.x * 0.55, q.y)) * 1.4) * (0.30 + 0.9 * U.mid);
-  c += ICE * 0.020 * smoothstep(0.6, 1.1, -q.y) * (0.3 + 0.7 * U.high);
-  c *= 0.92 + 0.16 * h2(pos.xy * 0.75 + U.frame * 0.7) * (0.3 + 0.7 * P(7));
+  // --- the backlight: a hot red band between the two rows of fangs, a cold light from above, grain.
+  let band = glow(q.y, 1.1);
+  let hue_ang = TAU * P(2);
+  let hue_tint = pal(cos(hue_ang), sin(hue_ang));
+  var c = plate(q, hue_tint * 0.30 + vec3f(0.10, 0.06, 0.08), U.T, 3.3);
+  c += RED * (0.075 + 0.150 * P(5)) * band * (0.30 + 1.00 * U.pulse * U.pulse);
+  c += RED * 0.045 * falloff(length(vec2f(q.x * 0.55, q.y)), 1.5) * (0.35 + 0.9 * U.mid);
+  c += vec3f(0.10, 0.15, 0.22) * 0.20 * glow(q.y - 1.0, 1.8) * (0.4 + 0.6 * U.high);
 
-  // --- the fangs: a chrome facet with a black core, and a red rim from the backlight.
-  let g = vec2f(dpdx(d), dpdy(d)) * (e / px);
-  if (d < px * 12.0) {
-    let cov = 1.0 - smoothstep(-aa, aa, d);
-    let nrm = normalize(vec3f(-g, e * 0.85));
-    let refl = reflect(vec3f(0.0, 0.0, -1.0), nrm);
-    let env = chrome(nrm, refl);
-    let rim = pow(1.0 - clamp(nrm.z, 0.0, 1.0), 1.9);
-    let spec = pow(max(dot(refl, normalize(vec3f(-0.35, 0.75, 0.55))), 0.0), 30.0);
-    var metal = STEEL * (0.20 + env * 1.40) + vec3f(1.0, 0.99, 0.97) * spec * 1.3;
-    metal = mix(metal * 0.45, metal, smoothstep(0.0, 0.55, -d / 0.10));
-    metal += ICE * rim * 0.45 * (0.4 + 0.6 * U.high);
-    metal += RED * rim * (0.35 + 1.10 * U.pulse) * band;
+  // --- the fangs, lit across the rod; the back row sits darker so the curtain has depth.
+  let cov = 1.0 - smoothstep(-aa, aa, hit.x);
+  if (hit.x < px * 2.5) {
+    let accent = mix(RED, hue_tint, 0.34) * (0.80 + 0.45 * P(5));
+    var metal = chrome_ridge(
+      max(hit.x, 0.0), g, hit.y, STEEL, accent, 0.40 + 0.50 * clamp(U.high, 0.0, 1.0)
+    );
+    metal = metal * mix(0.55, 1.0, hit.z);
+    metal = metal + RED * glow(hit.x + hit.y * 0.4, 22.0) * (0.10 + 0.45 * U.pulse);
     c = mix(c, metal, cov);
-    c += STEEL * 0.08 * exp(-max(d, 0.0) * 60.0) * (1.0 - cov);
   }
-  c += RED * 0.12 * exp(-abs(d) * 140.0) * U.pulse * U.pulse;
-  // Hue: a channel rotation on the finished frame, so P(2) shifts the whole plate from blood red
-  // toward violet without touching the chrome.
-  c *= mix(vec3f(1.0), vec3f(0.88, 0.58, 1.28), U.hue);
-  return fin(c);
+  c *= 1.0 - 0.30 * glow(hit.x, 30.0);
+  c *= grain(pos.xy, 0.10 + 0.20 * P(7));
+  c *= mix(vec3f(1.0), vec3f(0.96, 0.80, 1.10), P(2) * 0.55);
+  return fin(shoulder(c));
 }
