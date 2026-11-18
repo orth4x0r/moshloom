@@ -13,13 +13,18 @@
 //!
 //! Reference: `gpu.js` (read-only) crossfades with `xf` in `WG_MIX` and `engine.c`'s `decide()`
 //! (read-only) drives melt (freeze the old picture) and strobe (invert, then a tint frame).
-//! Two approximations are documented where they are made:
 //!
-//! - **Datamosh** displaces the "from" picture along its own luminance gradient. The web app's
-//!   datamosh is block-matching motion estimation over a feedback buffer; that is V-mosh's lane
-//!   (Task 2.2), and duplicating it here would be a second, diverging copy.
-//! - **Melt** sags the old picture by a per-column drip while the new one fades in, instead of
-//!   the web app's hard freeze of the whole buffer.
+//! **Datamosh is not a blend and never reaches `tr_mix`**: [`TransitionPass::apply`] returns
+//! without drawing for it. The web app's datamosh cut is the *feedback buffer* carried across the
+//! cut - `decide()` sets `skipres` for the entering frame and no I-frame, and the new clip's block
+//! motion pushes the old picture (`WG_FB`). That is `MoshPass`, driven by `Visuals::draw_layer`
+//! (`MoshPass::carry_over` plus a forced mosh amount for the transition's duration), which is
+//! exactly where it belongs: one implementation, not a second one here. The old luminance-gradient
+//! displacement this pass used to draw is gone; it was a crossfade with a wobble.
+//!
+//! One approximation is documented where it is made: **Melt** sags the old picture by a per-column
+//! drip while the new one fades in, instead of the web app's hard freeze of the whole buffer.
+
 //!
 //! ## The flash path
 //!
@@ -135,6 +140,12 @@ impl TransitionPass {
             rec.draw(&self.copy, dst, &[], &[src])?;
             return Ok(true);
         }
+        // Datamosh is not a blend either: the layer's mosh feedback buffer was carried across the
+        // cut by `Visuals::draw_layer`, so `src` already *is* the datamosh. Drawing here would put
+        // a second, unrelated picture over it (see the module docs).
+        if transition.kind == TransitionKind::Datamosh {
+            return Ok(false);
+        }
         // Without a saved picture (no `begin`, or a layer index past MAX_LAYERS) there is nothing
         // to blend from, and the layer keeps showing this frame's picture.
         if !self.saved.get(layer).is_some_and(Option::is_some) {
@@ -153,9 +164,9 @@ impl TransitionPass {
         };
         let mode = match transition.kind {
             TransitionKind::Crossfade | TransitionKind::Strobe => 0.0,
-            TransitionKind::Datamosh => 1.0,
             TransitionKind::Melt => 2.0,
             TransitionKind::Cut => unreachable!("cut returned above"),
+            TransitionKind::Datamosh => unreachable!("datamosh returned above"),
         };
         let uniforms = TransitionUniforms {
             res: [src.width() as f32, src.height() as f32],
@@ -220,11 +231,12 @@ struct TransitionUniforms {
     res: [f32; 2],
     /// 0..1, smoothstepped by the shader.
     progress: f32,
-    /// 0 crossfade, 1 datamosh, 2 melt.
+    /// 0 crossfade, 2 melt. 1 is retired: Datamosh is the mosh pass's carry-over and never reaches
+    /// this shader.
     mode: f32,
     /// 0 none, 1 invert, 2 tint.
     flash: f32,
-    /// Reserved for a per-kind parameter (melt drip, datamosh strength).
+    /// Reserved for a per-kind parameter (the melt drip).
     param: f32,
     pad0: f32,
     pad1: f32,

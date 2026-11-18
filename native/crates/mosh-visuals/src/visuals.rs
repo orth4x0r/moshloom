@@ -1,7 +1,7 @@
 //! The facade the app calls once per layer per frame. Owner: V-scenes (Task 2.1) may change the
 //! bodies; the public signatures are frozen by the coordinator.
 
-use mosh_core::{AnalysisFrame, EffectKind, LayerState};
+use mosh_core::{AnalysisFrame, EffectKind, LayerState, TransitionKind};
 use mosh_render::{FlashLimiter, FrameRecorder, Gpu, LayerTarget, RenderError};
 
 use crate::camera::CameraLayer;
@@ -13,6 +13,13 @@ use crate::particles::Particles;
 use crate::scenes::Scenes;
 use crate::text::TextLayer;
 use crate::transitions::TransitionPass;
+
+/// The mosh strength a Datamosh or Melt clip change runs at, even when the clip has no mosh slot of
+/// its own. The web app derives no amount from a transition - it uses the clip's `mosh` - so this
+/// is a native decision, and it is the same for both: `decide()` treats them identically
+/// (`tr != T_XFADE` sets `P.skipres=1`), and `skipres` only means anything with the pass running.
+/// 0.9 is above the coarse threshold, as a real mosh entry usually is.
+const CARRY_AMOUNT: f32 = 0.9;
 
 /// Which target holds a layer's current picture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,11 +129,38 @@ impl Visuals {
             return Ok(());
         };
 
-        // A clip change hands the transition its "from" picture (last frame's output) and starts
-        // the datamosh over from the new clip (an I-frame), as the web app does.
+        // A clip change hands the transition its "from" picture, and decides what happens to the
+        // mosh buffer. `decide()` in engine.c, on the frame a clip is entered:
+        //
+        //   if (lastK<0 || tr==T_CUT) iframe=1;
+        //   else if (tr==T_STROBE) { iframe=1; flash=1; }
+        //   else if (tr!=T_XFADE) P.skipres=1;
+        //
+        // So: Cut and Strobe (and the first clip, which has no transition) take an I-frame;
+        // Crossfade is an ordinary P-frame with the residual on; Datamosh and Melt keep the
+        // buffer and skip the residual (`MoshPass::carry_over`), which is what lets the new
+        // clip's motion push the old picture. `state.transition` is `None` when the clip enters
+        // with no transition, which is the web's default `T_CUT`.
+        let entry = state
+            .transition
+            .map_or(TransitionKind::Cut, |transition| transition.kind);
+        // `tr != T_XFADE && tr != T_CUT/STROBE`: the two kinds whose picture is the carried
+        // buffer, so the mosh below runs for as long as they last (see `CARRY_AMOUNT`).
+        let carry_entry = matches!(entry, TransitionKind::Datamosh | TransitionKind::Melt);
         if state.clip != slot.last_clip {
-            self.mosh.invalidate(slot.layer);
-            if state.transition.is_some() {
+            match entry {
+                TransitionKind::Crossfade => {}
+                TransitionKind::Datamosh | TransitionKind::Melt => {
+                    self.mosh.carry_over(slot.layer);
+                }
+                TransitionKind::Cut | TransitionKind::Strobe => {
+                    self.mosh.invalidate(slot.layer);
+                }
+            }
+            // Only a blending transition needs the saved "from" picture: Cut copies `src`, and
+            // Datamosh's `apply` draws nothing at all (the carried mosh buffer is the effect), so
+            // neither would ever read it.
+            if entry != TransitionKind::Cut && entry != TransitionKind::Datamosh {
                 let from = slot.target(slot.last_output_stage);
                 self.transitions.begin(rec, slot.layer, from)?;
             }
@@ -151,14 +185,22 @@ impl Visuals {
                 .draw(rec, &slot.scene, visualizer, frame, &state.params, t)?;
         }
 
-        let mosh = state
+        let mut mosh = state
             .effects
             .iter()
             .filter(|e| e.kind == EffectKind::Mosh)
             .map(|e| e.amount)
             .fold(0.0f32, f32::max);
-        if mosh > 0.0
-            && self.mosh.apply(
+        if carry_entry {
+            // The clip change *is* a mosh: keep the buffer running at mosh strength for the whole
+            // transition, even when the new clip asks for no mosh of its own. The web app derives
+            // no amount from a transition (it uses the clip's `mosh`), so this is a native
+            // decision: `P.skipres` only means anything with the pass running, and a Datamosh (or
+            // Melt) transition on a clip with no mosh slot would otherwise be an I-frame.
+            mosh = mosh.max(CARRY_AMOUNT);
+        }
+        if mosh > 0.0 {
+            if self.mosh.apply(
                 rec,
                 slot.layer,
                 slot.target(slot.output_stage),
@@ -166,9 +208,14 @@ impl Visuals {
                 mosh,
                 frame,
                 self.fluid.velocity(),
-            )?
-        {
-            slot.output_stage = Stage::Mosh;
+            )? {
+                slot.output_stage = Stage::Mosh;
+            }
+        } else {
+            // No mosh slot on a layer that moshed last frame is an I-frame, not a gap: the web app
+            // does `if (m <= 0.001) iframe = 1`, so the buffer is forgotten here instead of the
+            // next mosh frame carrying a picture the show has already left behind.
+            self.mosh.invalidate(slot.layer);
         }
 
         if self.effects.apply(
