@@ -1,9 +1,9 @@
-﻿//! Thorns and sigil marks: the sigil look's linework, grown from the block at bake time.
+//! Thorns and sigil marks: the sigil look's linework, grown from the block at bake time.
 //!
 //! # What the linework is
 //!
 //! Cybersigilism is thin tribal linework: long, whip-like spikes that leave the silhouette where it
-//! turns hardest â€” a stroke's end, a corner, a point â€” and sweep outward, plus abstract thorny
+//! turns hardest — a stroke's end, a corner, a point — and sweep outward, plus abstract thorny
 //! marks that flank the word. Both are *geometry*, found or drawn at bake time and handed to the
 //! shader as tapered capsules, so they stay sharp at any size and can never be baked into a
 //! letter's face.
@@ -16,7 +16,7 @@
 //! # Where a thorn may grow
 //!
 //! Only on an **outer** contour (a pixel the block's border can reach through empty space, so a
-//! counter â€” the hole in `A` â€” is never an anchor), only so the spike itself stays in that empty
+//! counter — the hole in `A` — is never an anchor), only so the spike itself stays in that empty
 //! space, and only over its own word: a spike that would reach into another word's column box
 //! would spear the next word across a space, which reads as a scratch, not a thorn. Every pixel a
 //! candidate covers is checked against the block's ink and against the other words' boxes, and a
@@ -50,8 +50,17 @@ pub const REACH_PX: f32 = 4.0;
 pub(crate) const BEND_WIDTH: f32 = 0.7;
 pub(crate) const TIP_WIDTH: f32 = 0.0;
 
+/// How far, in baked pixels, a thorn's body must stay from a mark's. The marks sit just outside
+/// the block and so do the thorns: on the left, where the shader draws the authored mark mirrored,
+/// a thorn hugging the block's edge merged into the mark and the pair stopped reading as a mark
+/// beside the word. The gap is a little under the mark's own distance from the block (`0.06` of a
+/// line), floored in pixels so a small block keeps a visible gap.
+fn mark_clearance(line_h: f32) -> f32 {
+    (0.06 * line_h).clamp(4.0, 12.0)
+}
+
 /// One stroke of the sigil look's linework, in block pixels (origin at the block's top-left, y
-/// down â€” the same space `Layout` places glyphs in, and the space `text.wgsl` maps `block_uv`
+/// down — the same space `Layout` places glyphs in, and the space `text.wgsl` maps `block_uv`
 /// into): two tapered capsules from `a` through `b` to `c`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Stroke {
@@ -284,17 +293,12 @@ impl<'a> Block<'a> {
             .unwrap_or((self.size.0, 0, usize::MAX))
     }
 
-    /// True when every pixel the stroke covers sits in the block's outside space and stays over
-    /// `own` word. Inside the block's columns a stroke may only cover its own word's columns â€” no
-    /// gap and no other word â€” so a spike can lean out of the text but never across a space; outside
-    /// the block it may point anywhere (that is where spikes leave the word).
-    fn is_clear(
-        &self,
-        stroke: &Stroke,
-        own: (u32, u32, usize),
-        words: &[(i32, i32, usize)],
-    ) -> bool {
-        let _ = words;
+    /// True when every pixel the stroke covers sits in the block's outside space and, wherever it
+    /// is over the block's *columns*, over `own` word: no ink, no counter (both are the block's
+    /// outside space), and no gap column and no other word's column. The column band holds all the
+    /// way out — a spike may lean above or below the line, but not sideways out of its word — which
+    /// is what keeps a spike from spearing the next word across a space.
+    fn is_clear(&self, stroke: &Stroke, own: (u32, u32, usize)) -> bool {
         let (min_x, max_x, min_y, max_y) = stroke_bounds(stroke, self.size);
         for y in min_y..=max_y {
             for x in min_x..=max_x {
@@ -365,13 +369,16 @@ fn stroke_bounds(stroke: &Stroke, size: (u32, u32)) -> (u32, u32, u32, u32) {
 }
 
 /// Grows the thorns for a baked block: `field` is the sheet's BGRA distance field, `width` its
-/// width, `origin` the block's top-left in it, `size` the block's size in pixels and `lines` how
-/// many visual lines the block has. At most [`MAX_THORNS`] strokes, and none at all for a block
-/// with no contour (empty or whitespace-only text).
+/// width, `origin` the block's top-left in it, `size` the block's size in pixels, `lines` how many
+/// visual lines the block has and `marks` the flanking strokes the bake has already placed. At most
+/// [`MAX_THORNS`] strokes, and none at all for a block with no contour (empty or whitespace-only
+/// text).
 ///
 /// A thorn's length is a fraction of one *line's* height, not of the whole block, so a two-line
 /// phrase grows the same spikes as a single word on one line. The longest reach about 0.6 of the
-/// line's height out from the silhouette.
+/// line's height out from the silhouette. A thorn that would come within [`mark_clearance`] of a
+/// mark's body — the authored mark or its mirror — is dropped instead: the marks must read as
+/// separate linework beside the word, not as part of the band of spikes on the block's edge.
 pub fn grow(
     field: &[u8],
     width: u32,
@@ -379,12 +386,16 @@ pub fn grow(
     size: (u32, u32),
     lines: usize,
     words: &[(i32, i32, usize)],
+    marks: &[Stroke],
 ) -> Vec<Stroke> {
     if size.0 < 3 || size.1 < 3 || field.len() < (width * (origin.1 + size.1) * 4) as usize {
         return Vec::new();
     }
     let block = Block::new(field, width, origin, size);
     let line_h = size.1 as f32 / lines.max(1) as f32;
+    // The marks are already fixed, so a thorn that would merge into one is dropped here: the two
+    // read as separate linework, a mark beside the word and spikes on its contour.
+    let clearance = mark_clearance(line_h);
 
     // Every boundary pixel where the contour turns sharply enough to be a corner or a stroke's
     // end: the turn is the angle between the outward normals a few pixels either side of the
@@ -468,7 +479,9 @@ pub fn grow(
             continue;
         }
         if !strokes.iter().all(|stroke| {
-            block.is_clear(stroke, own, words) && block.reach(stroke) >= REACH_PX
+            block.is_clear(stroke, own)
+                && block.reach(stroke) >= REACH_PX
+                && clear_of_marks(stroke, marks, size.0 as f32, clearance)
         }) {
             continue;
         }
@@ -575,7 +588,7 @@ fn flip_side(seed: u32) -> f32 {
 }
 
 /// The sigil marks that flank the word: five strokes in a box just outside the block on the right
-/// (the shader mirrors them for the left), so the pair is symmetric, abstract â€” a bramble: one
+/// (the shader mirrors them for the left), so the pair is symmetric, abstract — a bramble: one
 /// spine in two halves that bends twice, with three barbs on one side, an open line, never a closed
 /// figure, no letterforms and nothing from an alphabet. The same words always draw the same marks
 /// (`text_seed`), and they sit outside the ink's box, so they can never cover a glyph.
@@ -671,6 +684,44 @@ fn point_gap(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
         0.0
     };
     (ap[0] - ab[0] * t).hypot(ap[1] - ab[1] * t)
+}
+
+/// A mark stroke as the shader draws the left copy: mirrored about the block's vertical centre,
+/// which in block pixels is `block_w - x`.
+pub fn mirrored(stroke: &Stroke, block_w: f32) -> Stroke {
+    let about = |p: [f32; 2]| [block_w - p[0], p[1]];
+    Stroke {
+        a: about(stroke.a),
+        b: about(stroke.b),
+        c: about(stroke.c),
+        width: stroke.width,
+        mirrored: stroke.mirrored,
+    }
+}
+
+/// True when `stroke`'s body keeps `clearance` pixels from every mark's body, on both sides: the
+/// authored mark and the copy the shader mirrors out of it. Radii are the strokes' full base
+/// half-widths, never the taper, so the test is a little stricter than the drawn ink.
+fn clear_of_marks(stroke: &Stroke, marks: &[Stroke], block_w: f32, clearance: f32) -> bool {
+    marks.iter().all(|mark| {
+        [*mark, mirrored(mark, block_w)].iter().all(|copy| {
+            centreline_gap(stroke, copy) >= stroke.width + copy.width + clearance
+        })
+    })
+}
+
+/// The closest the two strokes' centrelines come, in block pixels: the nearest pair of points on
+/// their two-segment polylines. Both directions are sampled, so neither stroke's shape can slip
+/// between the other's samples.
+fn centreline_gap(a: &Stroke, b: &Stroke) -> f32 {
+    let mut closest = f32::INFINITY;
+    for (a0, a1) in [(a.a, a.b), (a.b, a.c)] {
+        for (b0, b1) in [(b.a, b.b), (b.b, b.c)] {
+            closest = closest.min(segment_gap(a0, a1, b0, b1));
+            closest = closest.min(segment_gap(b0, b1, a0, a1));
+        }
+    }
+    closest
 }
 
 /// A deterministic hash of a seed and a salt, in `0..1`.
@@ -1053,7 +1104,7 @@ mod tests {
     /// The same predicate against the *class* of defect the previous shader had: a diagonal lattice
     /// over the whole block, one barb per cell, gated only by the distance to the nearest edge, so
     /// it grows a barb inside a counter (the hole of an `A`). This is not a transcription of that
-    /// shader â€” its constants and hashes are gone â€” it is the shape of the rule, kept so the
+    /// shader — its constants and hashes are gone — it is the shape of the rule, kept so the
     /// property has something that fails it.
     #[test]
     fn the_old_diagonal_lattice_would_fail_the_same_test() {
@@ -1143,8 +1194,8 @@ mod tests {
     /// baked pixels of a mark barb missing on `W` and `THE LOOM IS US`.
     ///
     /// One check covers both copies: the shader draws the left mark by evaluating the *authored*
-    /// stroke at the mirrored position, so the authored body â€” including the part outside the
-    /// block's box â€” is exactly what the bound is applied to.
+    /// stroke at the mirrored position, so the authored body — including the part outside the
+    /// block's box — is exactly what the bound is applied to.
     #[test]
     fn every_authored_stroke_fits_the_shader_reach_bound() {
         let mut checked = 0usize;
@@ -1203,6 +1254,61 @@ mod tests {
             total > 0,
             "the chord bound skipped nothing, so it is not the bound this test is about"
         );
+    }
+
+    /// The marks flank the word and the thorns grow from the same edges, so on the left — where
+    /// the shader draws the authored mark mirrored — a thorn hugging the block merged into the mark
+    /// and the pair stopped reading as a mark beside the word. This checks the raster: no thorn ink
+    /// lands within the marks' clearance, on either side, and the gap is measured and printed.
+    #[test]
+    fn a_thorn_keeps_its_distance_from_the_marks() {
+        for text in ["ILANA", "THE LOOM IS US", "SIGIL", "W"] {
+            let probe = Probe::new(text);
+            let block_w = probe.size.0 as f32;
+            let clearance = mark_clearance(probe.line_h);
+            let marks: Vec<Stroke> = probe
+                .symbols()
+                .iter()
+                .flat_map(|mark| [*mark, mirrored(mark, block_w)])
+                .collect();
+            let flank = (2.0 * probe.line_h) as i32;
+            let mut violations = 0usize;
+            let mut closest = f32::INFINITY;
+            for y in 0..probe.size.1 as i32 {
+                for x in -flank..probe.size.0 as i32 + flank {
+                    let p = [x as f32 + 0.5, y as f32 + 0.5];
+                    if !probe.thorns().iter().any(|thorn| thorn.signed(p) <= 0.0) {
+                        continue;
+                    }
+                    let near_mark = marks
+                        .iter()
+                        .map(|mark| mark.signed(p))
+                        .fold(f32::INFINITY, f32::min);
+                    closest = closest.min(near_mark);
+                    if near_mark <= clearance {
+                        violations += 1;
+                    }
+                }
+            }
+            println!(
+                "{text:?}: {} thorns, closest thorn ink {closest:.1}px from a mark's body \
+                 (clearance {clearance:.1}px)",
+                probe.thorns().len()
+            );
+            assert!(
+                !probe.thorns().is_empty(),
+                "{text:?} grew no thorns at all: the clearance must not clear the contour"
+            );
+            assert_eq!(
+                violations, 0,
+                "{text:?}: {violations} thorn pixels lie within {clearance:.1}px of a mark, so the \
+                 mark merges into the thorn band"
+            );
+            assert!(
+                closest >= 1.0,
+                "{text:?}: thorn ink touches a mark's body (gap {closest:.2}px)"
+            );
+        }
     }
 
     #[test]

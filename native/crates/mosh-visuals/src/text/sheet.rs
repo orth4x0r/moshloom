@@ -267,6 +267,14 @@ fn compose_into(
         layout.block_h.max(1) as u32,
     );
     let thorny = face.thorns();
+    // The marks are drawn before the thorns are grown: a thorn that would come within a clearance
+    // of one is dropped, so the pair of marks reads as linework beside the word instead of merging
+    // into the band of spikes on the block's edge (`thorn::grow`).
+    let symbols = if thorny {
+        thorn::symbols(text, block, layout.lines.len())
+    } else {
+        Vec::new()
+    };
     Some(Baked {
         block_w: block.0,
         block_h: block.1,
@@ -280,15 +288,12 @@ fn compose_into(
                 block,
                 layout.lines.len(),
                 &layout.words,
+                &symbols,
             )
         } else {
             Vec::new()
         },
-        symbols: if thorny {
-            thorn::symbols(text, block, layout.lines.len())
-        } else {
-            Vec::new()
-        },
+        symbols,
         lines: layout.lines.len(),
         words: layout.words.clone(),
     })

@@ -22,7 +22,8 @@
 // draws the strokes in the same silver as the letters. Nothing is ever drawn across a glyph's face,
 // and no thorn crosses a space into the next word.
 //
-// Uniform block (416 bytes, matches `text::UNIFORM_BYTES`):
+// Uniform block (1008 bytes, matches `text::UNIFORM_BYTES`; mosh-render caps a per-draw block at
+// 1024, so this is sixteen bytes — half a stroke — under that cap):
 //   0  dst: vec2f          8  sheet: vec2f
 //   16 inset_min: vec2f    24 inset_max: vec2f
 //   32 p0: vec4f (p0..p3)  48 p1: vec4f (p4..p7)
@@ -314,6 +315,10 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         // left: the mirror of a block-space x is the block's width in its own units minus x. Both
         // copies sit outside the block's box, so there is nothing to evaluate over the letters.
         if (local.x < 0.0 || local.x > block_aspect) {
+            // Which side of the block this pixel is on, and so which copy of an authored mark it
+            // can see. `stroke.mirror` is the CPU's bit for the second copy (`text/thorn.rs`
+            // writes 1 for every mark stroke): a stroke without it is drawn once, on the right.
+            let mirrored = local.x < 0.5 * block_aspect;
             let probe = select(
                 vec2<f32>(block_aspect - local.x, local.y),
                 local,
@@ -326,6 +331,9 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
                 }
                 let stroke = U.symbols[mark];
                 mark = mark + 1u;
+                if (mirrored && stroke.mirror < 0.5) {
+                    continue;
+                }
                 if (out_of_reach(probe, stroke)) {
                     continue;
                 }

@@ -23,8 +23,9 @@
 //! * The beat pop (`p6`) and glitch change pixels, and nothing flashes the whole frame: the four
 //!   corners stay black through a 400 ms window (`README`: no full-frame flash faster than every
 //!   400 ms).
-//! * Previews of the three looks, with a word and a two-line phrase, are written under
-//!   `native/target/style-previews/text/` for the PR; nothing is committed.
+//! * Previews of the three looks, with a word, that word as the windowed run spelled it
+//!   (`ilanaVisual`) and a two-line phrase, are written under `native/target/style-previews/text/`
+//!   for the PR; nothing is committed.
 //!
 //! # Row order
 //!
@@ -860,7 +861,14 @@ fn three_looks_write_previews() {
     let (width, height) = (960u32, 540u32);
     let frame = audio_frame();
     let looks = [("chrome", 0.05), ("sigil", 0.45), ("clean", 0.85)];
-    let shots = [("ilana", "ILANA"), ("phrase", "the loom\nis us")];
+    // `ilanaVisual` is the text the windowed run broke into `ILANAVISU` / `AL`: the Sigil look
+    // uppercases it, and it must come out as one line in every look. The two-line phrase is the
+    // other half of the wrap contract.
+    let shots = [
+        ("ilana", "ILANA"),
+        ("ilanavisual", "ilanaVisual"),
+        ("phrase", "the loom\nis us"),
+    ];
 
     for (name, font) in looks {
         for (shot_name, text) in shots {
@@ -1181,27 +1189,39 @@ fn set_text_and_draw_costs() {
          {record_median:.3})"
     );
     // Reported, not budgeted: the sigil look's bake also grows its thorns from the composed field
-    // (`text/thorn.rs`), a cost the two other looks do not pay. A text change on a sigil layer is
-    // the only place it lands, so it is measured here and printed with the rest.
-    let mut recorder = FrameRecorder::new(&gpu);
-    layer
-        .draw(
-            &mut recorder,
-            0,
-            &dst,
-            &frame,
-            &params(0.8, 0.45, 0.5, 0.0, 0.0, 0.45, 0.0, 0.0),
-            0.0,
-        )
-        .expect("draw the sigil look");
-    let sigil_timings = gpu.wait_frame(recorder.submit());
+    // (`text/thorn.rs`), a cost the two other looks do not pay. The pass is measured the way the
+    // clean one is — a warm-up frame (the first draw after a text change also uploads the sheet and
+    // binds the look), then ten frames, median — because one cold sample is not a number.
+    let sigil_params = params(0.8, 0.45, 0.5, 0.0, 0.0, 0.45, 0.0, 0.0);
+    let mut sigil_samples: Vec<f64> = Vec::new();
+    for step in 0..11 {
+        let mut recorder = FrameRecorder::new(&gpu);
+        layer
+            .draw(
+                &mut recorder,
+                0,
+                &dst,
+                &frame,
+                &sigil_params,
+                step as f32 / 60.0,
+            )
+            .expect("draw the sigil look");
+        let timings = gpu.wait_frame(recorder.submit());
+        if step == 0 {
+            continue;
+        }
+        if let Some((_, ms)) = timings
+            .per_pass_ms
+            .iter()
+            .find(|(name, _)| name == "text.glyphs")
+        {
+            sigil_samples.push(f64::from(*ms));
+        }
+    }
+    assert_eq!(sigil_samples.len(), 10, "ten measured sigil frames");
+    let (sigil_min, sigil_median) = stats(&mut sigil_samples);
     // The sigil pass costs more than the clean one: it evaluates up to twenty thorn strokes and a
-    // handful of mark strokes per pixel over a wider region. Reported, not budgeted.
-    let sigil_pass = sigil_timings
-        .per_pass_ms
-        .iter()
-        .find(|(name, _)| name == "text.glyphs")
-        .map(|(_, ms)| *ms);
+    // handful of mark strokes per pixel over a wider region.
     let sigil_text = "the loom knows what the flesh wants";
     let sigil = {
         let start = Instant::now();
@@ -1218,8 +1238,8 @@ fn set_text_and_draw_costs() {
     };
     println!(
         "a sigil-look text change ({sigil_text:?}, thorns and marks included): {sigil:.3} ms cold, \
-         {warm:.3} ms with every glyph already cached; the sigil pass {}",
-        sigil_pass.map_or("not timed".to_string(), |ms| format!("{ms:.4} ms"))
+         {warm:.3} ms with every glyph already cached; the sigil pass {sigil_min:.4} / \
+         {sigil_median:.4} ms min/median"
     );
     // A sigil text change pays for the glyphs and for the thorn and mark growth, and it must not
     // become a per-frame or per-edit stall. 25 ms is about twice the 9.5 ms measured here for
@@ -1358,6 +1378,19 @@ fn the_mirrored_mark_draws_on_both_sides() {
         "the right flank has {right_ink} lit pixels and only {right_pairs} of them mirror the left \
          flank: the authored mark is not drawing"
     );
+    assert_no_validation_messages(&gpu);
+}
+
+#[test]
+fn a_text_layer_fits_the_uniform_cap() {
+    let gpu = gpu();
+    // `Pipeline::fullscreen` refuses a block over `mosh_render::device::MAX_UNIFORM_BYTES` (1024
+    // bytes, private to that crate) with `UniformTooLarge`; the text block is 1008 — 112 bytes of
+    // scalars, 20 thorn strokes and 8 mark strokes of 32 bytes. This constructor succeeding is the
+    // assertion that it fits; `text::tests::the_uniform_block_fits_the_render_crate_cap` pins the
+    // numbers, and one more stroke would not fit.
+    let _layer = TextLayer::new(&gpu).expect("the text pass's uniform block fits mosh-render's cap");
+    println!("TextLayer::new: a 1008-byte uniform block against a 1024-byte cap");
     assert_no_validation_messages(&gpu);
 }
 
