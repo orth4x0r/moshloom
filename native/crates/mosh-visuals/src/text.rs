@@ -76,12 +76,33 @@ pub const PARAMS: [&str; 8] = [
 ];
 
 /// Bytes of the pass's uniform block. Keep in sync with `text/text.wgsl` (a unit test reflects the
-/// shader and compares): 96 bytes of scalar block, then [`thorn::MAX_THORNS`] thorns at 32 bytes.
-const UNIFORM_BYTES: usize = 96 + thorn::MAX_THORNS * 32;
+/// shader and compares every member's offset): 96 bytes of scalar block, then [`thorn::MAX_THORNS`]
+/// thorns at 32 bytes.
+const UNIFORM_BYTES: usize = 96 + thorn::MAX_THORNS * THORN_BYTES;
 
-/// Bytes of one thorn in the uniform block: `base`, `bend` and `tip` as two `vec2` each, then the
-/// base half-width and a padding float.
+/// The uniform block's scalar member offsets, in bytes. `text/text.wgsl`'s `TextUniforms` is the
+/// other half of this contract: `the_uniform_block_members_match_the_shader` reflects the shader
+/// and compares each of these, so a reordered or resized WGSL member cannot pass silently.
+const DST_AT: usize = 0;
+const SHEET_AT: usize = 8;
+const INSET_MIN_AT: usize = 16;
+const INSET_MAX_AT: usize = 24;
+const PARAMS_AT: usize = 32;
+const TAPS_AT: usize = 48;
+const AUDIO_AT: usize = 64;
+const CLOCK_AT: usize = 80;
+const THORN_COUNT_AT: usize = 92;
+const THORNS_AT: usize = 96;
+
+/// Bytes of one thorn in the uniform block: its `Thorn` struct — `base`, `bend` and `tip` as a
+/// `vec2` each, then the base half-width and a padding float.
 const THORN_BYTES: usize = 32;
+
+/// The `Thorn` struct's member offsets, in bytes, relative to the thorn.
+const THORN_BASE_AT: usize = 0;
+const THORN_BEND_AT: usize = 8;
+const THORN_TIP_AT: usize = 16;
+const THORN_WIDTH_AT: usize = 24;
 
 /// A show has far fewer layers than this; the cap only stops a bogus index from growing the
 /// per-layer vector without bound.
@@ -116,10 +137,8 @@ struct TextSheet {
     height: u32,
     inset_min: [f32; 2],
     inset_max: [f32; 2],
-    /// The sigil look's thorns, in the shader's block space: `base.xy`, `bend.xy` and `tip.xy`
-    /// followed by the base half-width, each divided by the block's height so the shader's
-    /// `block_uv`-derived local space reads them directly.
-    thorns: Vec<[f32; 4]>,
+    /// The sigil look's thorns, packed for the shader ([`ThornWords`]).
+    thorns: ThornWords,
     /// The BGRA bytes of the last bake. Kept so a text change reuses the allocation instead of
     /// creating a few megabytes on the render thread.
     pixels: Vec<u8>,
@@ -249,7 +268,7 @@ impl TextLayer {
             height,
             inset_min: [0.0; 2],
             inset_max: [1.0; 2],
-            thorns: Vec::new(),
+            thorns: ThornWords::default(),
             pixels: Vec::new(),
             written_rows: 0,
         });
@@ -269,7 +288,7 @@ impl TextLayer {
         };
         held.written_rows = baked.mask_h;
         let (inset_min, inset_max) = baked.inset_in(width, height);
-        let thorns = thorn_words(&baked.thorns, baked.block_h);
+        let thorns = ThornWords::new(&baked.thorns, baked.block_h);
         let uploaded = match held.texture.as_mut() {
             Some(texture) => texture.upload(gpu, width, height, &held.pixels),
             None => match VideoTexture::new(gpu, width, height) {
@@ -355,7 +374,7 @@ impl TextLayer {
             return rec.clear(dst);
         };
         let uniforms = uniforms(
-            dst,
+            (dst.width(), dst.height()),
             sheet.width,
             sheet.height,
             sheet.inset_min,
@@ -370,74 +389,106 @@ impl TextLayer {
     }
 }
 
-/// The pass's uniform block. Field order is `text/text.wgsl`'s `U`.
+/// The pass's uniform block. Field order and offsets are `text/text.wgsl`'s `TextUniforms`; the
+/// `*_AT` constants above are that layout, and the reflection test compares them with the shader.
 #[allow(clippy::too_many_arguments)]
 fn uniforms(
-    dst: &LayerTarget,
+    dst: (u32, u32),
     width: u32,
     height: u32,
     inset_min: [f32; 2],
     inset_max: [f32; 2],
-    thorns: &[[f32; 4]],
+    thorns: &ThornWords,
     params: &ClipParams,
     frame: &AnalysisFrame,
     t: f32,
 ) -> [u8; UNIFORM_BYTES] {
     let mut block = [0u8; UNIFORM_BYTES];
-    let mut at = 0;
-    let mut push = |values: &[f32]| {
-        for value in values {
-            block[at..at + 4].copy_from_slice(&value.to_le_bytes());
-            at += 4;
-        }
-    };
-    push(&[dst.width() as f32, dst.height() as f32]);
-    push(&[width as f32, height as f32]);
-    push(&inset_min);
-    push(&inset_max);
-    push(&params.p[0..4]);
-    push(&params.p[4..8]);
-    push(&[
-        frame.bands[0],
-        frame.bands[1],
-        frame.bands[2],
-        frame.intensity,
-    ]);
-    push(&[t, frame.beat_phase, frame.loudness, thorns.len() as f32]);
-    // Past the scalar block: one 32-byte thorn each, two `vec4` (`base`, `bend`, `tip`, width).
-    for (slot, word) in thorns.iter().take(thorn::MAX_THORNS * 2).enumerate() {
-        let start = 96 + (slot / 2) * THORN_BYTES + (slot % 2) * (THORN_BYTES / 2);
-        for (index, value) in word.iter().enumerate() {
-            let field = start + index * 4;
+    // Every write names its member's offset: the layout is the `*_AT` constants, not a running
+    // cursor that can silently drift.
+    let mut write = |offset: usize, values: &[f32]| {
+        debug_assert!(offset + values.len() * 4 <= UNIFORM_BYTES, "member at {offset}");
+        for (slot, value) in values.iter().enumerate() {
+            let field = offset + slot * 4;
             block[field..field + 4].copy_from_slice(&value.to_le_bytes());
         }
+    };
+    write(DST_AT, &[dst.0 as f32, dst.1 as f32]);
+    write(SHEET_AT, &[width as f32, height as f32]);
+    write(INSET_MIN_AT, &inset_min);
+    write(INSET_MAX_AT, &inset_max);
+    write(PARAMS_AT, &params.p[0..4]);
+    write(TAPS_AT, &params.p[4..8]);
+    write(
+        AUDIO_AT,
+        &[
+            frame.bands[0],
+            frame.bands[1],
+            frame.bands[2],
+            frame.intensity,
+        ],
+    );
+    // `thorn_count` is the number of *thorns*, not of the words below: the shader indexes
+    // `U.thorns[i]` once per thorn, so publishing the word count would read the array's tail (and
+    // loop over it) for every Sigil pixel.
+    write(
+        CLOCK_AT,
+        &[t, frame.beat_phase, frame.loudness],
+    );
+    write(THORN_COUNT_AT, &[thorns.count as f32]);
+    for (index, thorn) in thorns.words.iter().take(thorn::MAX_THORNS).enumerate() {
+        let start = THORNS_AT + index * THORN_BYTES;
+        write(start + THORN_BASE_AT, &thorn[0][0..2]);
+        write(start + THORN_BEND_AT, &thorn[0][2..4]);
+        write(start + THORN_TIP_AT, &thorn[1][0..2]);
+        write(start + THORN_WIDTH_AT, &thorn[1][2..3]);
     }
-    debug_assert_eq!(at, 96);
     block
 }
 
-/// One thorn as the shader's `Thorn` struct wants it: `base`, `bend`, `tip` and the base
-/// half-width, every number divided by the block's height. `block_uv` scaled by the block's aspect
-/// is that space, so the shader reads these directly and the thorn keeps its weight relative to
-/// the block at every `size`.
-fn thorn_words(thorns: &[Thorn], block_h: u32) -> Vec<[f32; 4]> {
-    let height = block_h.max(1) as f32;
-    let mut words = Vec::with_capacity(thorns.len() * 2);
-    for thorn in thorns.iter().take(thorn::MAX_THORNS) {
-        words.push([
-            thorn.base[0] / height,
-            thorn.base[1] / height,
-            thorn.bend[0] / height,
-            thorn.bend[1] / height,
-        ]);
-        words.push([
-            thorn.tip[0] / height,
-            thorn.tip[1] / height,
-            thorn.width / height,
-            0.0,
-        ]);
+/// The sigil look's thorns as the shader reads them: how many there are, and one entry per thorn
+/// holding its `Thorn` struct's two `vec4` words, in the block's height units.
+#[derive(Default)]
+struct ThornWords {
+    /// The number of thorns — what `thorn_count` carries. One per `U.thorns[i]`, never the number
+    /// of `vec4` words (there are two of those per thorn).
+    count: usize,
+    /// One entry per thorn: `(base.xy, bend.xy)` and `(tip.xy, half-width, unused)`. Every number
+    /// is divided by the block's height, because `block_uv` scaled by the block's aspect is that
+    /// space; the shader reads them directly and a thorn keeps its weight relative to the block at
+    /// every `size`.
+    words: Vec<[[f32; 4]; 2]>,
+}
+
+impl ThornWords {
+    /// Packs `thorns` (in block pixels) for the shader.
+    fn new(thorns: &[Thorn], block_h: u32) -> ThornWords {
+        let height = block_h.max(1) as f32;
+        let words: Vec<[[f32; 4]; 2]> = thorns
+            .iter()
+            .take(thorn::MAX_THORNS)
+            .map(|thorn| {
+                [
+                    [
+                        thorn.base[0] / height,
+                        thorn.base[1] / height,
+                        thorn.bend[0] / height,
+                        thorn.bend[1] / height,
+                    ],
+                    [
+                        thorn.tip[0] / height,
+                        thorn.tip[1] / height,
+                        thorn.width / height,
+                        0.0,
+                    ],
+                ]
+            })
+            .collect();
+        ThornWords {
+            count: words.len(),
+            words,
+        }
     }
-    words
 }
 
 #[cfg(test)]
@@ -476,21 +527,162 @@ mod tests {
         mosh_shaders::compile_wgsl(SHADER).expect("text.wgsl compiles");
     }
 
+    /// The thorn's taper is written twice — in `text/thorn.rs` (which the tests rasterise) and in
+    /// `text/text.wgsl` (which the GPU draws) — so the two are compared instead of hoped for. A
+    /// text parse is enough: each is a literal on one `const NAME: f32 = ...;` line.
     #[test]
-    fn the_uniform_block_matches_the_shader() {
-        let module = naga::front::wgsl::parse_str(SHADER).expect("text.wgsl parses");
-        let mut declared = 0u32;
-        for (_, variable) in module.global_variables.iter() {
-            if variable.space != naga::AddressSpace::Uniform {
-                continue;
-            }
-            if let naga::TypeInner::Struct { span, .. } = &module.types[variable.ty].inner {
-                declared = declared.max(*span);
-            }
+    fn the_thorn_geometry_constants_match_the_shader() {
+        for (name, expected) in [
+            ("BEND_WIDTH", thorn::BEND_WIDTH),
+            ("TIP_WIDTH", thorn::TIP_WIDTH),
+        ] {
+            assert_eq!(
+                wgsl_const(SHADER, name),
+                expected,
+                "`{name}` in text.wgsl and `text/thorn.rs` must be the same number"
+            );
         }
+    }
+
+    /// The float a `const NAME: f32 = <literal>;` line of the shader declares.
+    fn wgsl_const(source: &str, name: &str) -> f32 {
+        let needle = format!("const {name}: f32 = ");
+        let start = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("text.wgsl declares no `{name}`"))
+            + needle.len();
+        let end = start + source[start..].find(';').expect("a ; after the literal");
+        source[start..end]
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| panic!("`{name}`'s literal: {error}"))
+    }
+
+    /// The uniform block's layout, member by member: offsets, the thorn array's stride and the
+    /// offsets inside `Thorn`. Swapping two members of `Thorn` in the shader (say `bend` and `tip`)
+    /// keeps the total size, so only this test can catch it.
+    #[test]
+    fn the_uniform_block_members_match_the_shader() {
+        let module = naga::front::wgsl::parse_str(SHADER).expect("text.wgsl parses");
+        let uniform_type = module
+            .global_variables
+            .iter()
+            .find(|(_, variable)| variable.space == naga::AddressSpace::Uniform)
+            .map(|(_, variable)| variable.ty)
+            .expect("text.wgsl declares a uniform block");
+        let naga::TypeInner::Struct { members, span } = &module.types[uniform_type].inner else {
+            panic!("the uniform block is a struct");
+        };
         assert_eq!(
-            declared as usize, UNIFORM_BYTES,
+            *span as usize, UNIFORM_BYTES,
             "the uniform block text.rs writes must be the struct text.wgsl reads"
         );
+        let offset = |name: &str| {
+            members
+                .iter()
+                .find(|member| member.name.as_deref() == Some(name))
+                .map(|member| member.offset as usize)
+                .unwrap_or_else(|| panic!("text.wgsl's uniform block has no `{name}` member"))
+        };
+        for (name, expected) in [
+            ("dst", DST_AT),
+            ("sheet", SHEET_AT),
+            ("inset_min", INSET_MIN_AT),
+            ("inset_max", INSET_MAX_AT),
+            ("p0", PARAMS_AT),
+            ("p1", TAPS_AT),
+            ("audio", AUDIO_AT),
+            ("time", CLOCK_AT),
+            ("beat", CLOCK_AT + 4),
+            ("loud", CLOCK_AT + 8),
+            ("thorn_count", THORN_COUNT_AT),
+            ("thorns", THORNS_AT),
+        ] {
+            assert_eq!(offset(name), expected, "`{name}` sits at the wrong byte");
+        }
+        // The thorn array: one 32-byte `Thorn` each, and the struct's own member offsets, which is
+        // where text.rs writes `base`, `bend`, `tip` and the half-width.
+        let thorns = members
+            .iter()
+            .find(|member| member.name.as_deref() == Some("thorns"))
+            .expect("the thorns member");
+        let naga::TypeInner::Array { base, stride, .. } = &module.types[thorns.ty].inner else {
+            panic!("`thorns` is an array");
+        };
+        assert_eq!(
+            *stride as usize, THORN_BYTES,
+            "one thorn's stride in the uniform block"
+        );
+        let naga::TypeInner::Struct {
+            members: thorn_members,
+            ..
+        } = &module.types[*base].inner
+        else {
+            panic!("a thorn is a struct");
+        };
+        let thorn_offset = |name: &str| {
+            thorn_members
+                .iter()
+                .find(|member| member.name.as_deref() == Some(name))
+                .map(|member| member.offset as usize)
+                .unwrap_or_else(|| panic!("the WGSL `Thorn` has no `{name}` member"))
+        };
+        assert_eq!(thorn_offset("base"), THORN_BASE_AT);
+        assert_eq!(thorn_offset("bend"), THORN_BEND_AT);
+        assert_eq!(thorn_offset("tip"), THORN_TIP_AT);
+        assert_eq!(thorn_offset("width"), THORN_WIDTH_AT);
+    }
+
+    /// The count the shader loops over is the number of thorns, not the number of `vec4` words it
+    /// takes to describe them: publishing the word count made the Sigil pass read past the end of
+    /// the array and loop twice per thorn.
+    #[test]
+    fn the_thorn_count_in_the_uniform_block_is_the_thorn_count() {
+        let thorns: Vec<Thorn> = (0..7)
+            .map(|index| Thorn {
+                base: [index as f32, 20.0],
+                bend: [index as f32 + 1.0, 10.0],
+                tip: [index as f32 + 2.0, 0.0],
+                width: 2.0,
+            })
+            .collect();
+        let words = ThornWords::new(&thorns, 100);
+        assert_eq!(words.count, thorns.len(), "one uniform entry per thorn");
+        assert_eq!(words.words.len(), thorns.len(), "two vec4 per thorn, one entry");
+        let block = uniforms(
+            (960, 540),
+            512,
+            256,
+            [0.0; 2],
+            [1.0; 2],
+            &words,
+            &ClipParams {
+                p: [0.5; 8],
+                palette: 0,
+                seed: 0,
+            },
+            &AnalysisFrame::default(),
+            1.0,
+        );
+        let at = |offset: usize| {
+            f32::from_le_bytes(block[offset..offset + 4].try_into().expect("four bytes"))
+        };
+        let count = at(THORN_COUNT_AT);
+        assert_eq!(
+            count,
+            thorns.len() as f32,
+            "the shader's `thorn_count` is the number of thorns, not of their words"
+        );
+        assert!(
+            count as usize <= thorn::MAX_THORNS,
+            "{count} thorns do not fit the shader's array of {}",
+            thorn::MAX_THORNS
+        );
+        // And the entry the shader indexes per thorn is the one the bake grew, at its own slot.
+        let last = THORNS_AT + (thorns.len() - 1) * THORN_BYTES;
+        assert_eq!(at(last), 6.0 / 100.0, "thorn 6 starts where thorn 6 is");
+        assert_eq!(at(last + 8), 7.0 / 100.0, "its bend follows its base");
+        assert_eq!(at(last + 16), 8.0 / 100.0, "its tip follows its bend");
+        assert_eq!(at(last + THORN_WIDTH_AT), 2.0 / 100.0, "its half-width");
     }
 }

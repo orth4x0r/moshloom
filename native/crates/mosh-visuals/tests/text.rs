@@ -1213,6 +1213,15 @@ fn set_text_and_draw_costs() {
         "a sigil-look text change ({sigil_text:?}, thorns included): {sigil:.3} ms cold, \
          {warm:.3} ms with every glyph already cached"
     );
+    // A sigil text change pays for the glyphs and for the thorn growth, and it must not become a
+    // per-frame or per-edit stall. 25 ms is about three times the 8.4-9.4 ms measured here for
+    // thirty-six characters, and the reviewer measured 9.2 ms at the 600-character, seven-line cap
+    // — generous, but a 3x regression fails it.
+    let sigil_bound = if cfg!(debug_assertions) { 400.0 } else { 25.0 };
+    assert!(
+        sigil < sigil_bound,
+        "a sigil text change must stay under {sigil_bound} ms, took {sigil:.3} ms (cold)"
+    );
     assert_no_validation_messages(&gpu);
 }
 

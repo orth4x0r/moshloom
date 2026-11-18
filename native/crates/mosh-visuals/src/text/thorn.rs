@@ -37,9 +37,11 @@ pub const MAX_THORNS: usize = 10;
 pub const REACH_PX: f32 = 4.0;
 
 /// The second capsule's fraction of the base half-width at the bend, and at the tip. The thorn is
-/// a point by the end, so it tapers from a stroke to nothing instead of ending in a cut.
-const BEND_WIDTH: f32 = 0.55;
-const TIP_WIDTH: f32 = 0.01;
+/// a point by the end, so it tapers from a stroke to nothing instead of ending in a cut. These two
+/// numbers exist in `text/text.wgsl` as well (the GPU draws the same capsules);
+/// `text.rs`'s `the_thorn_geometry_constants_match_the_shader` compares them.
+pub(crate) const BEND_WIDTH: f32 = 0.55;
+pub(crate) const TIP_WIDTH: f32 = 0.01;
 
 /// One thorn: a curved, tapered spike that grows outward from the contour, in block pixels
 /// (origin at the block's top-left, y down — the same space `Layout` places glyphs in, and the
@@ -658,10 +660,11 @@ mod tests {
         }
     }
 
-    /// The same predicate against the rule the previous shader used: a diagonal lattice across the
-    /// whole block, one barb per cell, gated only by the distance to the nearest edge. It grows a
-    /// barb inside a counter (the hole of an `A`), which is the "scratches across the face" the
-    /// coordinator saw.
+    /// The same predicate against the *class* of defect the previous shader had: a diagonal lattice
+    /// over the whole block, one barb per cell, gated only by the distance to the nearest edge, so
+    /// it grows a barb inside a counter (the hole of an `A`). This is not a transcription of that
+    /// shader — its constants and hashes are gone — it is the shape of the rule, kept so the
+    /// property has something that fails it.
     #[test]
     fn the_old_diagonal_lattice_would_fail_the_same_test() {
         let probe = Probe::new("ILANA");

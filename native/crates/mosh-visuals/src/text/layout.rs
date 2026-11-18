@@ -21,8 +21,8 @@
 //! here through `ttf-parser` — fontdue's own parser, already on the dependency graph. Pair values
 //! are cached per (left, right) in font units; the pixel value is `units * px / units_per_em`.
 //!
-//! The `kern` feature is resolved once, at load, through the script and language system (`DFLT`'s
-//! default LangSys, then `latn`'s, then the first script's), and its lookups are de-duplicated:
+//! The `kern` feature is resolved once, at load, through the script and language system (`latn`'s
+//! default LangSys, then `DFLT`'s, then the first script's), and its lookups are de-duplicated:
 //! every lookup applies once. Walking the FeatureList instead — as this module first did — would
 //! count a font that writes one `kern` FeatureRecord per script, all pointing at the same lookup,
 //! once per script. The pair cache itself is capped at [`CACHE_KERNS`] entries and cleared when it
@@ -131,8 +131,12 @@ struct KernFeature {
 }
 
 /// The lookups a `kern` feature contributes, chosen through the script and language system: the
-/// `DFLT` script's default language system, then `latn`'s, then the first script's, and only the
+/// `latn` script's default language system, then `DFLT`'s, then the first script's, and only the
 /// chosen system's records. Each lookup appears once.
+///
+/// `latn` first is the OpenType practice: the text is Latin, so the Latin script's system is the
+/// one that was written for it, and a face that keeps a separate `DFLT` system means that one for
+/// text with no script of its own.
 ///
 /// The hazard this closes: a font built one `kern` FeatureRecord per script points every record at
 /// the same lookup. Walking the FeatureList and adding each record's first matching pair value
@@ -141,12 +145,12 @@ struct KernFeature {
 fn kern_lookups(features: &[KernFeature]) -> Vec<u16> {
     let mut chosen: Vec<&KernFeature> = features
         .iter()
-        .filter(|feature| feature.script == SCRIPT_DFLT && feature.language.is_none())
+        .filter(|feature| feature.script == SCRIPT_LATN && feature.language.is_none())
         .collect();
     if chosen.is_empty() {
         chosen = features
             .iter()
-            .filter(|feature| feature.script == SCRIPT_LATN && feature.language.is_none())
+            .filter(|feature| feature.script == SCRIPT_DFLT && feature.language.is_none())
             .collect();
     }
     // The first script the table lists is the last resort.
@@ -321,11 +325,11 @@ struct Placed {
     line: usize,
 }
 
-/// One visual line: the character range it draws, and its advance width.
+/// One visual line: the character range it draws. Its advance width is measured when the glyphs
+/// are placed, because kerning depends on the glyphs and on the line's own first character.
 struct VisualLine {
     first: usize,
     end: usize,
-    advance: f32,
 }
 
 impl Face {
@@ -426,17 +430,10 @@ impl Face {
         ) else {
             return 0;
         };
-        let mut total = 0i32;
-        for index in &self.kern {
-            let Some(lookup) = table.lookups.get(*index) else {
-                continue;
-            };
-            if let Some(value) = pair_value(&lookup, left, right) {
-                total += i32::from(value);
-            }
-        }
-        // Two lookups can each ask for the largest adjustment: saturate instead of wrapping.
-        total.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+        pair_sum(&self.kern, |index| {
+            let lookup = table.lookups.get(index)?;
+            pair_value(&lookup, left, right)
+        })
     }
 
     /// The font's advance for `ch`, in pixels, without rasterising it.
@@ -540,7 +537,6 @@ impl Face {
                 lines.push(VisualLine {
                     first,
                     end: first,
-                    advance: 0.0,
                 });
                 first += 1;
                 continue;
@@ -580,7 +576,6 @@ impl Face {
             lines.push(VisualLine {
                 first,
                 end: break_at,
-                advance: widths[break_at] - widths[first],
             });
             first = break_at;
             while first < chars.len() && chars[first] == ' ' {
@@ -596,26 +591,18 @@ impl Face {
             lines.push(VisualLine {
                 first,
                 end: first,
-                advance: 0.0,
             });
         }
         let dropped = dropped + chars.len().saturating_sub(first.min(chars.len()));
 
-        // A line's first glyph does not kern from the character before it: the pair is not drawn
-        // together across a line break, and a space the wrap dropped is not part of the line. The
-        // prefix widths include that pair's kern, so take it out.
-        for line in &mut lines {
-            if line.first == 0 || line.first >= chars.len() || chars[line.first] == '\n' {
-                continue;
-            }
-            if let Some(before) = chars[..line.first].iter().rposition(|ch| *ch != '\n') {
-                line.advance -= self.kern_em(chars[before], chars[line.first]) * px;
-            }
-        }
-
-        // Place every glyph, line by line. Kerning is the font's, and only inside a line.
+        // Place every glyph, line by line, and measure each line by the pen it ends with. Kerning
+        // is the font's and only inside a line: the pen starts at zero on every line, so a line's
+        // first glyph never kerns from the character before the break (nor from a space the wrap
+        // dropped). That is what the centring uses; measuring a line from the prefix widths
+        // instead counted a kern across the break and needed a correction of its own.
         let mut placed: Vec<Placed> = Vec::new();
         let mut baseline = ascent;
+        let mut advances = vec![0.0f32; lines.len()];
         for (line_index, line) in lines.iter().enumerate() {
             let mut pen = 0.0f32;
             let mut previous: Option<char> = None;
@@ -637,18 +624,16 @@ impl Face {
                 }
                 pen += glyph.advance;
             }
+            advances[line_index] = pen;
             baseline += line_height;
         }
 
-        let block_advance = lines
-            .iter()
-            .map(|line| line.advance)
-            .fold(0.0f32, f32::max);
+        let block_advance = advances.iter().copied().fold(0.0f32, f32::max);
 
         // Centre every line by its advance width, not by its ink: a line's side bearings are part
         // of its width, and centring by ink is what puts a line visibly off the block's centre.
         for glyph in &mut placed {
-            let line_advance = lines[glyph.line].advance;
+            let line_advance = advances[glyph.line];
             glyph.x += ((block_advance - line_advance) * 0.5).round() as i32;
         }
 
@@ -667,12 +652,12 @@ impl Face {
         let block_w = (ink_right - ink_left).max(0);
         let block_h = (ink_bottom - ink_top).max(0);
 
-        let mut extents: Vec<Line> = lines
+        let mut extents: Vec<Line> = advances
             .iter()
-            .map(|line| Line {
+            .map(|advance| Line {
                 ink_left: 0,
                 ink_right: 0,
-                advance: line.advance,
+                advance: *advance,
             })
             .collect();
         for (line, extent) in extents.iter_mut().enumerate() {
@@ -834,24 +819,22 @@ pub fn write_field(
     }
 }
 
-/// The GPOS PairPos adjustment a lookup gives the pair, in font units, if it applies.
+/// The GPOS PairPos adjustment a lookup gives the pair, in font units, if it applies: the lookup's
+/// **first** subtable that handles the pair wins. One lookup is one adjustment — a later subtable
+/// of the same lookup never adds to an earlier one.
 fn pair_value(
     lookup: &ttf_parser::opentype_layout::Lookup<'_>,
     left: ttf_parser::GlyphId,
     right: ttf_parser::GlyphId,
 ) -> Option<i16> {
     use ttf_parser::gpos::PositioningSubtable as Subtable;
-    for slot in 0..lookup.subtables.len() {
-        let Some(subtable) = lookup.subtables.get::<Subtable<'_>>(slot) else {
-            continue;
-        };
+    let subtables = (0..lookup.subtables.len()).map(|slot| {
+        let subtable = lookup.subtables.get::<Subtable<'_>>(slot)?;
         let Subtable::Pair(pair) = subtable else {
-            continue;
+            return None;
         };
-        let Some(index) = pair.coverage().get(left) else {
-            continue;
-        };
-        let value = match pair {
+        let index = pair.coverage().get(left)?;
+        match pair {
             ttf_parser::gpos::PairAdjustment::Format1 { sets, .. } => sets
                 .get(index)
                 .and_then(|set| set.get(right))
@@ -861,12 +844,28 @@ fn pair_value(
             } => matrix
                 .get((classes.0.get(left), classes.1.get(right)))
                 .map(|(first, _)| first.x_advance),
-        };
-        if let Some(value) = value {
-            return Some(value);
+        }
+    });
+    first_subtable(subtables)
+}
+
+/// The adjustment a lookup list gives a pair, in font units: **across** lookups the adjustments
+/// add up (each lookup applies in turn), while inside one lookup [`first_subtable`] keeps a single
+/// value. Saturating, so two lookups at the `i16` limit cannot wrap.
+fn pair_sum(lookups: &[u16], mut value_of: impl FnMut(u16) -> Option<i16>) -> i16 {
+    let mut total = 0i32;
+    for index in lookups {
+        if let Some(value) = value_of(*index) {
+            total += i32::from(value);
         }
     }
-    None
+    total.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+}
+
+/// The first subtable that handles the pair: a lookup's subtables are alternatives, not
+/// adjustments to be added.
+fn first_subtable(values: impl IntoIterator<Item = Option<i16>>) -> Option<i16> {
+    values.into_iter().flatten().next()
 }
 
 /// The signed distance of one mask pixel, in pixels, positive outside.
@@ -926,6 +925,10 @@ mod tests {
         // the values a reviewer measured from the committed Space Grotesk: AV -0.0550 em,
         // To -0.1030, Ty -0.0790. (A commit or a doc that quotes AV -0.064, Ty -0.058, To -0.049 is
         // wrong: those numbers were never the font's.)
+        //
+        // This test reads the font, not the summation rule: every committed face has one `kern`
+        // FeatureRecord, so the old per-record walk produced these same values.
+        // `a_pair_sums_every_lookup_and_one_subtable_per_lookup` is what pins the rule.
         let face = space_grotesk();
         let measured = [('A', 'V', -0.0550), ('T', 'o', -0.1030), ('T', 'y', -0.0790)];
         let mut kerned = Vec::new();
@@ -934,8 +937,7 @@ mod tests {
             println!("{left}{right}: {kern:+.4} em (the font says {expected:+.4})");
             assert!(
                 (kern - expected).abs() < 0.002,
-                "{left}{right} kerns {kern:+.4} em, not the {expected:+.4} the font has; a lookup \
-                 counted twice moves it by a factor of two or three"
+                "{left}{right} kerns {kern:+.4} em, not the {expected:+.4} this font has"
             );
             assert!(kern != 0.0);
             kerned.push((left, right, kern));
@@ -973,9 +975,42 @@ mod tests {
         );
     }
 
-    /// The summation hazard: a font built one `kern` FeatureRecord per script points every record
-    /// at the same lookup. Walking the FeatureList and adding each record's pair value counted
-    /// that kerning once per script — `AV` closed two or three times as far as the font says. The
+    /// The summation rule, from data: **across lookups** the pair adjustments add up (each lookup
+    /// applies in turn), while **within one lookup** only the first subtable that handles the pair
+    /// counts. The walk this replaces (a2d8e4a) stopped at the first lookup of a feature that
+    /// matched, so two lookups could not both move a pair.
+    #[test]
+    fn a_pair_sums_every_lookup_and_one_subtable_per_lookup() {
+        // Two lookups, both handling AV: they add up.
+        assert_eq!(
+            pair_sum(&[3, 5], |index| match index {
+                3 => Some(40),
+                5 => Some(-15),
+                _ => None,
+            }),
+            25
+        );
+        // A lookup that does not handle the pair contributes nothing.
+        assert_eq!(
+            pair_sum(&[3, 9], |index| match index {
+                3 => Some(40),
+                _ => None,
+            }),
+            40
+        );
+        // Two lookups at the i16 limit saturate instead of wrapping.
+        assert_eq!(pair_sum(&[0, 1], |_| Some(i16::MAX)), i16::MAX);
+        // Within one lookup the first subtable that handles the pair wins, and a later one does
+        // not add to it.
+        assert_eq!(first_subtable([None, Some(7), Some(-9)]), Some(7));
+        assert_eq!(first_subtable([Some(3), Some(7)]), Some(3));
+        assert_eq!(first_subtable([None, None]), None);
+        assert_eq!(first_subtable([]), None);
+    }
+
+    /// The record hazard: a font built one `kern` FeatureRecord per script points every record at
+    /// the same lookup. Walking the FeatureList and adding each record's pair value counted that
+    /// kerning once per script — `AV` closed two or three times as far as the font says. The
     /// chosen script's lookups are de-duplicated, so each lookup applies once.
     #[test]
     fn a_kern_lookup_named_by_two_scripts_is_counted_once() {
@@ -1018,26 +1053,22 @@ mod tests {
             language: language.map(|tag| u32::from_be_bytes(*tag)),
             lookups,
         };
-        // DFLT's default system wins over every other script.
+        // `latn`'s default system wins: the words are Latin, so the Latin script's system is the
+        // one written for them, ahead of the generic `DFLT` system.
         assert_eq!(
             kern_lookups(&[
                 feature(b"cyrl", None, vec![2]),
-                feature(b"latn", None, vec![1]),
                 feature(b"DFLT", None, vec![0]),
+                feature(b"latn", None, vec![1]),
             ]),
-            vec![0]
-        );
-        // Without DFLT or latn, the first script in the table.
-        assert_eq!(
-            kern_lookups(&[feature(b"latn", None, vec![1]), feature(b"cyrl", None, vec![2])]),
             vec![1]
         );
+        // A face with only a `DFLT` system uses it.
         assert_eq!(
-            kern_lookups(&[feature(b"cyrl", None, vec![2]), feature(b"latn", None, vec![1])]),
-            vec![1],
-            "latn is the fallback whatever order the table lists the scripts in"
+            kern_lookups(&[feature(b"cyrl", None, vec![2]), feature(b"DFLT", None, vec![0])]),
+            vec![0]
         );
-        // With neither, the first script's default system.
+        // Without either, the first script in the table.
         assert_eq!(
             kern_lookups(&[feature(b"cyrl", None, vec![2]), feature(b"grek", None, vec![3])]),
             vec![2]
@@ -1045,12 +1076,12 @@ mod tests {
         // A language-specific record is not mixed into the script's default system.
         assert_eq!(
             kern_lookups(&[
-                feature(b"DFLT", None, vec![0]),
-                feature(b"DFLT", Some(b"TRK "), vec![9]),
+                feature(b"latn", None, vec![1]),
+                feature(b"latn", Some(b"TRK "), vec![9]),
             ]),
-            vec![0]
+            vec![1]
         );
-        // A face with no script data at all keeps every record rather than losing its kerning.
+        // A face with no default system at all keeps every record rather than losing its kerning.
         assert_eq!(
             kern_lookups(&[feature(b"ZZZZ", Some(b"ZZZ "), vec![5])]),
             vec![5]
@@ -1078,16 +1109,31 @@ mod tests {
     }
 
     /// A line is measured and centred without its trailing whitespace: `"hello \nworld"` must
-    /// centre `hello` exactly where `"hello\nworld"` does. The space used to be part of the line's
-    /// advance, so the word sat half a space left of the block's centre.
+    /// centre `hello` exactly where `"hello\nworld"` does, and a line's advance is its own glyphs
+    /// plus the kerns inside it — never a kern across the break. The space used to be part of the
+    /// line's advance, and the correction that removed it subtracted a pair the prefix widths had
+    /// already accounted for, so a line could end up a couple of pixels too wide and sit off the
+    /// block's centre.
     #[test]
     fn a_trailing_space_does_not_shift_the_line() {
         let face = unbounded();
+        // The width the font itself gives a string, as the line's advance must be.
+        let measured = |face: &Face, text: &str| {
+            let mut width = 0.0;
+            let mut previous: Option<char> = None;
+            for ch in text.chars() {
+                if let Some(left) = previous {
+                    width += face.kern_em(left, ch) * BAKE_PX;
+                }
+                width += face.advance(ch, BAKE_PX);
+                previous = Some(ch);
+            }
+            width
+        };
         let plain = face.layout("hello\nworld", BAKE_PX);
         let padded = face.layout("hello \nworld", BAKE_PX);
         assert_eq!(plain.lines.len(), 2, "two lines, not three");
         assert_eq!(padded.lines.len(), 2, "a space before a break is not a line");
-        println!("plain {:#?}\npadded {:#?}", plain.lines, padded.lines);
         assert_eq!(plain.lines, padded.lines, "the same two lines, measured alike");
         assert_eq!(plain.advance_w, padded.advance_w);
         let placed = |layout: &Layout| {
@@ -1098,11 +1144,59 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(placed(&plain), placed(&padded), "every glyph sits the same");
+        // The second line is `world`: its advance is that string's own width, not the whole
+        // prefix's, and not the prefix's with a kern taken out twice.
+        for layout in [&plain, &padded] {
+            let expected = measured(&face, "world");
+            println!(
+                "line 2: {:.4}px, the font says {expected:.4}px",
+                layout.lines[1].advance
+            );
+            assert!(
+                (layout.lines[1].advance - expected).abs() < 0.01,
+                "the second line is {:.4}px wide, `world` is {expected:.4}px",
+                layout.lines[1].advance
+            );
+        }
         // A trailing space at the end of the text is not a line (or a dropped character) either.
         let single = face.layout("hello ", BAKE_PX);
         assert_eq!(single.lines.len(), 1);
         assert_eq!(single.lines, face.layout("hello", BAKE_PX).lines);
         assert_eq!(single.dropped, 0, "trimming is not truncation");
+
+        // A pair that kerns hard across the break. Space Grotesk's `To` is -0.103 em: the second
+        // line is one `o`, so its width is exactly that glyph's advance.
+        let clean = space_grotesk();
+        assert!(
+            clean.kern_em('T', 'o') < -0.05,
+            "the clean face's To must really kern, it is {:.4} em",
+            clean.kern_em('T', 'o')
+        );
+        let plain = clean.layout("T\no", BAKE_PX);
+        let padded = clean.layout("T \no", BAKE_PX);
+        assert_eq!(plain.lines.len(), 2);
+        assert_eq!(padded.lines.len(), 2);
+        assert_eq!(
+            plain.lines, padded.lines,
+            "a space before the break changed a line's width"
+        );
+        assert_eq!(
+            placed(&plain),
+            placed(&padded),
+            "a space before the break moved a glyph"
+        );
+        let bare = clean.advance('o', BAKE_PX);
+        for layout in [&plain, &padded] {
+            println!(
+                "`o` after a break: {:.4}px, the glyph is {bare:.4}px",
+                layout.lines[1].advance
+            );
+            assert!(
+                (layout.lines[1].advance - bare).abs() < 0.01,
+                "a line that starts with `o` is {:.4}px wide, the glyph is {bare:.4}px",
+                layout.lines[1].advance
+            );
+        }
     }
 
     #[test]
@@ -1287,6 +1381,3 @@ mod tests {
         }
     }
 }
-
-
-

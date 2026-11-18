@@ -70,6 +70,13 @@ const BEVEL_PX: f32 = 9.0;
 // taller than the block.
 const THORN_REACH: f32 = 0.34;
 
+// The thorn's taper, as fractions of its base half-width: the second capsule of a thorn starts at
+// `BEND_WIDTH` of the first's radius and ends at `TIP_WIDTH` of it. `text/thorn.rs` rasters the
+// same two capsules for its tests, and `the_thorn_geometry_constants_match_the_shader` compares
+// these literals with that module's constants.
+const BEND_WIDTH: f32 = 0.55;
+const TIP_WIDTH: f32 = 0.01;
+
 fn hash11(n: f32) -> f32 {
     return fract(sin(n * 127.1) * 43758.5453);
 }
@@ -257,10 +264,8 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
                 break;
             }
             let thorn = U.thorns[index];
-            // Keep the taper in sync with `text/thorn.rs` (`BEND_WIDTH`, `TIP_WIDTH`): the tests
-            // rasterise that geometry, so a different taper here would draw a different thorn.
             let first = thorn_segment(
-                local, thorn.base, thorn.bend, thorn.width, thorn.width * 0.55,
+                local, thorn.base, thorn.bend, thorn.width, thorn.width * BEND_WIDTH,
             );
             if (first.x < thorn_distance) {
                 thorn_distance = first.x;
@@ -268,7 +273,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
                 thorn_radius = first.w;
             }
             let second = thorn_segment(
-                local, thorn.bend, thorn.tip, thorn.width * 0.55, thorn.width * 0.01,
+                local, thorn.bend, thorn.tip, thorn.width * BEND_WIDTH, thorn.width * TIP_WIDTH,
             );
             if (second.x < thorn_distance) {
                 thorn_distance = second.x;
