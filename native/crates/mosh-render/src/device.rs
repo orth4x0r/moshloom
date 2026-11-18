@@ -31,8 +31,15 @@ pub const FRAMES_IN_FLIGHT: usize = 2;
 pub const MAX_DRAWS_PER_FRAME: usize = 256;
 
 /// Upper bound on a per-draw uniform block. The web app's per-layer uniform block (T, hue,
-/// vari, dens, aux0..2, l0..l2, mel[24], palT/caT/melT/rdT, p0..p7) is 192 bytes.
-pub const MAX_UNIFORM_BYTES: u64 = 1024;
+/// vari, dens, aux0..2, l0..l2, mel[24], palT/caT/melT/rdT, p0..p7) is 192 bytes; the text
+/// layer's is already 1008, so the cap is one field away from being hit and sits at 4096.
+///
+/// Vulkan guarantees `maxUniformBufferRange` of at least 16384, so a 4096-byte range is safe on
+/// every device. The cost is the ring in [`Gpu::new`]: its stride is
+/// `align_up(this, minUniformBufferOffsetAlignment)` and Vulkan caps that alignment at 256, so the
+/// stride is 4096 on every device: 4096 bytes per draw, 256 draws per frame slot and
+/// [`FRAMES_IN_FLIGHT`] slots, 2 MiB of host-visible memory held once, up from 512 KiB at 1024.
+pub const MAX_UNIFORM_BYTES: u64 = 4096;
 
 const QUERIES_PER_FRAME: u32 = 2 * MAX_DRAWS_PER_FRAME as u32;
 
@@ -257,7 +264,8 @@ impl Gpu {
         let entry = unsafe { ash::Entry::load() }
             .map_err(|error| RenderError::Loader(error.to_string()))?;
 
-        let available_extensions = unsafe { entry.enumerate_instance_extension_properties(None) }?;
+        let available_extensions =
+            unsafe { retry_incomplete(|| entry.enumerate_instance_extension_properties(None)) }?;
         let has_extension = |name: &CStr| {
             available_extensions
                 .iter()
@@ -277,7 +285,8 @@ impl Gpu {
         }
 
         // Validation layers in debug builds, and only when they are installed.
-        let available_layers = unsafe { entry.enumerate_instance_layer_properties() }?;
+        let available_layers =
+            unsafe { retry_incomplete(|| entry.enumerate_instance_layer_properties()) }?;
         let validation_available = available_layers.iter().any(|properties| {
             properties
                 .layer_name_as_c_str()
@@ -337,7 +346,8 @@ impl Gpu {
         };
 
         // Guess which GPU to use before creating the device.
-        let physical_devices = unsafe { instance.enumerate_physical_devices() }?;
+        let physical_devices =
+            unsafe { retry_incomplete(|| instance.enumerate_physical_devices()) }?;
         let mut seen = Vec::new();
         let mut chosen = None;
         for physical in physical_devices {
@@ -379,8 +389,9 @@ impl Gpu {
             .map(|(index, family)| (index as u32, family.timestamp_valid_bits))
             .ok_or(RenderError::NoGraphicsQueue)?;
 
-        let device_extensions_available =
-            unsafe { instance.enumerate_device_extension_properties(physical) }?;
+        let device_extensions_available = unsafe {
+            retry_incomplete(|| instance.enumerate_device_extension_properties(physical))
+        }?;
         let mut device_extensions: Vec<*const c_char> = Vec::new();
         if device_extensions_available
             .iter()
@@ -858,6 +869,37 @@ pub(crate) fn extension_name(properties: &vk::ExtensionProperties) -> &CStr {
     properties.extension_name_as_c_str().unwrap_or(c"")
 }
 
+/// Attempts at one enumeration before an `INCOMPLETE` is reported as an error.
+const ENUMERATION_ATTEMPTS: u32 = 8;
+
+/// Runs a two-call Vulkan enumeration until it stops answering `VK_INCOMPLETE`.
+///
+/// `VK_INCOMPLETE` is a success code, not a failure: an enumeration returns it when the buffer is
+/// smaller than the number of items that exist, because that count changed between the count query
+/// and the fetch (`vkEnumeratePhysicalDevices`, `vkEnumerate*ExtensionProperties`,
+/// `vkGetPhysicalDeviceSurfaceFormatsKHR`, `vkGetSwapchainImagesKHR`). The answer is to ask
+/// again, never to fail: this retries up to [`ENUMERATION_ATTEMPTS`] times before it reports one.
+///
+/// `ash`'s helpers loop over the *fetch* call, but their **count query** goes through
+/// `vk::Result::result()`, and ash's `result_with_success` treats every code except `VK_SUCCESS`
+/// as an error, `VK_INCOMPLETE` included. That is the gap this closes: with a loader that
+/// multiplexes several ICDs (the reference machine has an integrated and a discrete Radeon and a
+/// virtual display driver), a device list rebuilt in the middle of the call makes the count query
+/// itself answer `VK_INCOMPLETE`, which [`Gpu::new`] used to hand back as
+/// `Vulkan(INCOMPLETE)` in about one workspace run in five.
+pub(crate) fn retry_incomplete<T>(
+    mut enumerate: impl FnMut() -> Result<T, vk::Result>,
+) -> Result<T, RenderError> {
+    for _ in 0..ENUMERATION_ATTEMPTS {
+        match enumerate() {
+            Ok(items) => return Ok(items),
+            Err(vk::Result::INCOMPLETE) => std::thread::yield_now(),
+            Err(error) => return Err(RenderError::Vulkan(error)),
+        }
+    }
+    Err(RenderError::Vulkan(vk::Result::INCOMPLETE))
+}
+
 pub(crate) fn create_buffer(
     device: &ash::Device,
     memory: &vk::PhysicalDeviceMemoryProperties,
@@ -888,4 +930,54 @@ pub(crate) fn create_buffer(
     unsafe { device.bind_buffer_memory(buffer, allocation, 0) }?;
     allocations.add(allocation, requirements.size);
     Ok((buffer, allocation))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole point of the helper: `VK_INCOMPLETE` is an answer to retry, not a failure. The
+    /// synthetic call counts its attempts so the retry itself is pinned, not just the result.
+    #[test]
+    fn incomplete_is_retried_not_reported() {
+        let mut attempts = 0;
+        let devices = retry_incomplete(|| {
+            attempts += 1;
+            if attempts < 4 {
+                Err(vk::Result::INCOMPLETE)
+            } else {
+                Ok(vec!["integrated", "discrete"])
+            }
+        })
+        .expect("INCOMPLETE is a success code");
+        assert_eq!(devices, ["integrated", "discrete"]);
+        assert_eq!(attempts, 4, "it asks again while the answer is INCOMPLETE");
+    }
+
+    /// A call that never settles must end as an error at the bound, not spin forever.
+    #[test]
+    fn incomplete_stops_after_the_bound() {
+        let mut attempts = 0;
+        let result: Result<Vec<u32>, RenderError> = retry_incomplete(|| {
+            attempts += 1;
+            Err(vk::Result::INCOMPLETE)
+        });
+        assert_eq!(result, Err(RenderError::Vulkan(vk::Result::INCOMPLETE)));
+        assert_eq!(attempts, ENUMERATION_ATTEMPTS);
+    }
+
+    /// A real error must not be retried and must keep its code.
+    #[test]
+    fn a_real_error_passes_through_at_once() {
+        let mut attempts = 0;
+        let result: Result<Vec<u32>, RenderError> = retry_incomplete(|| {
+            attempts += 1;
+            Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        });
+        assert_eq!(
+            result,
+            Err(RenderError::Vulkan(vk::Result::ERROR_OUT_OF_HOST_MEMORY))
+        );
+        assert_eq!(attempts, 1);
+    }
 }

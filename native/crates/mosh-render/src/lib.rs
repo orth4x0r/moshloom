@@ -56,6 +56,9 @@
 //!   buffer instead of a one-shot submission the CPU waits on (V-perf, Task 2.8's follow-up).
 //! - `submission_count()` (device) counts `vkQueueSubmit` calls process-wide, so a test can prove
 //!   that a per-frame pass did not add one.
+//! - `MAX_UNIFORM_BYTES` is public (4096 bytes) so a layer crate can assert its uniform block fits
+//!   instead of meeting `UniformTooLarge` at `Pipeline::fullscreen`:
+//!   `mosh_render::MAX_UNIFORM_BYTES`.
 //!
 //! ## Adjustment and Mask layers (L-stack, wave 3)
 //!
@@ -104,7 +107,7 @@ mod win;
 
 pub use compositor::{CompositeTarget, Compositor, StackInput};
 pub use device::submission_count;
-pub use device::{Gpu, GpuPreference};
+pub use device::{Gpu, GpuPreference, MAX_UNIFORM_BYTES};
 pub use flash::{FlashLimiter, FLASH_INTERVAL};
 pub use pace::{FramePacer, WaitTimer, DEFAULT_MAX_FPS};
 pub use pipeline::{FrameRecorder, Pipeline};
@@ -136,7 +139,7 @@ pub enum RenderError {
     /// The window handle is not a Win32 handle.
     UnsupportedWindow,
     ZeroSized,
-    /// A uniform block larger than the crate's ring (`MAX_UNIFORM_BYTES`).
+    /// A uniform block larger than the crate's ring (`MAX_UNIFORM_BYTES`, 4096 bytes).
     UniformTooLarge {
         size: u64,
         max: u64,

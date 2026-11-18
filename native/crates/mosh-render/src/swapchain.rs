@@ -15,7 +15,7 @@ use mosh_core::show::BlendMode;
 use raw_window_handle::RawWindowHandle;
 
 use crate::compositor::Compositor;
-use crate::device::{Gpu, FRAMES_IN_FLIGHT};
+use crate::device::{retry_incomplete, Gpu, FRAMES_IN_FLIGHT};
 use crate::target::{cmd_barrier, Barrier, LayerTarget};
 use crate::readback::{AsyncReadback, Readback};
 use crate::timing::GpuTimings;
@@ -520,8 +520,10 @@ impl Stage {
                     .get_physical_device_surface_capabilities(self.physical, self.surface)?
             };
             let formats = unsafe {
-                self.surface_loader
-                    .get_physical_device_surface_formats(self.physical, self.surface)?
+                retry_incomplete(|| {
+                    self.surface_loader
+                        .get_physical_device_surface_formats(self.physical, self.surface)
+                })?
             };
             let format = formats
                 .iter()
@@ -591,8 +593,7 @@ impl Stage {
                 .clipped(true);
             let handle = unsafe { self.swapchain_loader.create_swapchain(&info, None) }?;
             let images = unsafe {
-                self.swapchain_loader
-                    .get_swapchain_images(handle)?
+                retry_incomplete(|| self.swapchain_loader.get_swapchain_images(handle))?
             };
             let mut views = Vec::with_capacity(images.len());
             for image in &images {
