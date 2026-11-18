@@ -14,8 +14,8 @@ use mosh_app::core::{
 };
 use mosh_app::monitor::{MonitorInfo, StagePlacement, monitor_choice as choose_monitor};
 use mosh_core::{
-    AudioBlock, ControlEvent, EventFlags, LaunchQuantize, Layer, ParamRange, Project, SceneRow,
-    SessionGrid, ShowMode, Transport, TransportSource,
+    AudioBlock, ControlEvent, EffectKind, EventFlags, LaunchQuantize, Layer, ParamRange, Project,
+    SceneRow, SessionGrid, ShowMode, TransitionKind, Transport, TransportSource,
 };
 
 /// A scripted audio source: `alive` plus the block it hands out, both changeable mid-test.
@@ -335,6 +335,130 @@ fn default_project_is_a_sixteen_scene_grid() {
     let range: ParamRange = ParamRange::default();
     assert_eq!(range.lo, 0.0);
     assert_eq!(range.hi, 1.0);
+}
+
+// The web app's Auto Arrange opens with a datamosh on every block; the native default show must
+// do the same, or pressing play draws a clean show and the mosh pass never runs.
+#[test]
+fn every_default_clip_opens_with_a_mosh_effect() {
+    let project = default_project();
+    let amounts: Vec<f32> = project
+        .clips
+        .iter()
+        .map(|clip| {
+            let slots: Vec<f32> = clip
+                .effects
+                .iter()
+                .filter(|slot| slot.kind == EffectKind::Mosh)
+                .map(|slot| slot.amount)
+                .collect();
+            assert_eq!(slots.len(), 1, "{} has {:?}", clip.name, clip.effects);
+            let amount = slots[0];
+            assert!(
+                (0.35..=0.95).contains(&amount),
+                "{} mosh {amount} is outside 0.35..=0.95",
+                clip.name
+            );
+            amount
+        })
+        .collect();
+    // Spread over the whole range, not bunched at one tier: the quietest scene is the web's
+    // quiet-section floor and the densest one its loud-section ceiling.
+    let low = amounts.iter().copied().fold(f32::INFINITY, f32::min);
+    let high = amounts.iter().copied().fold(0.0f32, f32::max);
+    assert_eq!(low, 0.35, "amounts: {amounts:?}");
+    assert_eq!(high, 0.95, "amounts: {amounts:?}");
+}
+
+// About four clips in five enter with a Datamosh, as the web app's `R()<.2?0:2` does, with a
+// transition length `mosh-show` can spend (`beats` of 1..=4).
+#[test]
+fn most_default_clips_enter_with_a_datamosh_transition() {
+    let project = default_project();
+    let datamosh = project
+        .clips
+        .iter()
+        .filter(|clip| clip.transition_in.kind == TransitionKind::Datamosh)
+        .count();
+    assert!(
+        datamosh * 10 >= project.clips.len() * 7,
+        "{datamosh} of {} default clips enter with a datamosh",
+        project.clips.len()
+    );
+    for clip in &project.clips {
+        match clip.transition_in.kind {
+            TransitionKind::Datamosh => assert!(
+                (1.0..=4.0).contains(&clip.transition_in.beats),
+                "{} enters over {} beats",
+                clip.name,
+                clip.transition_in.beats
+            ),
+            TransitionKind::Cut => assert_eq!(
+                clip.transition_in.beats, 0.0,
+                "{} is a cut with beats",
+                clip.name
+            ),
+            other => panic!("{} enters with {other:?}", clip.name),
+        }
+    }
+}
+
+// Not just the project file: Autopilot's own launches must put the mosh effect and the Datamosh
+// transition on the layer, which is the `LayerState` the render path consumes.
+#[test]
+fn autopilot_plays_the_default_mosh() {
+    let source = Script::with_block(transport_block(0.0));
+    let handle = source.clone();
+    let mut core = AppCore::new(
+        default_project(),
+        InputMux::new(Some(Box::new(source)), None),
+        Controls::new(Vec::new()),
+    );
+    let start = Instant::now();
+
+    // ppq 0 is the first bar line, so Autopilot starts scene 1 on this frame; the next two bars
+    // keep it. Every frame of it must carry the mosh the scene clip asks for.
+    for (bar, ppq) in [0.0, 4.0, 8.0].into_iter().enumerate() {
+        handle.set_block(transport_block(ppq));
+        let frame = core.step(start + Duration::from_millis(16 * bar as u64));
+        let layer = &frame.plan.layers[0];
+        assert_eq!(
+            layer.clip,
+            Some(1),
+            "bar {bar}: autopilot did not keep the first scene"
+        );
+        let mosh = layer
+            .effects
+            .iter()
+            .find(|slot| slot.kind == EffectKind::Mosh)
+            .unwrap_or_else(|| panic!("bar {bar}: no mosh on {:?}", layer.effects));
+        assert!(
+            (0.35..=0.95).contains(&mosh.amount),
+            "bar {bar}: mosh {}",
+            mosh.amount
+        );
+    }
+
+    // Ask for scene 2 and cross onto the next bar line: the clip change carries its Datamosh
+    // transition into the plan, which is what keeps the carried mosh buffer running.
+    core.queue_control(ControlEvent::LaunchClip { layer: 0, scene: 1 });
+    handle.set_block(transport_block(12.0));
+    let changed = core.step(start + Duration::from_millis(48));
+    assert_eq!(changed.plan.layers[0].clip, Some(3));
+    let transition = changed.plan.layers[0]
+        .transition
+        .unwrap_or_else(|| panic!("scene 2 entered with a cut"));
+    assert_eq!(transition.kind, TransitionKind::Datamosh);
+    assert_eq!(transition.from, Some(1));
+    assert!(transition.progress < 1.0, "progress {}", transition.progress);
+    assert!(
+        changed.plan.layers[0]
+            .effects
+            .iter()
+            .any(|slot| slot.kind == EffectKind::Mosh),
+        "the clip change dropped the mosh effect: {:?}",
+        changed.plan.layers[0].effects
+    );
 }
 
 // The control window has no scene yet (Task 2.7 builds it), so its title is the stats line: it
