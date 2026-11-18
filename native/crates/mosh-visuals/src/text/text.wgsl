@@ -12,16 +12,38 @@
 //
 // Three contemporary looks, one face each:
 //   chrome  Unbounded      liquid chrome: environment reflection, iridescent rim, soft specular
-//   sigil   Grenze Gotisch blackletter in polished silver, barbed accents, a blood-red glow
+//   sigil   Grenze Gotisch blackletter in polished silver, long whip thorns and mirrored sigil
+//                          marks grown at bake time, a thin blood-red glow
 //   clean   Space Grotesk  crisp minimal, soft shadow, thin cool rim
 // Nothing here flashes the whole frame: every bright thing is inside the glyphs.
 //
-// Uniform block (96 bytes, matches `text::UNIFORM_BYTES`):
+// The sigil look's linework is geometry, not a pattern: `text/thorn.rs` grows it at bake time —
+// thorns on the block's outer contour, a bramble mark beside each end of the word — and the shader
+// draws the strokes in the same silver as the letters. Nothing is ever drawn across a glyph's face,
+// and no thorn crosses a space into the next word.
+//
+// Uniform block (416 bytes, matches `text::UNIFORM_BYTES`):
 //   0  dst: vec2f          8  sheet: vec2f
 //   16 inset_min: vec2f    24 inset_max: vec2f
 //   32 p0: vec4f (p0..p3)  48 p1: vec4f (p4..p7)
 //   64 audio: vec4f (low, mid, high, intensity)
-//   80 time: f32  84 beat: f32  88 loud: f32  92 pad: f32
+//   80 time: f32  84 beat: f32  88 loud: f32  92 thorn_count: f32
+//   96 marks: vec4f (symbol_count, 0, 0, 0)
+//   112 thorns: array<Stroke, 20>, 32 bytes each: a, b, c, half-width, mirror
+//   752 symbols: array<Stroke, 8>
+//      (the counts and the strides are `thorn::MAX_THORNS`/`MAX_SYMBOLS`; the reflection test
+//      pins every offset together with `text.rs`)
+
+// One stroke of the sigil look's linework: two tapered capsules `a -> b -> c`, wide at `a` and a
+// needle point at `c`. `mirror` is 1 for a symbol stroke, which is drawn again mirrored about the
+// block's vertical centre, so the pair of marks is symmetric.
+struct Stroke {
+    a: vec2<f32>,
+    b: vec2<f32>,
+    c: vec2<f32>,
+    width: f32,
+    mirror: f32,
+};
 
 struct TextUniforms {
     dst: vec2<f32>,
@@ -34,7 +56,10 @@ struct TextUniforms {
     time: f32,
     beat: f32,
     loud: f32,
-    pad: f32,
+    thorn_count: f32,
+    marks: vec4<f32>,
+    thorns: array<Stroke, 20>,
+    symbols: array<Stroke, 8>,
 };
 
 @group(0) @binding(0) var<uniform> U: TextUniforms;
@@ -45,9 +70,21 @@ struct TextUniforms {
 // pixels on each side of an edge.
 const SDF_RANGE: f32 = 12.0;
 
-// Keep in sync with 	ext/layout.rs::BEVEL_PX: this many baked pixels of the field is the
+// Keep in sync with `text/layout.rs::BEVEL_PX`: this many baked pixels of the field is the
 // bevel's height, which is what turns the flat distance into a rounded stroke.
 const BEVEL_PX: f32 = 9.0;
+
+// How far the sigil look's linework reaches past the block's box, in block heights: `text/thorn.rs`
+// grows a thorn at most 0.60 of a line's height plus its base half-width, and puts the flanking
+// marks within 0.40 of a line of the box; a line is never taller than the block.
+const LINEWORK_REACH: f32 = 0.72;
+
+// The stroke's taper, as fractions of its base half-width: the second capsule of a stroke starts at
+// `BEND_WIDTH` of the first's radius and ends at `TIP_WIDTH` of it, which is a needle point.
+// `text/thorn.rs` rasters the same two capsules for its tests, and
+// `the_thorn_geometry_constants_match_the_shader` compares these literals with that module's.
+const BEND_WIDTH: f32 = 0.7;
+const TIP_WIDTH: f32 = 0.0;
 
 fn hash11(n: f32) -> f32 {
     return fract(sin(n * 127.1) * 43758.5453);
@@ -59,6 +96,35 @@ fn hash21(p: vec2<f32>) -> f32 {
 
 fn texel(uv: vec2<f32>) -> vec4<f32> {
     return textureSampleLevel(sheetT, lin, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
+}
+
+// One tapered segment of a stroke: the signed distance to its edge (negative inside), the unit
+// vector across it — which is the stroke's own surface direction as it turns — and the radius
+// there. Distances are in block heights, the space the stroke arrays carry.
+fn stroke_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, ra: f32, rb: f32) -> vec4<f32> {
+    let ab = b - a;
+    let t = clamp(dot(p - a, ab) / max(dot(ab, ab), 0.000001), 0.0, 1.0);
+    let delta = p - (a + ab * t);
+    let run = length(delta);
+    let radius = mix(ra, rb, t);
+    let across = select(vec2<f32>(0.0, 1.0), delta / max(run, 0.000001), run > 0.000001);
+    return vec4<f32>(run - radius, across, radius);
+}
+
+// A whole stroke: the nearer of its two tapered capsules. Same return as `stroke_segment`.
+fn stroke_sdf(p: vec2<f32>, stroke: Stroke) -> vec4<f32> {
+    let first = stroke_segment(p, stroke.a, stroke.b, stroke.width, stroke.width * BEND_WIDTH);
+    let second = stroke_segment(
+        p, stroke.b, stroke.c, stroke.width * BEND_WIDTH, stroke.width * TIP_WIDTH,
+    );
+    return select(first, second, second.x < first.x);
+}
+
+// The cheapest way to know a stroke cannot reach `p`: its own bounding circle. Most strokes are
+// rejected by this before the capsule maths runs.
+fn out_of_reach(p: vec2<f32>, stroke: Stroke) -> bool {
+    let radius = length(stroke.c - stroke.a) + stroke.width * 2.0 + 0.01;
+    return distance(p, stroke.a) > radius;
 }
 
 // Filmic roll-off: a specular highlight gets bright without ever clipping to flat white.
@@ -176,11 +242,23 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     // `spacing` widens the block: a screen position maps closer to the block's centre.
     block_uv.x = 0.5 + (block_uv.x - 0.5) / spacing;
 
+    // The sigil look is the only one whose ink leaves the block's box: its thorns reach past the
+    // silhouette and its marks flank the word, so that look's pass covers a wider rectangle and
+    // every other look covers exactly the sheet's margin.
+    let thorny = look >= 1.0 && look < 2.0;
+
     // Every pixel outside the sheet (block plus its margin, in block units) has nothing to sample:
     // the pass costs a compare there.
     let margin_u = U.inset_min.x / max(span.x, 0.000001);
     let margin_v = U.inset_min.y / max(span.y, 0.000001);
-    if (abs(block_uv.x - 0.5) > 0.5 + margin_u || abs(block_uv.y - 0.5) > 0.5 + margin_v) {
+    var reach_u = 0.0;
+    var reach_v = 0.0;
+    if (thorny) {
+        reach_v = LINEWORK_REACH;
+        reach_u = LINEWORK_REACH / max(block_aspect, 0.0001);
+    }
+    if (abs(block_uv.x - 0.5) > 0.5 + margin_u + reach_u
+        || abs(block_uv.y - 0.5) > 0.5 + margin_v + reach_v) {
         return vec4<f32>(0.0);
     }
 
@@ -193,11 +271,72 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let slice_shift = (hash21(vec2<f32>(slice_row * 3.7, slice_clock)) - 0.5) * 0.05 * glitch;
     sheet_uv = sheet_uv + vec2<f32>(slice_shift * slice_on * span.x, 0.0);
 
+    // The sigil look's linework (sigil only): thorns grown on the block's outer contour and the
+    // marks that flank the word, both baked geometry and never inside the ink — a spike that would
+    // touch a glyph, lean into a counter or spear the next word is dropped at bake time, not here.
+    // `local` is the block's own space (one unit per block height, x by the aspect), which is the
+    // space the stroke arrays are written in; it slides with the same glitch the sheet takes.
+    var line_distance = 1.0e9;
+    var line_across = vec2<f32>(0.0, 1.0);
+    var line_radius = 1.0;
+    let local = vec2<f32>(
+        block_uv.x * block_aspect + slice_shift * slice_on * block_aspect,
+        block_uv.y,
+    );
+    if (thorny) {
+        var index = 0u;
+        loop {
+            if (index >= u32(U.thorn_count)) {
+                break;
+            }
+            let stroke = U.thorns[index];
+            index = index + 1u;
+            if (out_of_reach(local, stroke)) {
+                continue;
+            }
+            let hit = stroke_sdf(local, stroke);
+            if (hit.x < line_distance) {
+                line_distance = hit.x;
+                line_across = hit.yz;
+                line_radius = hit.w;
+            }
+        }
+        // A mark is authored once, on the right of the block, and drawn again mirrored for the
+        // left: the mirror of a block-space x is the block's width in its own units minus x. Both
+        // copies sit outside the block's box, so there is nothing to evaluate over the letters.
+        if (local.x < 0.0 || local.x > block_aspect) {
+            let probe = select(
+                vec2<f32>(block_aspect - local.x, local.y),
+                local,
+                local.x > block_aspect,
+            );
+            var mark = 0u;
+            loop {
+                if (mark >= u32(U.marks.x)) {
+                    break;
+                }
+                let stroke = U.symbols[mark];
+                mark = mark + 1u;
+                if (out_of_reach(probe, stroke)) {
+                    continue;
+                }
+                let hit = stroke_sdf(probe, stroke);
+                if (hit.x < line_distance) {
+                    line_distance = hit.x;
+                    line_across = hit.yz;
+                    line_radius = hit.w;
+                }
+            }
+        }
+    }
+
     let sample = texel(sheet_uv);
     // Past the field's range every term below is zero: the glow fades out well before it, and the
-    // body, ring and barbs are all measured from the distance. Most of the block is that empty
-    // space between letters, so this one tap is what the pass costs there.
-    if (sample.a <= 0.0) {
+    // body and ring are both measured from the distance. Most of the block is that empty space
+    // between letters, so this one tap is what the pass costs there. The linework's ink is the one
+    // thing out there that still draws, so it is measured in screen pixels first.
+    let line_sdf = line_distance * block_h;
+    if (sample.a <= 0.0 && line_sdf >= 0.0) {
         return vec4<f32>(0.0);
     }
     let distance_baked = (0.5 - sample.a) * (2.0 * SDF_RANGE);
@@ -205,8 +344,8 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     // space so they stay the same weight at every `size`.
     let scale = block_h / max(span.y * U.sheet.y, 1.0);
     let d0 = distance_baked * scale;
-    // The distance is only meaningful out to the sheet's range; every effect measured from it
-    // (barbs, glow) must finish inside this, or it would paint the sheet's margin.
+    // The distance is only meaningful out to the sheet's range; the glow must finish inside this,
+    // or it would paint the sheet's margin.
     let field_reach = SDF_RANGE * scale;
 
     // Baked surface: the outward direction across the stroke comes from the sheet, the height
@@ -227,37 +366,22 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         bold = 0.012 * block_h;
     }
 
-    // Barbs (sigil only): sharp accents that grow out of the strokes. They are geometry in the
-    // field, not a wobble: a narrow periodic tooth shifted outward along the distance, so the
-    // silhouette gets points while the stroke itself stays crisp. Every part of the pattern is
-    // measured from the *body's* edge (`d0 - bold`), so it can never hatch the letter itself.
-    var shape = d0;
-    var barb_tip = 0.0;
-    if (look >= 1.0 && look < 2.0) {
-        // A thorn: a tapered spike growing out of the silhouette. The lattice runs along the
-        // edge, one cell per thorn, with two incommensurate hashes so the spacing never lines up
-        // like hatching; each thorn bends its own way as it rises, is thick at the stroke and
-        // comes to a point, and most cells grow nothing at all.
-        let barb_len = min((0.075 + 0.020 * glitch) * block_h, 0.45 * field_reach);
-        let along = dot(offset * block_h, vec2<f32>(0.94, 0.34)) / max(barb_len, 0.001);
-        let cell = floor(along);
-        let bend_hash = hash11(cell * 7.13 + 3.7);
-        let grow_hash = hash11(cell * 3.71 + 9.1);
-        let phase = fract(along) - 0.5;
-        let beyond = d0 - bold;
-        let rise = clamp(beyond / max(barb_len, 0.001), 0.0, 1.0);
-        // The spike leans as it rises, so it is a curve, not a comb tooth.
-        let curved = phase + (bend_hash - 0.5) * 1.2 * rise;
-        // Thick where it leaves the stroke, a point at the tip.
-        let width = mix(0.30, 0.01, rise);
-        let pointed = 1.0 - smoothstep(0.0, width, abs(curved));
-        // Few cells grow a thorn, at their own length: sparse and asymmetric, not a fringe.
-        let sparse = smoothstep(0.74, 0.88, grow_hash);
-        let length = 0.6 + 0.4 * bend_hash;
-        let present = smoothstep(-0.02, 0.08, beyond) * (1.0 - smoothstep(0.9, 1.0, rise));
-        let spike = pointed * sparse * present * (1.0 - rise * rise);
-        shape = d0 - spike * length * barb_len;
-        barb_tip = spike * (0.35 + 0.65 * rise);
+    // The linework is part of the silhouette — the glow wraps it like the letters — so its distance
+    // joins the glyph's. The stroke dilation is the letters' (`bold` gives a hairline face its
+    // display weight); a stroke carries its own taper, so the dilation is added back to its
+    // distance and the spike keeps the needle point the bake drew instead of swelling into a rod.
+    // Nothing is ever added *inside* the ink: `min` only moves the edge outward, and the geometry
+    // is outside the ink to begin with.
+    let shape = select(d0, min(d0, line_sdf + bold), thorny);
+    // Across a stroke the surface turns like a thin metal rod, not like a letter's bevel: the
+    // stroke's own width is its depth. Only the nearer edge owns the surface, and only outside the
+    // body's edge (`d0 - bold`): inside a letter the stroke's root would otherwise shade a dark
+    // notch in the face, which is the same defect as a barb drawn across it.
+    var surface = facing;
+    var into = depth;
+    if (thorny && line_sdf < d0 - bold && d0 - bold > 0.0) {
+        surface = line_across;
+        into = clamp(-line_sdf / max(line_radius * block_h * 0.75, 1.0), 0.0, 1.0);
     }
 
     // The antialiasing width in distance units: the field is in screen pixels and its gradient
@@ -266,13 +390,16 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let aa = 0.9;
     let body = smoothstep(aa, -aa, shape - bold);
 
-    // The rim just outside the body: one number for its weight, one for where it starts.
+    // The rim just outside the body: one number for its weight, one for where it starts. It is
+    // the *letters'* rim, measured on the glyph's own distance, because a thorn is thinner than
+    // the rim: giving a spike this outline would turn a silver thorn into a dark scratch.
     var ring_width = 0.002 * block_h + outline * 0.030 * block_h;
     if (look >= 1.0 && look < 2.0) {
         ring_width = 0.002 * block_h + outline * 0.022 * block_h;
     }
-    let ring_outer = smoothstep(aa, -aa, shape - bold - ring_width);
-    let ring = clamp(ring_outer - body, 0.0, 1.0);
+    let glyph_body = smoothstep(aa, -aa, d0 - bold);
+    let ring_outer = smoothstep(aa, -aa, d0 - bold - ring_width);
+    let ring = clamp(ring_outer - glyph_body, 0.0, 1.0);
 
     // Glow, in screen pixels. Its width is a fraction of the block, and it is faded out before the
     // field's range ends so the sheet's margin can never show as a soft rectangle.
@@ -284,9 +411,11 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         glow_colour = vec3<f32>(0.36, 0.72, 1.0);
         glow_strength = 0.20 + 0.20 * high + 0.14 * intensity;
     } else if (look < 2.0) {
-        glow_width = 0.032 * block_h;
-        glow_colour = vec3<f32>(0.92, 0.09, 0.14);
-        glow_strength = 0.36 + 0.26 * low + 0.16 * intensity;
+        // A thin, dark red halo: it should read as a shadow of blood behind silver, not a neon
+        // tube. Thorns carry it too, at their base where the field still reaches.
+        glow_width = 0.020 * block_h;
+        glow_colour = vec3<f32>(0.72, 0.06, 0.10);
+        glow_strength = 0.30 + 0.18 * low + 0.10 * intensity;
     }
     let reach_fade = 1.0 - smoothstep(0.30 * field_reach, 0.65 * field_reach, shape - bold);
     // A rational falloff instead of `exp`: same soft halo, no transcendental per pixel.
@@ -329,9 +458,10 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         ring_colour = mix(vec3<f32>(0.03, 0.04, 0.09), film, 0.30);
         ring_strength = 0.50;
     } else if (look < 2.0) {
-        // Sigil: polished silver, brushed along the stroke, an iridescent edge and a red glow.
-        let shoulder = sqrt(max(1.0 - depth * depth, 0.0));
-        let normal = normalize(vec3<f32>(facing * shoulder, 0.16 + 0.84 * depth));
+        // Sigil: polished silver, brushed along the stroke, an iridescent edge and a thin red
+        // glow. Thorns shade with `surface`/`into`, which is their own rod-like cross-section.
+        let shoulder = sqrt(max(1.0 - into * into, 0.0));
+        let normal = normalize(vec3<f32>(surface * shoulder, 0.16 + 0.84 * into));
         let halfway = normalize(light + view);
         let specular = soft_power(clamp(dot(normal, halfway), 0.0, 1.0), 6);
         let fresnel = soft_power(1.0 - clamp(normal.z, 0.0, 1.0), 3);
@@ -343,14 +473,13 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         let silver = mix(
             vec3<f32>(0.30, 0.31, 0.35),
             vec3<f32>(0.99, 0.995, 1.0),
-            smoothstep(0.0, 0.34, depth),
+            smoothstep(0.0, 0.34, into),
         );
         let brush = 0.5 + 0.5 * sin((offset.y * 7.0 + offset.x * 1.5));
         // A darker rim and a bright core: polished metal needs the falloff, not a flat plate.
-        var c = silver * (0.86 + 0.18 * brush) * mix(0.55, 1.05, smoothstep(0.0, 0.40, depth));
+        var c = silver * (0.86 + 0.18 * brush) * mix(0.55, 1.05, smoothstep(0.0, 0.40, into));
         c = c + film * fresnel * 0.45;
         c = c + vec3<f32>(1.0) * specular * 1.10;
-        c = c + vec3<f32>(0.70, 0.05, 0.10) * barb_tip * 0.9;
         body_colour = tonemap(c * 1.05);
         ring_colour = mix(vec3<f32>(0.045, 0.028, 0.032), film, 0.14);
         ring_strength = 0.30;
@@ -394,10 +523,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     );
 
     // The body, with the beat lifting its fill rather than clipping it.
-    var fill = body_colour * (1.0 + beat_env * 0.14);
-    if (look >= 1.0 && look < 2.0) {
-        fill = fill + vec3<f32>(1.0, 0.92, 0.94) * barb_tip * 0.18;
-    }
+    let fill = body_colour * (1.0 + beat_env * 0.14);
     acc = over(acc, vec4<f32>(fill * body, body));
 
     // Chromatic split: two more taps of the field, pushed apart by glitch and the high band. The
