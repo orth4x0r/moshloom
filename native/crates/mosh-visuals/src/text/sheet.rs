@@ -31,9 +31,11 @@
 //! # Size
 //!
 //! [`capacity`] is the largest block the layout can produce at the em size the shader bakes
-//! (wrapped to [`super::layout::WRAP_CHARS`] characters and capped at
+//! (wrapped to [`super::layout::WRAP_CHARS`] advances and capped at
 //! [`super::layout::MAX_LINES`]), so the layer can allocate one texture per look and never grow
-//! it: growing means dropping the old image, and dropping it waits for the device.
+//! it: growing means dropping the old image, and dropping it waits for the device. The wrap budget
+//! and this capacity are both proportional to the em, which is what makes the sheet always hold a
+//! wrapped block: no text is ever shrunk (or its words broken) to fit.
 //!
 //! # Thorns
 //!
