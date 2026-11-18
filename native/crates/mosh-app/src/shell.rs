@@ -153,6 +153,19 @@ impl Scene {
         for (index, layer) in layers.iter().enumerate() {
             let (w, h) = internal_size(self.out, layer.internal_scale);
             self.slots.push(LayerSlot::new(gpu, index, w, h));
+            // The new targets are cleared to black, so a mosh layer's feedback buffer - the
+            // readable image of the layer's own `post[0]` - no longer holds its last picture.
+            // `Visuals` (and so `MoshPass`) survives a resize that keeps the internal size, and
+            // its `valid` flag would still say the buffer was there. Forget it layer by layer, so
+            // a rebuild cannot leave the mosh carrying black.
+            //
+            // With today's `LayerSlot` this is belt and braces: a fresh slot has `last_clip: None`,
+            // so the next `draw_layer` sees a clip change and takes an I-frame anyway
+            // (`shell::tests::rebuilding_the_slots_forgets_the_mosh_buffer` passes either way).
+            // It is here so the invariant does not depend on that accident.
+            if let Some(visuals) = self.visuals.as_mut() {
+                visuals.mosh.invalidate(index);
+            }
         }
     }
 
@@ -1825,7 +1838,11 @@ pub fn parse_args(args: &[String]) -> (Option<String>, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_args;
+    use super::{parse_args, Scene};
+    use mosh_core::{
+        AnalysisFrame, BlendMode, ClipParams, EffectKind, EffectSlot, Layer, LayerState,
+    };
+    use mosh_render::FrameRecorder;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -1848,4 +1865,84 @@ mod tests {
         assert_eq!(parse_args(&args(&["--fps"])), (None, 60));
         assert_eq!(parse_args(&args(&["--fps", "fast"])), (None, 60));
     }
+
+    /// A rebuilt layer slot holds black targets, so the mosh buffer that lived in the old ones is
+    /// gone. Without forgetting it, the next P-frame carries black over the whole layer - the
+    /// resize bug: dragging the stage window made a mosh layer go black and stay black.
+    ///
+    /// Offscreen: `Scene::new` builds a device and the visuals with no window, and the check is
+    /// the layer's own picture, read back after a frame.
+    #[test]
+    fn rebuilding_the_slots_forgets_the_mosh_buffer() {
+        fn mean_abs_difference(a: &[u8], b: &[u8]) -> f32 {
+            let sum: u64 = a
+                .iter()
+                .zip(b.iter())
+                .map(|(x, y)| u64::from(x.abs_diff(*y)))
+                .sum();
+            if a.is_empty() {
+                0.0
+            } else {
+                sum as f32 / a.len() as f32
+            }
+        }
+
+        let layers = [Layer::default()];
+        let mut scene = Scene::new((256, 144), &layers).expect("scene");
+        let state = LayerState {
+            layer: 0,
+            clip: Some(1),
+            visualizer: Some("tunnel".to_string()),
+            // p[0] is the scene's clock rate (engine.c's `speed`): at 0 the tunnel stands still,
+            // and a still picture has a zero residual and zero vectors.
+            params: ClipParams {
+                p: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ..ClipParams::default()
+            },
+            effects: vec![EffectSlot {
+                kind: EffectKind::Mosh,
+                amount: 0.8,
+                param: 0.0,
+            }],
+            transition: None,
+            blend: BlendMode::Normal,
+            opacity: 1.0,
+            seed: 0,
+        };
+        let frame = AnalysisFrame::default();
+        let draw = |scene: &mut Scene, t: f32| -> f32 {
+            // Field-by-field, so the device and the layer's slot are not borrowed through `self`.
+            let gpu = scene.gpu.as_ref().expect("device");
+            let visuals = scene.visuals.as_mut().expect("visuals");
+            let mut recorder = FrameRecorder::new(gpu);
+            visuals
+                .draw_layer(&mut recorder, &mut scene.slots[0], &state, &frame, t)
+                .expect("draw layer");
+            gpu.wait_frame(recorder.submit());
+            let slot = &scene.slots[0];
+            mean_abs_difference(&gpu.read_back(slot.output()), &gpu.read_back(&slot.scene))
+        };
+
+        // The scene animates with `t`, so a carried buffer differs from this frame's scene.
+        let mut carried = 0.0;
+        for step in 0..6 {
+            carried = draw(&mut scene, step as f32 * 0.2);
+        }
+        scene.rebuild_slots(&layers);
+        let rebuilt = draw(&mut scene, 1.2);
+        println!(
+            "mosh 0.8, tunnel: carried {carried:.2}/255 from the scene, first frame after a slot \
+             rebuild {rebuilt:.2}/255"
+        );
+        assert!(
+            carried > 1.0,
+            "the mosh did not carry anything ({carried:.2}/255)"
+        );
+        assert!(
+            rebuilt < 0.01,
+            "after rebuilding the slots the first mosh frame was not an I-frame \
+             ({rebuilt:.2}/255 from the scene): the buffer that survived held black"
+        );
+    }
 }
+

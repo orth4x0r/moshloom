@@ -25,6 +25,9 @@ struct MU {
 const BLOCK: f32 = 8.0;
 const SEARCH: i32 = 6;
 const LUMA: vec3<f32> = vec3<f32>(0.3, 0.59, 0.11);
+/// `gpu.js:307` bounds a candidate block against 184, not the grid's 180: the vector field has
+/// 23 rows (180 / 8 = 22.5) and the last, half-covered row searches as a whole block.
+const BLOCK_LIMIT_Y: f32 = 184.0;
 
 fn lum_cur(p: vec2<f32>) -> f32 {
     return clamp(dot(textureSampleLevel(curT, curS, p / m.grid, 0.0).rgb, LUMA), 0.0, 1.0);
@@ -53,7 +56,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }
                 let offset = vec2<f32>(f32(dx), f32(dy));
                 let block = origin + offset;
-                if (block.x < 0.0 || block.y < 0.0 || block.x + BLOCK > m.grid.x || block.y + BLOCK > m.grid.y) {
+                if (block.x < 0.0 || block.y < 0.0 || block.x + BLOCK > m.grid.x || block.y + BLOCK > BLOCK_LIMIT_Y) {
                     continue;
                 }
                 var cost = 3.0 * (abs(offset.x) + abs(offset.y));

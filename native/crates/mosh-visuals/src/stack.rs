@@ -279,6 +279,14 @@ impl Stack {
             .filter(|slot| slot.kind == EffectKind::Mosh)
             .map(|slot| slot.amount)
             .fold(0.0f32, f32::max);
+        // No mosh slot this frame is an I-frame, exactly as in `Visuals::draw_layer`: the web app
+        // does `if (m <= 0.001) iframe = 1`, so the buffer is forgotten and the next mosh frame
+        // starts from a fresh picture instead of carrying a stale one.
+        if amount <= 0.0
+            && let Some(mosh) = self.mosh.as_mut()
+        {
+            mosh.invalidate(index);
+        }
         let has_effects = state
             .effects
             .iter()

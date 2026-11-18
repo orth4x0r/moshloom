@@ -131,11 +131,14 @@ fn cut_is_instant() {
     assert_no_validation(&gpu);
 }
 
-/// Datamosh and Melt both hold the old picture at progress 0 (Datamosh displaced, Melt sagging)
-/// and are the new picture by the end; a finished transition draws nothing, and neither does one
-/// whose `begin` never ran.
+/// Melt holds the old picture at progress 0 (sagging) and is the new picture by the end; a
+/// finished transition draws nothing, and neither does one whose `begin` never ran.
+///
+/// Datamosh is deliberately *not* here: it is not a blend, `TransitionPass::apply` draws nothing
+/// for it (the carried feedback buffer is the datamosh, and `tests/mosh.rs` covers it through
+/// `Visuals::draw_layer`).
 #[test]
-fn datamosh_and_melt_blend_and_finish() {
+fn melt_blends_and_finishes_and_datamosh_leaves_the_layer_alone() {
     let gpu = gpu();
     let mut transitions = TransitionPass::new(&gpu).expect("transitions");
     let solid = solid_pipeline(&gpu);
@@ -158,7 +161,8 @@ fn datamosh_and_melt_blend_and_finish() {
 
     let frame = AnalysisFrame::default();
     let mut flash = FlashLimiter::new();
-    for kind in [TransitionKind::Datamosh, TransitionKind::Melt] {
+    {
+        let kind = TransitionKind::Melt;
         let mut draw = |progress: f32| -> (bool, Vec<u8>) {
             let mut recorder = FrameRecorder::new(&gpu);
             let applied = transitions
@@ -220,27 +224,34 @@ fn datamosh_and_melt_blend_and_finish() {
         );
     }
 
-    // Datamosh displaces the old picture; Melt at progress 0 does not.
-    let mut recorder = FrameRecorder::new(&gpu);
-    transitions
-        .apply(
-            &mut recorder,
+    // Datamosh draws no pass at all, at any progress: the mosh feedback buffer carried across the
+    // cut is the transition (`Visuals::draw_layer` + `MoshPass::carry_over`).
+    let before = gpu.read_back(&dst);
+    for progress in [0.0f32, 0.5, 0.99] {
+        let mut recorder = FrameRecorder::new(&gpu);
+        let applied = transitions
+            .apply(
+                &mut recorder,
+                0,
+                &src,
+                &dst,
+                &transition(TransitionKind::Datamosh, progress),
+                &frame,
+                &mut flash,
+            )
+            .expect("datamosh");
+        gpu.wait_frame(recorder.submit());
+        assert!(
+            !applied,
+            "datamosh at progress {progress} drew a pass: the mosh pass owns it"
+        );
+        assert_eq!(
+            differing_pixels(&before, &gpu.read_back(&dst), 0),
             0,
-            &src,
-            &dst,
-            &transition(TransitionKind::Datamosh, 0.0),
-            &frame,
-            &mut flash,
-        )
-        .expect("datamosh");
-    gpu.wait_frame(recorder.submit());
-    let displaced = differing_pixels(&gpu.read_back(&dst), &gpu.read_back(&from), 2);
-    assert!(
-        displaced * 100 >= (W * H) as usize,
-        "datamosh displaced only {displaced} of {} pixels of the old picture",
-        W * H
-    );
-
+            "datamosh at progress {progress} wrote to the destination"
+        );
+    }
+    println!("datamosh: no blend pass at 0.0, 0.5 or 0.99 (the mosh carry-over is the effect)");
     // No saved picture (a layer whose clip never changed): there is nothing to blend from.
     let mut recorder = FrameRecorder::new(&gpu);
     let applied = transitions
@@ -256,7 +267,6 @@ fn datamosh_and_melt_blend_and_finish() {
         .expect("a transition with no from picture");
     gpu.wait_frame(recorder.submit());
     assert!(!applied, "a transition without begin must not draw");
-    println!("datamosh displacement: {displaced} of {} pixels", W * H);
     assert_no_validation(&gpu);
 }
 

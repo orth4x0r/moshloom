@@ -1,13 +1,28 @@
-// The mosh feedback pass: carry the previous mosh buffer along the motion field and mix it with
-// the new frame. Owner: V-mosh (Task 2.2). Ported from the P-frame branch of `WG_FB` in gpu.js,
-// with two documented differences:
+// The mosh P-frame: carry the previous mosh buffer along the block-motion field, add the motion
+// residual of the new frame, and leak the new frame in slowly. Owner: V-mosh (Task 2.2). This is
+// the P-frame branch of `WG_FB` in gpu.js, ported as written:
 //
-// * `amount` is the P-frame strength - the mix weight of the displaced buffer, so the new frame
-//   gets `1 - amount` - instead of the web's `leak = (1 - amount)^5`, which is the same knob with
-//   a much longer time constant (Task 2.2's brief redefines amount this way).
-// * the buffer is warped by the estimated motion as-is, without the web's
-//   `gain = 1 + 2.2 * amount` overshoot: with both applied the picture is carried *ahead* of the
-//   motion, and the overshoot would be a second copy of the same knob.
+//   bc = clamp(floor(uv * (40, 22.5)), 0, (39, 22))          one vector per 8x8 analysis block
+//   if (coarse) bc &= -2                                      amount > 0.85: every other block
+//   d  = round(motion * gain * mvScale * res / grid)          whole output pixels
+//   c  = buf(pixel - d + flow)                                nearest, mirror-repeat
+//   if (!skipres) { c = c + s - prv; c = mix(c, s, leak) }
+//
+// `motion` is the forward displacement in analysis-grid pixels (`mosh_motion`), `prv` is last
+// frame's source picture, `leak = (1 - amount)^5` floored at 0.004 and `gain = 1 + 2.2 * amount`.
+// The residual and the leak are what make this a datamosh instead of a crossfade; the block
+// lookup and the whole-pixel rounding are what make it blocky instead of a smooth warp.
+//
+// `s` and `prv` are read at this pixel's own centre, and the buffer through the web's sampler:
+// `G.nm` is nearest, mirror-repeat (`gpu.js:639`), and every displacement here is a whole number
+// of pixels, so the pass reads exactly one texel of each input and a smear that runs off the edge
+// mirrors back in rather than clamping. `textureLoad` at the mirrored texel index is that sample
+// exactly, which is why this shader declares its samplers and only uses `velS`.
+//
+// `skipres` is the web app's `P.skipres`: on the frame a clip change enters on a Datamosh
+// transition, the buffer is carried by the new clip's motion but nothing of the new clip is
+// mixed in, which is the classic datamosh cut. The residual is skipped whole - `leak` too,
+// exactly as in `WG_FB`.
 //
 // I-frames do not come through this pass; `mosh_copy` refreshes the buffer instead.
 //
@@ -16,10 +31,13 @@
 
 struct FU {
     res: vec2<f32>,
-    amount: f32,
+    leak: f32,
+    mv_scale: f32,
+    gain: f32,
+    skipres: f32,
+    coarse: f32,
     pad0: f32,
     grid: vec2<f32>,
-    pad1: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> f: FU;
@@ -27,27 +45,65 @@ struct FU {
 @group(0) @binding(2) var srcS: sampler;
 @group(0) @binding(3) var bufT: texture_2d<f32>;
 @group(0) @binding(4) var bufS: sampler;
-@group(0) @binding(5) var mvT: texture_2d<f32>;
-@group(0) @binding(6) var mvS: sampler;
-@group(0) @binding(7) var velT: texture_2d<f32>;
-@group(0) @binding(8) var velS: sampler;
+@group(0) @binding(5) var prvT: texture_2d<f32>;
+@group(0) @binding(6) var prvS: sampler;
+@group(0) @binding(7) var mvT: texture_2d<f32>;
+@group(0) @binding(8) var mvS: sampler;
+@group(0) @binding(9) var velT: texture_2d<f32>;
+@group(0) @binding(10) var velS: sampler;
 
-// The web looks its vector texture up per block (`textureLoad(mvT, bc, 0)`, one 8x8 grid-pixel
-// block per vector). We sample the same 40x23 texture at the fragment's own uv instead: the
-// linear sampler interpolates between block centres, so the displacement field does not step by a
-// whole block at a block edge, which would leave a trail made of detached 24-pixel ghosts at
-// 960x540. The field, its units and its sign are the web's.
+/// The web app's vector grid: 40 blocks across, 180 / 8 = 22.5 down, clamped to 39 x 22 - the
+/// last row of the 40x23 field is only half covered, and the web clamps to the covered part.
+const BLOCKS: vec2<f32> = vec2<f32>(40.0, 22.5);
+
+/// `G.nm`'s mirror-repeat wrap of one texel index (`gpu.js:639`): `0, 1, ... n-1, n-1, ... 0`.
+fn mirror(index: i32, n: i32) -> i32 {
+    let period = 2 * n;
+    let wrapped = ((index % period) + period) % period;
+    if (wrapped < n) {
+        return wrapped;
+    }
+    return period - 1 - wrapped;
+}
 
 @fragment
 fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let uv = pos.xy / f.res;
-    let motion = textureSampleLevel(mvT, mvS, uv, 0.0).xy;
-    let flow = textureSampleLevel(velT, velS, uv, 0.0).xy;
-    // Where this pixel's content was last frame: the motion is in analysis-grid pixels per frame,
-    // the fluid's velocity in internal pixels per frame, so each is divided by its own scale.
-    let shift = motion / f.grid + flow / f.res;
-    let fresh = textureSampleLevel(srcT, srcS, uv, 0.0).rgb;
-    let carried = textureSampleLevel(bufT, bufS, uv - shift, 0.0).rgb;
-    let mixed = mix(fresh, carried, clamp(f.amount, 0.0, 1.0));
-    return vec4<f32>(clamp(mixed, vec3<f32>(-0.15), vec3<f32>(1.15)), 1.0);
+    let pixel = vec2<i32>(i32(pos.x), i32(pos.y));
+    let res = vec2<i32>(i32(f.res.x), i32(f.res.y));
+    // `s` and `prv` are read at this pixel's centre, which is the texel itself through any filter.
+    let fresh = textureLoad(srcT, pixel, 0).rgb;
+
+    // One vector per block of the analysis grid, read straight out of the 40x23 field: no
+    // filtering, so the displacement steps by a whole block at a block edge (`textureLoad(mvT,
+    // bc, 0)` in `WG_FB`).
+    var bc = vec2<i32>(floor((pos.xy / f.res) * BLOCKS));
+    bc = clamp(bc, vec2<i32>(0, 0), vec2<i32>(39, 22));
+    if (f.coarse > 0.5) {
+        bc = bc & vec2<i32>(-2);
+    }
+    let motion = textureLoad(mvT, bc, 0).xy;
+    // The fluid visualizer's field is a displacement, in internal pixels per frame: the web adds
+    // its velocity to the sample offset (`d += vel * ...; sample(buf, uv + d)` in `WG_FB`), so the
+    // carried picture moves *against* the field. Same here: this is a sample offset, and `flow` is
+    // added to it rather than subtracted. The web scales by `0.03` because its velocity is in uv
+    // per second; this one is already pixels per frame, so the factor is 1.
+    let flow = textureSampleLevel(velT, velS, pos.xy / f.res, 0.0).xy;
+    // The web rounds the displacement to whole output pixels after the gain, which is what makes
+    // the smear hold still for a frame instead of sliding sub-pixel. `motion` is the forward
+    // displacement in grid pixels, so the sample offset it comes from is `-shift`.
+    let shift = round(motion * (f.gain * f.mv_scale) * f.res / f.grid);
+
+    // The web samples the buffer with `G.nm` - nearest, mirror-repeat (`gpu.js:639`), so a
+    // displacement of whole pixels is exactly a texel, and a smear that leaves the frame mirrors
+    // back in instead of clamping. `textureLoad` at the mirrored index is that sample exactly.
+    let offset = vec2<i32>(i32(-shift.x + floor(flow.x)), i32(-shift.y + floor(flow.y)));
+    let at = vec2<i32>(mirror(pixel.x + offset.x, res.x), mirror(pixel.y + offset.y, res.y));
+
+    var c = textureLoad(bufT, at, 0).rgb;
+    if (f.skipres < 0.5) {
+        let previous = textureLoad(prvT, pixel, 0).rgb;
+        c = c + fresh - previous;
+        c = mix(c, fresh, clamp(f.leak, 0.0, 1.0));
+    }
+    return vec4<f32>(clamp(c, vec3<f32>(-0.15), vec3<f32>(1.15)), 1.0);
 }
