@@ -476,8 +476,8 @@ number — it is the same work minus presentation.
 | sigil text look (L-text-3 `3ab85d6`, L-text-4 `9b822e4`) | uppercase Grenze Gotisch, whip thorns 0.24-0.60 of a line's height with needle tips, S-curves and barbs (up to 20, kept clear of other words, spaces, and flanking marks), a mirrored bramble mark either side, seeded by the text; GPOS kerning sums across lookups; path-length reach bound instead of chord length; single words up to 18 advances stay on one line ("ilanaVisual" no longer hard-breaks); uniform reflection test pins every member offset; mirrored-mark GPU draw test passes. Sigil pass 0.96 ms vs clean 0.68 ms at 1080p |
 | Vulkan enumeration retry & uniform cap (N-render-incomplete `f33d04d`) | retries `VK_INCOMPLETE` across 6 Vulkan enumeration calls (instance/device extensions, devices, queues, surface formats, present modes, swapchain images) and raises `MAX_UNIFORM_BYTES` from 1024 to 4096 |
 | **app wiring** (#60: camera, text, HAP, Adjustment/Mask, stem taps; windowed, stage 1075x655, 163 BPM feed) | camera clip shows the live webcam; a Mask layer lights the text only where the sigil halo is bright; an Adjustment (Negative + Mirror) inverts and mirrors the whole stack below it. Steady state over 20 one-second windows (`ILANAVISUAL_BUDGET_LOG=1`): camera + mask + text + adjustment 0.32-0.66 ms render thread, 8.3-10.7 ms GPU (stack waits included) vs the stress project's 0.56-0.95 / 7.4-9.3 ms in the same window. Text draws upside down (fixed in L-text-2); HAP and stem taps not yet run with a real HAP file or Tap instances in Live |
-| **stress project**, `mosh-budget`, offscreen release, **1920x1080 output, 960x540 layers**, 300 frames (`080a140`, web-faithful datamosh + ring motion + zero-copy `prev_src`) | **GPU median 4.93 ms, p95 6.40 ms** (steady frames: median 4.82, p95 5.75; 2-beat 4-layer crossfade frames: median 6.21, max 9.09) vs 7.55 / 9.16 ms before optimization (and 4.82 / 6.05 ms before web-faithful datamosh); `mosh motion` 0.41 ms (was 2.05 ms), `mosh copy` eliminated (was 0.44 ms); render-thread CPU median 1.16 ms; 148.0 MB of targets and textures |
-| **stress project**, same bench at **2560x1600** (the laptop panel, 1280x800 layers, `080a140`) | **GPU median 9.02 ms, p95 11.52 ms** (steady 8.79 / 9.75; crossfade 11.08, max 13.05) vs 11.54 / 14.11 ms before optimization (faster than pre-web-faithful 9.15 / 11.57 ms); CPU median 1.31 ms; 263.7 MB |
+| **stress project**, `mosh-budget`, offscreen release, **1920x1080 output, 960x540 layers**, 300 frames (`4e1bff5`, `--warmup 120`, AC 100%, sustained boost clock) | **GPU median 3.78 ms, p95 5.20 ms, max 5.81 ms** (steady frames: median 3.72, p95 4.69; 2-beat 4-layer crossfade frames: median 5.05, max 5.81 — all 300 frames under the 6 ms budget; vs 4.93 / 6.40 ms on `080a140` and 7.55 / 9.16 ms before optimization); `mosh feedback` 0.57 ms, `numogram` 0.53 ms, `mosh motion` 0.48 ms, `fx_effects` 0.48 ms, `composite` 0.46 ms, `tr_mix` 0.88 ms/crossfade; render-thread CPU median 1.06 ms; 148.0 MB of targets and textures |
+| **stress project**, same bench at **2560x1600** (the laptop panel, 1280x800 layers, `4e1bff5`, `--warmup 120`) | **GPU median 7.10 ms, p95 10.48 ms** (steady 6.95 / 8.58; crossfade 9.84, max 13.04; vs 9.02 / 11.52 ms on `080a140` and 11.54 / 14.11 ms before optimization); CPU median 1.02 ms; 263.7 MB |
 | **stress project windowed on the laptop panel after V-budget** (2560x1600, 60 fps cap, release, on AC at 100%, display on) | GPU 7.2-8.5 ms per frame (one 11.8 ms sample), render thread 0.34-0.74 ms, process 8.7% of one core, 460-463 MB working set |
 | stress project on the laptop panel, windowed at 120 Hz, before the frame cap and the profile (release, 2.6 Mpx panels, FIFO) | GPU 20-24 ms per frame, render thread 1.0-1.7 ms, process 18% of one core, 593 MB — twice the pixels and twice the frame rate of the budget's case |
 | **first app run**, loopback, nothing playing (release, integrated GPU, laptop screen only) | GPU 0.70-0.75 ms, render thread 0.05-0.11 ms per frame; process about 5.5% of one core; 322 MB |
@@ -526,15 +526,18 @@ in 9 of 12 cases (was 2 of 10). "reza pedia": bars 9-23 now average level 3.0 an
 4.0 (both were ~3.9). `Analyzer::push` stays at 32-37 us per 256-sample block (release), 54-90 us
 with drum and bass stems fed through `push_stem` (budget 200 us).
 
-Known gap: after web-faithful datamosh + `080a140` (ring-outward motion search and zero-copy
-ping-pong `prev_src`), the stress project's *steady* 1080p frame is inside the 6 ms GPU budget
-(median 4.82 ms, p95 5.75 ms), while the 300-frame run's p95 is 6.40 ms (down from 9.16 ms before
-`080a140`) because 20% of those frames carry a four-layer 2-beat crossfade (median 6.21 ms). What
-is left to cut at 1080p, in the order the profile says: effects (0.76 ms), the two datamosh
-feedbacks (0.75 ms), the compositor sampling four 960x540 layers (0.71 ms), numogram (0.69 ms),
-the overlay upload (0.42 ms), the two motion estimates (0.41 ms, down from 2.05 ms), and the fluid
-solver plus its present pass (0.55 ms). `mosh-budget` prints that table;
-`mosh-stress-project out.ron <video>` writes the project.
+Budget status (`4e1bff5`): after `080a140` (ring-outward motion search + zero-copy ping-pong
+`prev_src`) and `4e1bff5` (`LOAD_OP_DONT_CARE` + `UNDEFINED` transitions for full-screen
+overwrite passes, fast-path `mirror` in `mosh_feedback.wgsl`, symmetry-folded `numogram.wgsl`,
+and exact `textureLoad` paths in `fx_effects.wgsl` and `tr_mix.wgsl`), the 1080p stress project
+meets the 6 ms GPU budget on AC sustained boost clock (`--warmup 120`: median 3.78 ms, p95 5.20 ms,
+max 5.81 ms across all 300 frames including the 60 four-layer 2-beat crossfade frames at median
+5.05 ms). Per-pass breakdown at 1080p: `mosh feedback` (0.57 ms), `numogram` (0.53 ms),
+`mosh motion` (0.48 ms), `fx_effects` (0.48 ms), `composite` (0.46 ms), `overlay.upload`
+(0.42 ms), fluid solver + present (0.37 ms), `overlay.video` (0.20 ms), `tr_mix` (0.88 ms on
+crossfade frames). Note: short bursts (`--warmup 30`) can still catch AMD iGPU DVFS P-state dips
+(~14 ms spikes for ~30 frames); on-battery clock behaviour is not yet measured. `mosh-budget`
+prints that table; `mosh-stress-project out.ron <video>` writes the project.
 Memory: `mosh-budget` reports 148.0 MB of targets and textures at 1080p (110.7 MB across 4 layers
 with ping-pong `scene`, `mosh`, and `effects` targets plus single-image `transition` and saved
 transition frames, 23.7 MB overlay texture + staging, 7.9 MB output, 5.6 MB visuals) and 263.7 MB
