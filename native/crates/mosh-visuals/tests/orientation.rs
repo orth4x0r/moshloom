@@ -23,8 +23,11 @@ use std::sync::{Mutex, MutexGuard};
 
 use mosh_core::{AnalysisFrame, BlendMode, ClipParams};
 use mosh_render::upload::BlockFormat;
-use mosh_render::{Compositor, FrameRecorder, Gpu, GpuPreference, LayerTarget, OutputImage};
+use mosh_render::{
+    AsyncReadback, Compositor, FrameRecorder, Gpu, GpuPreference, LayerTarget, OutputImage,
+};
 use mosh_visuals::overlay::OverlayLayer;
+use mosh_visuals::scenes::Scenes;
 use mosh_visuals::text::TextLayer;
 
 /// One GPU test at a time in this binary: several short offscreen tests in parallel fight for the
@@ -393,6 +396,243 @@ fn text_is_upright_on_the_stage() {
     assert!(
         stem > arm * 3 / 2,
         "the L's stem must be on the left: left half {stem}, right half {arm}"
+    );
+    assert_no_validation_messages(&gpu);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Web scenes, custom scenes, and clip thumbnails
+// ---------------------------------------------------------------------------------------------
+
+fn luma(px: [u8; 4]) -> f32 {
+    (f32::from(px[0]) + f32::from(px[1]) + f32::from(px[2])) / 3.0
+}
+
+fn mean_luma_rect(pixels: &[u8], width: u32, x0: u32, x1: u32, y0: u32, y1: u32) -> f32 {
+    let mut sum = 0.0f32;
+    let mut count = 0u32;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            sum += luma(pixel(pixels, width, x, y));
+            count += 1;
+        }
+    }
+    sum / count.max(1) as f32
+}
+
+/// Scene 14 (`scan`) at `t = 0` draws its dark header (`y < 0.05`) with a bright white sync box
+/// at `x in 0.10..0.16` across the TOP of the picture, and bright static bars across the bottom
+/// (`y > 0.74`). Through `Compositor` into `OutputImage`, the header and sync box must land at
+/// the top-left of the stage.
+#[test]
+fn scan_is_upright_on_the_stage() {
+    let gpu = gpu();
+    let (width, height) = SIZE;
+    let mut scenes = Scenes::new(&gpu).expect("scenes");
+    let layer = LayerTarget::new(&gpu, width, height);
+    let params = ClipParams {
+        p: [0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        palette: 1,
+        seed: 0,
+    };
+    {
+        let mut recorder = FrameRecorder::new(&gpu);
+        scenes
+            .draw(
+                &mut recorder,
+                &layer,
+                "scan",
+                &AnalysisFrame::default(),
+                &params,
+                0.0,
+            )
+            .expect("draw scan");
+        gpu.wait_frame(recorder.submit());
+    }
+
+    let pixels = composite_output(&gpu, &layer, width, height);
+    let sync_box = pixel(&pixels, width, width * 13 / 100, 1);
+    let sync_mirror_x = pixel(&pixels, width, width * 87 / 100, 1);
+    let top_header = mean_luma_rect(&pixels, width, width / 4, width, 0, height / 25);
+    let bottom_band = mean_luma_rect(&pixels, width, width / 4, width, height - height / 12, height);
+    println!(
+        "scan on stage: sync_box={sync_box:?}, top_right={sync_mirror_x:?}, \
+         top_header_luma={top_header:.1}, bottom_band_luma={bottom_band:.1}"
+    );
+
+    assert!(
+        luma(sync_box) > 170.0,
+        "scan's white sync box must be at the top-left of the stage, got {sync_box:?}"
+    );
+    assert!(
+        luma(sync_mirror_x) < 75.0,
+        "scan's top-right header must stay dark (not H-mirrored), got {sync_mirror_x:?}"
+    );
+    assert!(
+        top_header < 75.0 && bottom_band > top_header + 40.0,
+        "scan's dark header must be at the top ({top_header:.1}) and bright static at the bottom \
+         ({bottom_band:.1})"
+    );
+    assert_no_validation_messages(&gpu);
+}
+
+/// Scene 06 (`spectrum`) in waterfall mode (`vari = 0`) places the newest mel rows (`age = 0..`)
+/// at the TOP of the screen (`q.y = -1.0`) and older rows below them. After six loud frames on a
+/// fresh `Scenes` instance, the top strip of the stage is lit and the bottom strip is dark.
+#[test]
+fn spectrum_is_upright_on_the_stage() {
+    let gpu = gpu();
+    let (width, height) = SIZE;
+    let mut scenes = Scenes::new(&gpu).expect("scenes");
+    let layer = LayerTarget::new(&gpu, width, height);
+    let frame = AnalysisFrame {
+        bands: [0.9, 0.9, 0.9],
+        mel: [1.0; 24],
+        loudness: 0.9,
+        intensity: 0.9,
+        ..AnalysisFrame::default()
+    };
+    let params = ClipParams {
+        p: [1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        palette: 1,
+        seed: 0,
+    };
+    for step in 1..=6 {
+        let mut recorder = FrameRecorder::new(&gpu);
+        scenes
+            .draw(
+                &mut recorder,
+                &layer,
+                "spectrum",
+                &frame,
+                &params,
+                step as f32,
+            )
+            .expect("draw spectrum");
+        gpu.wait_frame(recorder.submit());
+    }
+
+    let pixels = composite_output(&gpu, &layer, width, height);
+    let top = mean_luma_rect(&pixels, width, 0, width, 0, 6);
+    let bottom = mean_luma_rect(&pixels, width, 0, width, height - 6, height);
+    println!("spectrum on stage (6 loud frames): top_luma={top:.1}, bottom_luma={bottom:.1}");
+
+    assert!(
+        top > 30.0 && bottom < 5.0,
+        "spectrum's newest mel rows must land at the top of the stage (top={top:.1}, \
+         bottom={bottom:.1})"
+    );
+    assert_no_validation_messages(&gpu);
+}
+
+/// A custom WGSL scene written in WebGPU's top-down `pos.xy / U.res` coordinates renders right
+/// way up on the stage, matching the orientation fixture on both axes.
+#[test]
+fn custom_scene_is_upright_on_the_stage() {
+    let gpu = gpu();
+    let (width, height) = SIZE;
+    let mut scenes = Scenes::new(&gpu).expect("scenes");
+    let wgsl = r#"
+@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let uv = pos.xy / U.res;
+  if (uv.y < 60. / 360.) { return vec4f(1., 0., 0., 1.); }
+  if (uv.y >= 300. / 360.) { return vec4f(0., 0., 1., 1.); }
+  if (uv.x >= 20. / 640. && uv.x < 140. / 640. && uv.y >= 100. / 360. && uv.y < 140. / 360.) {
+    return vec4f(1., 1., 0., 1.);
+  }
+  return vec4f(0., 1., 0., 1.);
+}
+"#;
+    scenes
+        .set_custom(&gpu, "orient", wgsl)
+        .expect("register custom orientation shader");
+    let layer = LayerTarget::new(&gpu, width, height);
+    {
+        let mut recorder = FrameRecorder::new(&gpu);
+        scenes
+            .draw(
+                &mut recorder,
+                &layer,
+                "custom:orient",
+                &AnalysisFrame::default(),
+                &ClipParams::default(),
+                0.0,
+            )
+            .expect("draw custom:orient");
+        gpu.wait_frame(recorder.submit());
+    }
+
+    let pixels = composite_output(&gpu, &layer, width, height);
+    assert_upright(&pixels, width, height, 3, "custom WGSL scene on stage");
+    assert_no_validation_messages(&gpu);
+}
+
+/// A clip thumbnail captured directly from a `LayerTarget` (`AsyncReadback::record_target`, the
+/// path `Stage::present_with_capture` uses for the control window's clip deck) matches the
+/// stage's orientation on both axes.
+#[test]
+fn clip_thumbnail_matches_stage_orientation() {
+    let gpu = gpu();
+    let (width, height) = SIZE;
+    let (thumb_w, thumb_h) = (96u32, 54u32);
+    let mut scenes = Scenes::new(&gpu).expect("scenes");
+    let layer = LayerTarget::new(&gpu, width, height);
+    let params = ClipParams {
+        p: [0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        palette: 1,
+        seed: 0,
+    };
+    {
+        let mut recorder = FrameRecorder::new(&gpu);
+        scenes
+            .draw(
+                &mut recorder,
+                &layer,
+                "scan",
+                &AnalysisFrame::default(),
+                &params,
+                0.0,
+            )
+            .expect("draw scan");
+        gpu.wait_frame(recorder.submit());
+    }
+
+    let stage = composite_output(&gpu, &layer, width, height);
+    let mut readback = AsyncReadback::new(&gpu, thumb_w, thumb_h).expect("readback");
+    readback.begin_frame();
+    readback.record_target(&gpu, &layer, 42).expect("record");
+    readback.begin_frame();
+    let thumb = readback.begin_frame().expect("thumbnail");
+
+    // Stage and thumbnail must both have the white sync box in the top-left, dark header at the
+    // top-right, and bright static band at the bottom.
+    let stage_sync = luma(pixel(&stage, width, width * 13 / 100, 1));
+    let thumb_sync = luma(pixel(&thumb.rgba, thumb_w, thumb_w * 13 / 100, 0));
+    let thumb_top_right = luma(pixel(&thumb.rgba, thumb_w, thumb_w * 87 / 100, 0));
+    let thumb_top_header = mean_luma_rect(&thumb.rgba, thumb_w, thumb_w / 4, thumb_w, 0, 2);
+    let thumb_bottom = mean_luma_rect(
+        &thumb.rgba,
+        thumb_w,
+        thumb_w / 4,
+        thumb_w,
+        thumb_h - 4,
+        thumb_h,
+    );
+    println!(
+        "scan thumbnail vs stage: stage_sync={stage_sync:.1}, thumb_sync={thumb_sync:.1}, \
+         thumb_top_right={thumb_top_right:.1}, thumb_top_header={thumb_top_header:.1}, \
+         thumb_bottom={thumb_bottom:.1}"
+    );
+
+    assert!(stage_sync > 170.0 && thumb_sync > 140.0);
+    assert!(
+        thumb_top_right < 80.0,
+        "thumbnail top-right must stay dark (not H-mirrored), got {thumb_top_right:.1}"
+    );
+    assert!(
+        thumb_top_header < 80.0 && thumb_bottom > thumb_top_header + 35.0,
+        "thumbnail must match stage orientation (top={thumb_top_header:.1}, \
+         bottom={thumb_bottom:.1})"
     );
     assert_no_validation_messages(&gpu);
 }

@@ -158,14 +158,14 @@ impl Scenes {
         // Style packs (`styles`): native scenes on the scene prelude plus `P(i)`.
         let style_prelude = crate::styles::prelude();
         for style in crate::styles::all() {
-            let words = compile(
+            let source = wrap_stage_y_required(
                 &format!(
-                    "{style_prelude}
-{}",
+                    "{style_prelude}\n{}",
                     style.body
                 ),
                 style.id,
             );
+            let words = compile(&source, style.id);
             let pipeline = Pipeline::fullscreen(gpu, &words, LAYER_UNIFORM_BYTES, INPUTS)
                 .unwrap_or_else(|error| panic!("style scene {} pipeline: {error}", style.id))
                 .with_name(style.id);
@@ -291,6 +291,7 @@ impl Scenes {
         // here and the error lines are rebased into `wgsl` exactly the way `compile_custom` does.
         let prelude = mosh_shaders::web_prelude().replace("fn vs(", "fn vs_main(");
         let body = wgsl.replace("fn fs(", "fn fs_main(");
+        let body = wrap_stage_y(&body).unwrap_or(body);
         let source = format!("{prelude}{body}");
         let words = mosh_shaders::compile_wgsl(&source).map_err(|error| {
             let prelude_lines = prelude.matches('\n').count() as u32;
@@ -372,8 +373,8 @@ impl Scenes {
 /// vertex stage is kept verbatim (scene 02, for one, declares its own consts and helpers there).
 fn scene_source(id: &str) -> String {
     match id {
-        "numogram" => format!("{PRELUDE}\n{NUMOGRAM}"),
-        "swarm" => format!("{PRELUDE}\n{SWARM_FAST}"),
+        "numogram" => wrap_stage_y_required(&format!("{PRELUDE}\n{NUMOGRAM}"), id),
+        "swarm" => wrap_stage_y_required(&format!("{PRELUDE}\n{SWARM_FAST}"), id),
         _ => extracted_source(id),
     }
 }
@@ -383,7 +384,7 @@ fn scene_source(id: &str) -> String {
 /// hand-written scenes against.
 fn extracted_source(id: &str) -> String {
     if id == "swarm" {
-        return format!("{PRELUDE}\n{SWARM}");
+        return wrap_stage_y_required(&format!("{PRELUDE}\n{SWARM}"), id);
     }
     let module = visualizer_shader(id).unwrap_or_else(|| panic!("no extracted module for {id}"));
     let text = scene_module(module).unwrap_or_else(|| panic!("no source for module {module}"));
@@ -394,7 +395,7 @@ fn extracted_source(id: &str) -> String {
         fragment, body,
         "{module}: no `@fragment fn fs` entry point to rename"
     );
-    format!("{PRELUDE}\n{fragment}")
+    wrap_stage_y_required(&format!("{PRELUDE}\n{fragment}"), module)
 }
 
 /// The scene's own text: everything after the web prelude's `@vertex fn vs(...)` line.
@@ -416,6 +417,146 @@ fn scene_body(text: &str) -> Option<String> {
 /// calls it `fs`, and `mosh-render`'s pipeline looks for `fs_main`. Same text, one word.
 fn rename_fragment(text: &str) -> String {
     text.replace("@fragment fn fs(", "@fragment fn fs_main(")
+}
+
+/// [`wrap_stage_y`] for built-in and style scenes, where every scene must have a matching
+/// `@fragment fn fs_main(@builtin(position) ...)` entry point.
+fn wrap_stage_y_required(source: &str, name: &str) -> String {
+    wrap_stage_y(source).unwrap_or_else(|| {
+        panic!("{name}: no `@fragment fn fs_main(@builtin(position) ...)` entry point to wrap")
+    })
+}
+
+/// Rewrites a scene's `@fragment fn fs_main(@builtin(position) ...)` entry point so the scene
+/// sees WebGPU's top-down pixel coordinates (`pos.y = 0.5` at the top of the stage, `U.res.y -
+/// 0.5` at the bottom) while drawing into a `LayerTarget` (whose row 0 is the stage's *bottom*
+/// row because `Compositor` samples layers with `fullscreen.vert`'s uv).
+///
+/// The original entry point is demoted in place to `fn _mosh_scene_fs(...)` without adding or
+/// removing any newlines before or inside the body, so custom-shader diagnostics keep the exact
+/// line numbers the human typed. A tiny `@fragment fn fs_main` wrapper appended at the end flips
+/// `pos.y` to `U.res.y - pos.y` and forwards to `_mosh_scene_fs`.
+fn wrap_stage_y(source: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip line comments so a commented-out `@fragment` never matches.
+        if bytes[i..].starts_with(b"//") {
+            match source[i..].find('\n') {
+                Some(nl) => i += nl + 1,
+                None => break,
+            }
+            continue;
+        }
+        if !bytes[i..].starts_with(b"@fragment") {
+            i += 1;
+            continue;
+        }
+        let frag_start = i;
+        let frag_end = i + "@fragment".len();
+        let after_frag = skip_ws(bytes, frag_end);
+        if after_frag == frag_end || !bytes[after_frag..].starts_with(b"fn") {
+            i = frag_end;
+            continue;
+        }
+        let fn_end = after_frag + 2;
+        let name_start = skip_ws(bytes, fn_end);
+        if name_start == fn_end || !bytes[name_start..].starts_with(b"fs_main") {
+            i = fn_end;
+            continue;
+        }
+        let name_end = name_start + "fs_main".len();
+        let open_paren = skip_ws(bytes, name_end);
+        if bytes.get(open_paren) != Some(&b'(') {
+            i = name_end;
+            continue;
+        }
+        // Match the parameter list's closing `)`.
+        let mut depth = 0usize;
+        let mut close_paren = None;
+        for (offset, &b) in bytes[open_paren..].iter().enumerate() {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_paren = Some(open_paren + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close_paren = close_paren?;
+        let params = &source[open_paren + 1..close_paren];
+        // Only single-parameter `@builtin(position)` entry points are rewritten.
+        let (builtin_start, builtin_end) = find_attr(params, "@builtin", "position")?;
+        let params_without_attr =
+            format!("{}{}", &params[..builtin_start], &params[builtin_end..]);
+        if params_without_attr
+            .trim()
+            .trim_end_matches(',')
+            .contains(',')
+        {
+            return None;
+        }
+
+        // Expect `-> @location(0) ... {` after `)`.
+        let after_params = skip_ws(bytes, close_paren + 1);
+        if !bytes[after_params..].starts_with(b"->") {
+            return None;
+        }
+        let ret_start = skip_ws(bytes, after_params + 2);
+        let brace = source[ret_start..].find('{')? + ret_start;
+        let ret_slice = &source[ret_start..brace];
+        let (loc_start, loc_end) = find_attr(ret_slice, "@location", "0")?;
+        let ret_without_attr =
+            format!("{}{}", &ret_slice[..loc_start], &ret_slice[loc_end..]);
+
+        // Reassemble with the exact original line breaks preserved everywhere up to the end.
+        let mut out = String::with_capacity(source.len() + 180);
+        out.push_str(&source[..frag_start]);
+        out.push_str(&source[frag_end..name_start]);
+        out.push_str("_mosh_scene_fs");
+        out.push_str(&source[name_end..open_paren + 1]);
+        out.push_str(&params_without_attr);
+        out.push_str(&source[close_paren..ret_start]);
+        out.push_str(&ret_without_attr);
+        out.push_str(&source[brace..]);
+        out.push_str(
+            "\n@fragment fn fs_main(@builtin(position) _mosh_raw_pos: vec4f) -> @location(0) vec4f {\n  return _mosh_scene_fs(vec4f(_mosh_raw_pos.x, U.res.y - _mosh_raw_pos.y, _mosh_raw_pos.z, _mosh_raw_pos.w));\n}\n",
+        );
+        return Some(out);
+    }
+    None
+}
+
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Finds `@name(arg)` (allowing ASCII whitespace around `(` and `arg`), returning its byte range.
+fn find_attr(text: &str, attr: &str, arg: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut search = 0;
+    while let Some(rel) = text[search..].find(attr) {
+        let start = search + rel;
+        let open = skip_ws(bytes, start + attr.len());
+        if bytes.get(open) == Some(&b'(') {
+            let arg_start = skip_ws(bytes, open + 1);
+            if bytes[arg_start..].starts_with(arg.as_bytes()) {
+                let close = skip_ws(bytes, arg_start + arg.len());
+                if bytes.get(close) == Some(&b')') {
+                    return Some((start, close + 1));
+                }
+            }
+        }
+        search = start + attr.len();
+    }
+    None
 }
 
 /// The committed WGSL text of the scene modules, by module name (`visualizer_shader`).
@@ -542,10 +683,10 @@ mod perf;
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFPAL, remap_web_bindings, scene_source};
+    use super::{DEFPAL, remap_web_bindings, scene_source, wrap_stage_y};
     use mosh_shaders::VISUALIZERS;
 
-    /// Every scene source assembles: the prelude plus a body, or the hand-written swarm.
+    /// Every scene source assembles and wraps `@builtin(position)` for stage orientation.
     #[test]
     fn every_scene_has_a_source() {
         let scenes = VISUALIZERS.iter().filter(|info| info.id != "fluid");
@@ -557,7 +698,48 @@ mod tests {
                 "{} has no fragment entry point",
                 info.id
             );
+            assert!(
+                source.contains("fn _mosh_scene_fs("),
+                "{} was not wrapped for stage y",
+                info.id
+            );
         }
+    }
+
+    #[test]
+    fn wrap_stage_y_preserves_line_numbers_and_handles_edge_cases() {
+        // Inline after `}` (like `y2k_chrome.wgsl`), plus a commented-out `@fragment`.
+        let compact = "// @fragment fn fs_main(@builtin(position) x: vec4f) -> @location(0) vec4f {}\nfn h() -> f32 { return 1.; }@fragment fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {\n  let marker = 42.;\n  return vec4f(marker);\n}";
+        let wrapped = wrap_stage_y(compact).expect("compact header wraps");
+        assert!(wrapped.contains("fn _mosh_scene_fs("));
+        assert!(wrapped.contains("U.res.y - _mosh_raw_pos.y"));
+        // The body's line number must stay identical to the input's.
+        let orig_line = compact
+            .lines()
+            .position(|l| l.contains("let marker = 42.;"))
+            .unwrap();
+        let new_line = wrapped
+            .lines()
+            .position(|l| l.contains("let marker = 42.;"))
+            .unwrap();
+        assert_eq!(new_line, orig_line);
+
+        // Multi-line `@fragment\nfn fs_main(...)` with `vec4<f32>`.
+        let multiline = "@fragment\nfn fs_main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {\n  let line3 = p.y;\n  return vec4<f32>(line3);\n}";
+        let wrapped = wrap_stage_y(multiline).expect("multiline header wraps");
+        let orig_line = multiline
+            .lines()
+            .position(|l| l.contains("let line3 = p.y;"))
+            .unwrap();
+        let new_line = wrapped
+            .lines()
+            .position(|l| l.contains("let line3 = p.y;"))
+            .unwrap();
+        assert_eq!(new_line, orig_line);
+
+        // An entry point that does not take `@builtin(position)` is left alone.
+        let uv_only = "@fragment fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f { return vec4f(uv, 0., 1.); }";
+        assert!(wrap_stage_y(uv_only).is_none());
     }
 
     #[test]

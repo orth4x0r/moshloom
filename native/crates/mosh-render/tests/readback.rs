@@ -8,8 +8,10 @@
 
 use std::time::{Duration, Instant};
 
+use mosh_core::BlendMode;
 use mosh_render::{
-    AsyncReadback, FrameRecorder, Gpu, GpuPreference, LayerTarget, Pipeline, READBACK_DELAY,
+    AsyncReadback, Compositor, FrameRecorder, Gpu, GpuPreference, LayerTarget, OutputImage,
+    Pipeline, READBACK_DELAY,
 };
 
 /// Left half red, right half green; blue runs along `uv.y`.
@@ -159,9 +161,14 @@ fn a_large_source_is_scaled_down_the_right_way_up() {
         let right = pixel(&picture.rgba, 96, 85, 27);
         assert!(left[0] > 250 && left[1] < 5, "{what}: left {left:?}");
         assert!(right[1] > 250 && right[0] < 5, "{what}: right {right:?}");
-        // Top and bottom are the way the blocking readback has them: not flipped. (Which end
-        // of `uv.y` is the top row is the vertex stage's business; the two readbacks must agree.)
-        let reference = gpu.read_back(&target);
+        // Top and bottom match what the audience sees on the stage (`Compositor` into an
+        // `OutputImage`), not raw layer-target memory (whose row 0 is the stage's bottom row).
+        let out = OutputImage::new(&gpu, width, height);
+        let mut compositor = Compositor::new(&gpu).expect("compositor");
+        compositor
+            .composite(&[(&target, BlendMode::Normal, 1.0)], &out)
+            .expect("composite");
+        let reference = gpu.read_back_output(&out);
         let reference_top = pixel(&reference, width, width / 8, height / 20);
         let reference_bottom = pixel(&reference, width, width / 8, height - height / 20);
         let top = pixel(&picture.rgba, 96, 12, 2);
@@ -173,7 +180,7 @@ fn a_large_source_is_scaled_down_the_right_way_up() {
         assert_eq!(
             top[2] > bottom[2],
             reference_top[2] > reference_bottom[2],
-            "{what}: top {top:?} bottom {bottom:?}, reference {reference_top:?} {reference_bottom:?}"
+            "{what}: top {top:?} bottom {bottom:?}, stage {reference_top:?} {reference_bottom:?}"
         );
         // The edge between the halves is where it belongs, within a pixel of the middle.
         let near_left = pixel(&picture.rgba, 96, 46, 27);

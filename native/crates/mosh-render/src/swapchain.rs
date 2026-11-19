@@ -1,4 +1,4 @@
-﻿//! The stage output: a surface on a window, a swapchain, and the recovery policy that keeps the
+//! The stage output: a surface on a window, a swapchain, and the recovery policy that keeps the
 //! show running when the swapchain goes out of date or the surface is lost (a monitor unplugged
 //! mid-set, Review Focus item 5).
 //!
@@ -815,6 +815,8 @@ impl Stage {
                         dst_stage: vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                         dst_access: vk::AccessFlags::empty(),
                     },
+                    // The swapchain image was composited right-way-up.
+                    flip_y: false,
                 };
                 readback.record(self.cmd, source, 0);
             }

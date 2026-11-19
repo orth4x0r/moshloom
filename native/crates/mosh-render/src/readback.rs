@@ -59,6 +59,10 @@ pub(crate) struct ReadbackSource {
     pub(crate) before: Barrier,
     /// From `TRANSFER_SRC_OPTIMAL` to the layout the caller wants it left in.
     pub(crate) after: Barrier,
+    /// Flip vertically on the way into the picture. A `LayerTarget`'s row 0 is the stage's
+    /// bottom row (`Compositor` flips it into the swapchain), so thumbnails taken from a layer
+    /// target flip here to match the stage; the swapchain preview is already upright.
+    pub(crate) flip_y: bool,
 }
 
 struct Slot {
@@ -228,6 +232,7 @@ impl AsyncReadback {
                 source.extent,
                 self.mid.image,
                 self.mid.extent,
+                false,
             );
             (self.mid.image, self.mid.extent)
         } else {
@@ -243,6 +248,7 @@ impl AsyncReadback {
             from.1,
             self.small.image,
             self.small.extent,
+            source.flip_y,
         );
         cmd_barrier(device, cmd, self.small.image, written_to_source());
         let region = vk::BufferImageCopy::default()
@@ -336,6 +342,7 @@ pub(crate) fn target_source(target: &crate::LayerTarget) -> ReadbackSource {
             dst_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
             dst_access: vk::AccessFlags::SHADER_READ,
         },
+        flip_y: true,
     }
 }
 
@@ -368,6 +375,7 @@ fn blit(
     src_extent: vk::Extent2D,
     dst: vk::Image,
     dst_extent: vk::Extent2D,
+    flip_y: bool,
 ) {
     cmd_barrier(
         device,
@@ -387,9 +395,25 @@ fn blit(
         y: extent.height as i32,
         z: 1,
     };
+    let src_offsets = if flip_y {
+        [
+            vk::Offset3D {
+                x: 0,
+                y: src_extent.height as i32,
+                z: 0,
+            },
+            vk::Offset3D {
+                x: src_extent.width as i32,
+                y: 0,
+                z: 1,
+            },
+        ]
+    } else {
+        [vk::Offset3D::default(), corner(src_extent)]
+    };
     let region = vk::ImageBlit::default()
         .src_subresource(layers())
-        .src_offsets([vk::Offset3D::default(), corner(src_extent)])
+        .src_offsets(src_offsets)
         .dst_subresource(layers())
         .dst_offsets([vk::Offset3D::default(), corner(dst_extent)]);
     unsafe {
