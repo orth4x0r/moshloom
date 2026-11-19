@@ -37,51 +37,178 @@ const LUMA: vec3<f32> = vec3<f32>(0.3, 0.59, 0.11);
 /// so the vector field has 23 rows and the web lets the last, half-covered row search as a whole
 /// block. Ported as written.
 const BLOCK_LIMIT_Y: f32 = 184.0;
-/// Samples per block: a 4x4 grid of block pixels, every other row and column.
-const SAMPLES: u32 = 16;
-const STEP: f32 = 2.0;
+/// Web motion penalty (3.0 per grid pixel in 0..255 luma) and zero-motion early-exit threshold
+/// (0.5 in 0..255 luma), scaled into 0..1 so the inner loop avoids multiplying every sample by 255.
+const PENALTY: f32 = 3.0 / 255.0;
+const EARLY_EXIT: f32 = 0.5 / 255.0;
 
-fn lum_cur(p: vec2<f32>) -> f32 {
-    return clamp(dot(textureSampleLevel(curT, curS, p / m.grid, 0.0).rgb, LUMA), 0.0, 1.0);
+fn lum_cur(uv: vec2<f32>) -> f32 {
+    return clamp(dot(textureSampleLevel(curT, curS, uv, 0.0).rgb, LUMA), 0.0, 1.0);
 }
 
-fn lum_prv(p: vec2<f32>) -> f32 {
-    return clamp(dot(textureSampleLevel(prvT, prvS, p / m.grid, 0.0).rgb, LUMA), 0.0, 1.0);
+fn lum_prv(uv: vec2<f32>) -> f32 {
+    return clamp(dot(textureSampleLevel(prvT, prvS, uv, 0.0).rgb, LUMA), 0.0, 1.0);
+}
+
+fn sad4x4(
+    origin: vec2<f32>,
+    offset: vec2<f32>,
+    inv_grid: vec2<f32>,
+    c0: vec4<f32>,
+    c1: vec4<f32>,
+    c2: vec4<f32>,
+    c3: vec4<f32>,
+    best: f32,
+) -> f32 {
+    let block = origin + offset;
+    if (block.x < 0.0 || block.y < 0.0 || block.x + BLOCK > m.grid.x || block.y + BLOCK > BLOCK_LIMIT_Y) {
+        return best;
+    }
+    var cost = PENALTY * (abs(offset.x) + abs(offset.y));
+    if (cost >= best) {
+        return best;
+    }
+    let uv0 = (block + vec2<f32>(0.5)) * inv_grid;
+    let sx = 2.0 * inv_grid.x;
+    let sy = 2.0 * inv_grid.y;
+
+    let y0 = uv0.y;
+    cost += abs(c0.x - lum_prv(vec2<f32>(uv0.x, y0)))
+          + abs(c0.y - lum_prv(vec2<f32>(uv0.x + sx, y0)))
+          + abs(c0.z - lum_prv(vec2<f32>(uv0.x + 2.0 * sx, y0)))
+          + abs(c0.w - lum_prv(vec2<f32>(uv0.x + 3.0 * sx, y0)));
+    if (cost >= best) {
+        return best;
+    }
+    let y1 = y0 + sy;
+    cost += abs(c1.x - lum_prv(vec2<f32>(uv0.x, y1)))
+          + abs(c1.y - lum_prv(vec2<f32>(uv0.x + sx, y1)))
+          + abs(c1.z - lum_prv(vec2<f32>(uv0.x + 2.0 * sx, y1)))
+          + abs(c1.w - lum_prv(vec2<f32>(uv0.x + 3.0 * sx, y1)));
+    if (cost >= best) {
+        return best;
+    }
+    let y2 = y0 + 2.0 * sy;
+    cost += abs(c2.x - lum_prv(vec2<f32>(uv0.x, y2)))
+          + abs(c2.y - lum_prv(vec2<f32>(uv0.x + sx, y2)))
+          + abs(c2.z - lum_prv(vec2<f32>(uv0.x + 2.0 * sx, y2)))
+          + abs(c2.w - lum_prv(vec2<f32>(uv0.x + 3.0 * sx, y2)));
+    if (cost >= best) {
+        return best;
+    }
+    let y3 = y0 + 3.0 * sy;
+    cost += abs(c3.x - lum_prv(vec2<f32>(uv0.x, y3)))
+          + abs(c3.y - lum_prv(vec2<f32>(uv0.x + sx, y3)))
+          + abs(c3.z - lum_prv(vec2<f32>(uv0.x + 2.0 * sx, y3)))
+          + abs(c3.w - lum_prv(vec2<f32>(uv0.x + 3.0 * sx, y3)));
+    return cost;
 }
 
 @fragment
 fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let origin = floor(pos.xy) * BLOCK;
-    var current: array<f32, 16>;
-    var best = 0.0;
-    for (var i = 0u; i < SAMPLES; i = i + 1u) {
-        let p = origin + vec2<f32>(f32(i % 4u), f32(i / 4u)) * STEP + vec2<f32>(0.5);
-        current[i] = lum_cur(p);
-        best = best + abs(current[i] - lum_prv(p)) * 255.0;
-    }
+    let inv_grid = vec2<f32>(1.0) / m.grid;
+    let uv0 = (origin + vec2<f32>(0.5)) * inv_grid;
+    let sx = 2.0 * inv_grid.x;
+    let sy = 2.0 * inv_grid.y;
+
+    let y0 = uv0.y;
+    let y1 = y0 + sy;
+    let y2 = y0 + 2.0 * sy;
+    let y3 = y0 + 3.0 * sy;
+    let x0 = uv0.x;
+    let x1 = x0 + sx;
+    let x2 = x0 + 2.0 * sx;
+    let x3 = x0 + 3.0 * sx;
+
+    // Hold the 4x4 current-block luma samples in 4 vec4 registers (no dynamic array indexing).
+    let c0 = vec4<f32>(
+        lum_cur(vec2<f32>(x0, y0)),
+        lum_cur(vec2<f32>(x1, y0)),
+        lum_cur(vec2<f32>(x2, y0)),
+        lum_cur(vec2<f32>(x3, y0)),
+    );
+    let c1 = vec4<f32>(
+        lum_cur(vec2<f32>(x0, y1)),
+        lum_cur(vec2<f32>(x1, y1)),
+        lum_cur(vec2<f32>(x2, y1)),
+        lum_cur(vec2<f32>(x3, y1)),
+    );
+    let c2 = vec4<f32>(
+        lum_cur(vec2<f32>(x0, y2)),
+        lum_cur(vec2<f32>(x1, y2)),
+        lum_cur(vec2<f32>(x2, y2)),
+        lum_cur(vec2<f32>(x3, y2)),
+    );
+    let c3 = vec4<f32>(
+        lum_cur(vec2<f32>(x0, y3)),
+        lum_cur(vec2<f32>(x1, y3)),
+        lum_cur(vec2<f32>(x2, y3)),
+        lum_cur(vec2<f32>(x3, y3)),
+    );
+
+    let p0 = vec4<f32>(
+        lum_prv(vec2<f32>(x0, y0)),
+        lum_prv(vec2<f32>(x1, y0)),
+        lum_prv(vec2<f32>(x2, y0)),
+        lum_prv(vec2<f32>(x3, y0)),
+    );
+    let p1 = vec4<f32>(
+        lum_prv(vec2<f32>(x0, y1)),
+        lum_prv(vec2<f32>(x1, y1)),
+        lum_prv(vec2<f32>(x2, y1)),
+        lum_prv(vec2<f32>(x3, y1)),
+    );
+    let p2 = vec4<f32>(
+        lum_prv(vec2<f32>(x0, y2)),
+        lum_prv(vec2<f32>(x1, y2)),
+        lum_prv(vec2<f32>(x2, y2)),
+        lum_prv(vec2<f32>(x3, y2)),
+    );
+    let p3 = vec4<f32>(
+        lum_prv(vec2<f32>(x0, y3)),
+        lum_prv(vec2<f32>(x1, y3)),
+        lum_prv(vec2<f32>(x2, y3)),
+        lum_prv(vec2<f32>(x3, y3)),
+    );
+
+    let ones = vec4<f32>(1.0);
+    var best = dot(abs(c0 - p0) + abs(c1 - p1) + abs(c2 - p2) + abs(c3 - p3), ones);
     var best_offset = vec2<f32>(0.0, 0.0);
-    if (best > 0.5) {
-        for (var dy = -SEARCH; dy <= SEARCH; dy = dy + 1) {
-            for (var dx = -SEARCH; dx <= SEARCH; dx = dx + 1) {
-                if (dx == 0 && dy == 0) {
-                    continue;
+
+    if (best > EARLY_EXIT) {
+        // Search outward by Chebyshev ring r = 1..=6. Every candidate on ring r has
+        // |dx| + |dy| >= r, so once PENALTY * r >= best no outer candidate can improve on best.
+        for (var r = 1; r <= SEARCH; r = r + 1) {
+            if (PENALTY * f32(r) >= best) {
+                break;
+            }
+            for (var dx = -r; dx <= r; dx = dx + 1) {
+                let top = vec2<f32>(f32(dx), f32(-r));
+                let ct = sad4x4(origin, top, inv_grid, c0, c1, c2, c3, best);
+                if (ct < best) {
+                    best = ct;
+                    best_offset = top;
                 }
-                let offset = vec2<f32>(f32(dx), f32(dy));
-                let block = origin + offset;
-                if (block.x < 0.0 || block.y < 0.0 || block.x + BLOCK > m.grid.x || block.y + BLOCK > BLOCK_LIMIT_Y) {
-                    continue;
+                let bot = vec2<f32>(f32(dx), f32(r));
+                let cb = sad4x4(origin, bot, inv_grid, c0, c1, c2, c3, best);
+                if (cb < best) {
+                    best = cb;
+                    best_offset = bot;
                 }
-                var cost = 3.0 * (abs(offset.x) + abs(offset.y));
-                for (var i = 0u; i < SAMPLES; i = i + 1u) {
-                    let p = vec2<f32>(f32(i % 4u), f32(i / 4u)) * STEP + vec2<f32>(0.5);
-                    cost = cost + abs(current[i] - lum_prv(block + p)) * 255.0;
-                    if (cost >= best) {
-                        break;
-                    }
+            }
+            for (var dy = -(r - 1); dy <= r - 1; dy = dy + 1) {
+                let left = vec2<f32>(f32(-r), f32(dy));
+                let cl = sad4x4(origin, left, inv_grid, c0, c1, c2, c3, best);
+                if (cl < best) {
+                    best = cl;
+                    best_offset = left;
                 }
-                if (cost < best) {
-                    best = cost;
-                    best_offset = offset;
+                let right = vec2<f32>(f32(r), f32(dy));
+                let cr = sad4x4(origin, right, inv_grid, c0, c1, c2, c3, best);
+                if (cr < best) {
+                    best = cr;
+                    best_offset = right;
                 }
             }
         }

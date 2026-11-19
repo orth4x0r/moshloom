@@ -52,16 +52,13 @@
 //!   motion pass measured 4.1 ms per frame at 1080p, and the previous-frame copy 0.46 ms).
 //! * `motion`: 40x23 vectors, one per 8x8 block of the analysis grid (the web's `mvT`), so it
 //!   costs the same at every internal size.
-//! * `prev_src`: last frame's source picture at the internal size, one image, written by a
-//!   `mosh_copy` pass after the feedback pass. The residual needs `src - prv` at the *layer's*
-//!   resolution: the 320x180 grid pair cannot stand in for it, because a static picture would
-//!   then have a non-zero residual wherever the grid copy lost detail, and every edge would ring.
-//!   Cost: one full-size copy pass per layer per frame, measured in `--release` on the reference
-//!   machine at **0.221 ms at 960x540 and 0.378 ms at 1280x720** (the whole mosh apply is 0.640
-//!   and 1.079 ms), against the ~6 ms 1080p frame budget. That is the price of the residual: a
-//!   second source target (a ping-pong `LayerSlot::scene`, which would let the *renderer* hand
-//!   over last frame's picture with no pass at all) is the obvious follow-up, but `LayerSlot`'s
-//!   public fields are frozen and it would move the copy out of this pass's lane.
+//! * `prev_src`: last frame's source picture at the internal size for the residual (`src - prv`
+//!   must run at the *layer's* resolution, not the 320x180 grid, so a static picture has zero
+//!   residual and never rings). When `src` is a ping-pong target written once per frame (the
+//!   normal case: `LayerSlot::scene` is a ping-pong `LayerTarget::new`), its back image *is*
+//!   last frame's picture and `mosh_feedback` samples it directly via `TargetSample::Previous`
+//!   with zero copy passes and zero extra memory. Only a single-image `src`
+//!   (`LayerTarget::new_single`) lazily allocates `prev_src` and runs `mosh_copy`.
 //! * the feedback buffer is `dst`'s own previous image: the mosh stage is the only writer of
 //!   `dst`, so its readable image *is* last frame's mosh output and no extra full-size target is
 //!   allocated. `valid` tracks whether that image may be used.
@@ -119,7 +116,7 @@
 //! the slot is bound to a 1x1 zero texture, which costs one texel per fragment.
 
 use mosh_core::AnalysisFrame;
-use mosh_render::{FrameRecorder, Gpu, LayerTarget, Pipeline, RenderError};
+use mosh_render::{FrameRecorder, Gpu, LayerTarget, Pipeline, RenderError, TargetSample};
 use mosh_shaders::spirv;
 
 /// The web app's analysis grid (`GS` in `gpu.js`): block matching always runs here, whatever the
@@ -179,8 +176,15 @@ struct LayerState {
     grid_front: usize,
     /// 40x23 displacement field, RG = grid pixels per frame, forward.
     motion: LayerTarget,
-    /// Last frame's source picture, at the layer's internal size, for the residual.
-    prev_src: LayerTarget,
+    /// Fallback copy of last frame's source picture, allocated lazily only when `src` is a
+    /// single-image target (`LayerTarget::new_single`). A ping-pong `src` (such as
+    /// `LayerSlot::scene`) already keeps last frame's image in its back half, so no copy pass
+    /// or extra target is needed.
+    prev_src: Option<LayerTarget>,
+    /// Identity and write counter of `src` on the last `apply`, to verify its back image is
+    /// still last frame's picture.
+    last_src_id: u64,
+    last_src_writes: u64,
     last_time_s: f64,
     /// True once the buffer in the caller's `dst` holds this layer's last output.
     valid: bool,
@@ -189,7 +193,7 @@ struct LayerState {
 }
 
 impl LayerState {
-    fn new(gpu: &Gpu, width: u32, height: u32) -> LayerState {
+    fn new(gpu: &Gpu) -> LayerState {
         LayerState {
             grids: [
                 LayerTarget::new(gpu, GRID[0] as u32, GRID[1] as u32),
@@ -197,7 +201,9 @@ impl LayerState {
             ],
             grid_front: 0,
             motion: LayerTarget::new(gpu, MOTION_WIDTH, MOTION_HEIGHT),
-            prev_src: LayerTarget::new_single(gpu, width, height),
+            prev_src: None,
+            last_src_id: 0,
+            last_src_writes: 0,
             last_time_s: f64::NAN,
             valid: false,
             skipres_frames: 0,
@@ -214,7 +220,6 @@ fn iframe_due(valid: bool, last_time_s: f64, frame: &AnalysisFrame) -> bool {
     let gap = frame.time_s - last_time_s;
     !(0.0..=IFRAME_GAP_S).contains(&gap)
 }
-
 
 impl MoshPass {
     /// `width`/`height`: the layers' internal size. Per-layer state (feedback, motion field) is
@@ -266,7 +271,7 @@ impl MoshPass {
         }
         let (width, height) = (self.width, self.height);
         if self.layers[layer].is_none() {
-            self.layers[layer] = Some(LayerState::new(rec.gpu(), width, height));
+            self.layers[layer] = Some(LayerState::new(rec.gpu()));
         }
         debug_assert_eq!(
             (dst.width(), dst.height()),
@@ -292,6 +297,8 @@ impl MoshPass {
         let next_grid = 1 - state.grid_front;
         rec.draw(grid, &state.grids[next_grid], &grid_uniform, &[src])?;
 
+        let src_id = src.id();
+        let src_writes = src.writes();
         if iframe {
             rec.draw(copy, dst, &copy_uniform, &[src])?;
         } else {
@@ -310,17 +317,45 @@ impl MoshPass {
             }
             let feedback_uniform = feedback_uniform(res, amount, GRID, skipres);
             let flow = extra_flow.unwrap_or(no_flow);
-            rec.draw(
+            // When `src` is a ping-pong target written once since our last call, its back image
+            // *is* last frame's source (zero copy). When `src` was not redrawn since last call,
+            // its current image is unchanged. Single-image targets fall back to `state.prev_src`.
+            let previous = if !src.is_single()
+                && src_id == state.last_src_id
+                && src_writes == state.last_src_writes.wrapping_add(1)
+            {
+                TargetSample::Previous(src)
+            } else if src_id == state.last_src_id && src_writes == state.last_src_writes {
+                TargetSample::Current(src)
+            } else if let Some(prev) = state.prev_src.as_ref() {
+                TargetSample::Current(prev)
+            } else {
+                TargetSample::Current(src)
+            };
+            rec.draw_samples(
                 feedback,
                 dst,
                 &feedback_uniform,
-                &[src, dst, &state.prev_src, &state.motion, flow],
+                &[
+                    TargetSample::Current(src),
+                    TargetSample::Current(dst),
+                    previous,
+                    TargetSample::Current(&state.motion),
+                    TargetSample::Current(flow),
+                ],
             )?;
         }
-        // The residual needs last frame's source, so every frame - I-frame or not - this frame's
-        // source becomes it. (The web app keeps the same picture in its `G.src` ping-pong.)
-        rec.draw(copy, &state.prev_src, &copy_uniform, &[src])?;
+        // Only single-image sources need an explicit `prev_src` copy: ping-pong sources keep last
+        // frame's picture in their other half for free.
+        if src.is_single() {
+            let prev = state
+                .prev_src
+                .get_or_insert_with(|| LayerTarget::new_single(rec.gpu(), width, height));
+            rec.draw(copy, prev, &copy_uniform, &[src])?;
+        }
         state.grid_front = next_grid;
+        state.last_src_id = src_id;
+        state.last_src_writes = src_writes;
 
         state.valid = true;
         state.last_time_s = frame.time_s;

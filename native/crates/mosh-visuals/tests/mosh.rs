@@ -1250,3 +1250,78 @@ fn invalidate_refreshes_the_buffer() {
     );
     assert_no_validation_messages(&gpu);
 }
+
+/// A ping-pong `src` (like `LayerSlot::scene`) keeps last frame's picture in its back image so
+/// `MoshPass::apply` samples it directly with no `mosh copy` pass on P-frames; a single-image
+/// `src` falls back to copying into `prev_src`. Both paths must produce bit-identical output.
+#[test]
+fn ping_pong_and_single_image_sources_produce_identical_mosh() {
+    let gpu = gpu();
+    let (width, height) = (320, 180);
+    let pattern = pipeline(&gpu, PATTERN_WGSL, 16, 0);
+    let mut mosh_pp = MoshPass::new(&gpu, width, height).expect("mosh pass ping-pong");
+    let mut mosh_single = MoshPass::new(&gpu, width, height).expect("mosh pass single");
+    let src_pp = LayerTarget::new(&gpu, width, height);
+    let dst_pp = LayerTarget::new(&gpu, width, height);
+    let src_single = LayerTarget::new_single(&gpu, width, height);
+    let dst_single = LayerTarget::new(&gpu, width, height);
+
+    let mut last_pp_passes: Vec<String> = Vec::new();
+    let mut last_single_passes: Vec<String> = Vec::new();
+    for step in 0..6u32 {
+        let x0 = 60.0 + 6.0 * step as f32;
+        let bar = vec4_uniform([x0, x0 + 24.0, 0.0, 0.0]);
+        let frame = AnalysisFrame {
+            time_s: step as f64 / 60.0,
+            ..Default::default()
+        };
+
+        let mut rec = FrameRecorder::new(&gpu);
+        rec.draw(&pattern, &src_pp, &bar, &[]).expect("pattern pp");
+        mosh_pp
+            .apply(&mut rec, 0, &src_pp, &dst_pp, 0.8, &frame, None)
+            .expect("mosh pp");
+        let timings_pp = gpu.wait_frame(rec.submit());
+
+        let mut rec = FrameRecorder::new(&gpu);
+        rec.draw(&pattern, &src_single, &bar, &[])
+            .expect("pattern single");
+        mosh_single
+            .apply(&mut rec, 0, &src_single, &dst_single, 0.8, &frame, None)
+            .expect("mosh single");
+        let timings_single = gpu.wait_frame(rec.submit());
+
+        if step > 0 {
+            last_pp_passes = timings_pp
+                .per_pass_ms
+                .iter()
+                .map(|(n, _)| (*n).to_string())
+                .collect();
+            last_single_passes = timings_single
+                .per_pass_ms
+                .iter()
+                .map(|(n, _)| (*n).to_string())
+                .collect();
+            assert!(
+                !last_pp_passes.iter().any(|n| n == "mosh copy"),
+                "frame {step}: ping-pong src must not record mosh copy on P-frames: {last_pp_passes:?}"
+            );
+            assert!(
+                last_single_passes.iter().any(|n| n == "mosh copy"),
+                "frame {step}: single-image src must record mosh copy fallback: {last_single_passes:?}"
+            );
+        }
+    }
+
+    let out_pp = gpu.read_back(&dst_pp);
+    let out_single = gpu.read_back(&dst_single);
+    assert_eq!(
+        out_pp, out_single,
+        "ping-pong zero-copy output differed from single-image fallback"
+    );
+    println!(
+        "ping-pong P-frame passes: {last_pp_passes:?} | single-image passes: {last_single_passes:?}"
+    );
+    assert_no_validation_messages(&gpu);
+}
+

@@ -376,6 +376,17 @@ fn shader_module(gpu: &Gpu, words: &[u32]) -> Result<vk::ShaderModule, RenderErr
     Ok(unsafe { gpu.dev.create_shader_module(&info, None) }?)
 }
 
+/// Which image of a [`LayerTarget`] a pass samples.
+#[derive(Clone, Copy)]
+pub enum TargetSample<'a> {
+    /// The target's current (most recently written) image.
+    Current(&'a LayerTarget),
+    /// The target's previous image (the other half of a ping-pong pair, or the same image on a
+    /// single-image target). Never pass `Previous(target)` when `target` is also the pass's
+    /// destination.
+    Previous(&'a LayerTarget),
+}
+
 /// Records the layer passes of one frame.
 ///
 /// `draw` writes one fragment shader pass into a layer target's back image, with the target's
@@ -482,6 +493,50 @@ impl<'a> FrameRecorder<'a> {
             );
         }
         let views: Vec<vk::ImageView> = inputs.iter().map(|input| input.front_view()).collect();
+        self.pass(pipeline, target, uniforms, &views)
+    }
+
+    /// Like [`Self::draw`], but each input chooses either the target's current image or the
+    /// previous image of a ping-pong pair.
+    pub fn draw_samples(
+        &mut self,
+        pipeline: &Pipeline,
+        target: &LayerTarget,
+        uniforms: &[u8],
+        inputs: &[TargetSample<'_>],
+    ) -> Result<(), RenderError> {
+        if inputs.len() != pipeline.layouts.textures as usize {
+            return Err(RenderError::InputCountMismatch {
+                expected: pipeline.layouts.textures,
+                got: inputs.len() as u32,
+            });
+        }
+        let mut views = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            match *input {
+                TargetSample::Current(src) => {
+                    debug_assert_eq!(
+                        src.front_layout(),
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        "layer target front must be readable when sampled"
+                    );
+                    views.push(src.front_view());
+                }
+                TargetSample::Previous(src) => {
+                    debug_assert_ne!(
+                        src.id(),
+                        target.id(),
+                        "cannot sample Previous of the destination target while writing it"
+                    );
+                    debug_assert_eq!(
+                        src.back_layout(),
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        "layer target back must be readable when sampled"
+                    );
+                    views.push(src.back_view());
+                }
+            }
+        }
         self.pass(pipeline, target, uniforms, &views)
     }
 

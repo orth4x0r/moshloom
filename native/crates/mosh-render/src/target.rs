@@ -6,10 +6,13 @@
 //! write image to `COLOR_ATTACHMENT_OPTIMAL` and back.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ash::vk;
 
 use crate::device::{Allocations, create_buffer, Gpu};
+
+static NEXT_TARGET_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Layer targets are half float: a feedback chain that adds a few percent per frame bands badly
 /// in 8 bits, and the compositor has the bandwidth for it at these resolutions.
@@ -129,6 +132,11 @@ pub struct LayerTarget {
     pair: ImagePair,
     layouts: [Cell<vk::ImageLayout>; 2],
     front: Cell<usize>,
+    /// Monotonic id unique to this allocation, so passes can tell whether they were handed the
+    /// same ping-pong target as last frame.
+    id: u64,
+    /// Incremented on every write (`swap`), including single-image targets.
+    writes: Cell<u64>,
     /// One image instead of a ping-pong pair: `back_*` is `front_*` and `swap` does nothing.
     single: bool,
     width: u32,
@@ -194,6 +202,8 @@ impl LayerTarget {
             },
             layouts,
             front: Cell::new(0),
+            id: NEXT_TARGET_ID.fetch_add(1, Ordering::Relaxed),
+            writes: Cell::new(0),
             single: count == 1,
             width,
             height,
@@ -206,6 +216,16 @@ impl LayerTarget {
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    /// Unique identifier for this target instance.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// How many passes have written to this target since creation.
+    pub fn writes(&self) -> u64 {
+        self.writes.get()
     }
 
     /// True when this target has one image (see [`LayerTarget::new_single`]).
@@ -250,12 +270,17 @@ impl LayerTarget {
         self.pair.views[self.back_index()]
     }
 
+    pub(crate) fn back_layout(&self) -> vk::ImageLayout {
+        self.layouts[self.back_index()].get()
+    }
+
     pub(crate) fn set_back_layout(&self, layout: vk::ImageLayout) {
         self.layouts[self.back_index()].set(layout);
     }
 
-    /// Makes the image just written the readable one (nothing to do with a single image).
+    /// Makes the image just written the readable one and records the write.
     pub(crate) fn swap(&self) {
+        self.writes.set(self.writes.get().wrapping_add(1));
         if !self.single {
             self.front.set(1 - self.front.get());
         }

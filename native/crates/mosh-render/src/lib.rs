@@ -110,7 +110,7 @@ pub use device::submission_count;
 pub use device::{Gpu, GpuPreference, MAX_UNIFORM_BYTES};
 pub use flash::{FlashLimiter, FLASH_INTERVAL};
 pub use pace::{FramePacer, WaitTimer, DEFAULT_MAX_FPS};
-pub use pipeline::{FrameRecorder, Pipeline};
+pub use pipeline::{FrameRecorder, Pipeline, TargetSample};
 pub use readback::{AsyncReadback, Readback, READBACK_DELAY};
 pub use swapchain::{
     MonitorId, PresentResult, Stage, SwapchainAction, SwapchainPolicy, STAGE_FORMAT,

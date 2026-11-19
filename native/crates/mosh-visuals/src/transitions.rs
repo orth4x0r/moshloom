@@ -115,7 +115,7 @@ impl TransitionPass {
         };
         if stale {
             self.saved[layer] = Some(SavedLayer {
-                target: LayerTarget::new(rec.gpu(), from.width(), from.height()),
+                target: LayerTarget::new_single(rec.gpu(), from.width(), from.height()),
             });
         }
         let saved = self.saved[layer].as_ref().expect("saved above");
