@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use mosh_core::show::BlendMode;
 use mosh_render::{
     Compositor, FlashLimiter, FrameRecorder, Gpu, GpuPreference, LayerTarget, OutputImage, Pipeline,
-    SwapchainAction, SwapchainPolicy,
+    RenderError, SwapchainAction, SwapchainPolicy, MAX_UNIFORM_BYTES,
 };
 
 /// A fragment shader that writes its uniform `color`.
@@ -42,6 +42,21 @@ struct Params {
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     return textureSample(source, source_sampler, uv) + params.amount;
+}
+"#;
+
+/// A shader whose uniform block is the crate's whole cap: 256 `vec4`s, 4096 bytes. It returns the
+/// last one, so a draw proves the end of a full-size block actually reached the GPU.
+const BIG_UNIFORM_WGSL: &str = r#"
+struct Params {
+    values: array<vec4<f32>, 256>,
+};
+
+@group(0) @binding(0) var<uniform> params: Params;
+
+@fragment
+fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    return params.values[255];
 }
 "#;
 
@@ -178,6 +193,75 @@ fn solid_color_shader_reads_back() {
         timings.frame_ms
     );
     assert_no_validation_messages(&gpu);
+}
+
+/// The cap is 4096 bytes because the text layer's block is 1008 and one more field would not fit
+/// in 1024. A pipeline at the cap must create, take a full-size uniform slice out of the ring and
+/// draw; one byte past it must still be `UniformTooLarge`, not a silent truncation.
+#[test]
+fn uniform_block_at_the_cap_creates_and_draws() {
+    assert_eq!(
+        MAX_UNIFORM_BYTES, 4096,
+        "the cap the layer crates are written against"
+    );
+
+    // What the cap costs: the uniform ring is the only allocation a fresh device makes, and its
+    // stride is `align_up(MAX_UNIFORM_BYTES, minUniformBufferOffsetAlignment)`. Vulkan guarantees
+    // that alignment is at most 256, so 4096 is the stride on every device: 4096 B x 256 draws x
+    // 2 frame slots = 2 MiB, where 1024 used to cost 512 KiB. It is allocated once, not per frame.
+    let fresh = gpu();
+    assert_eq!(
+        fresh.allocation_count(),
+        1,
+        "the uniform ring is a fresh device's only allocation"
+    );
+    assert!(
+        fresh.allocated_bytes() >= MAX_UNIFORM_BYTES * 2 * 256,
+        "the ring holds the cap for all 256 draws of both frame slots: {} B",
+        fresh.allocated_bytes()
+    );
+    println!(
+        "uniform ring: {} B (the 1024-byte cap cost 512 KiB)",
+        fresh.allocated_bytes()
+    );
+
+    let gpu = fresh;
+    let size = MAX_UNIFORM_BYTES as usize;
+    let pipeline = Pipeline::fullscreen(&gpu, &spirv(BIG_UNIFORM_WGSL), size, 0)
+        .expect("a pipeline with a 4096-byte uniform block");
+    let target = LayerTarget::new(&gpu, 8, 8);
+
+    // The shader reads the block's last vec4; everything before it is padding that a real layer
+    // fills with its own fields.
+    let mut uniforms = vec![0u8; size];
+    let last = size - 16;
+    for (index, value) in [0.25f32, 0.5, 0.75, 1.0].iter().enumerate() {
+        uniforms[last + index * 4..last + index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    let mut recorder = FrameRecorder::new(&gpu);
+    recorder
+        .draw(&pipeline, &target, &uniforms, &[])
+        .expect("draw with a 4096-byte uniform block");
+    let timings = gpu.wait_frame(recorder.submit());
+
+    let pixels = gpu.read_back(&target);
+    assert_all_pixels(&pixels, [64, 128, 191, 255], 1, "4096-byte uniform");
+    println!(
+        "4096-byte uniform readback: {:?}, frame {:.3} ms, live device memory {} B in {} allocations",
+        first_pixel(&pixels),
+        timings.frame_ms,
+        gpu.allocated_bytes(),
+        gpu.allocation_count()
+    );
+    assert_no_validation_messages(&gpu);
+
+    let beyond = Pipeline::fullscreen(&gpu, &spirv(SOLID_WGSL), size + 16, 0);
+    match beyond {
+        Err(RenderError::UniformTooLarge { max, .. }) => assert_eq!(max, MAX_UNIFORM_BYTES),
+        Err(other) => panic!("wrong error for a block past the cap: {other:?}"),
+        Ok(_) => panic!("a uniform block past the cap must be refused, not truncated"),
+    }
 }
 
 #[test]
