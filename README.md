@@ -471,11 +471,13 @@ number — it is the same work minus presentation.
 | **windowed run of the default show** (no project, Autopilot, mosh-feed at 163 BPM, 22 s in) | the stage is wall-to-wall block mosh: 8x8 blocks carried and recoloured by the residual, the underlying scenes no longer readable; warm-up GPU mean 2.60 ms, no budget line. Heavy by design of the web's leak (0.004 a frame above m 0.67); whether the default amounts should be lower is a taste call left to the human |
 | text layer #61 (continuous field, GPOS kerning, wrap) | one distance field per line from cached glyph tiles (no cell clipping); Unbounded / Grenze Gotisch / Space Grotesk; GPOS PairPos kerning (Space Grotesk AV -0.055 em, To -0.103, Ty -0.079); word wrap with a 7-line / 600-char cap, char-safe on multibyte text; typing 18..59 chars worst 1.0 ms (isolated), first use of a 20-char text 8-21 ms, repeat 0.0004 ms, GPU pass 0.14 ms at 960x540. Reviewed by DeepSeek then GLM-5.3 (kerning mutation-verified) |
 | **windowed orientation run** (text over a test video: red top band, blue bottom band, yellow mark upper-left) | the word reads upright on the stage; the **overlay video is upside down** (blue on top, mark in the lower third), left-right correct. Cause: overlay, HAP and camera shaders assume two flips on the way to the screen, there is one (the compositor). |
-| overlay, HAP and camera upright (O-orient, merged 61fb446) | the three shaders no longer flip v; `tests/orientation.rs` composites LayerTarget -> Compositor -> OutputImage for overlay BGRA, HAP1, camera and text (red top band at output row 0, blue at the bottom, marker upper-left), and fails on the old shaders (GLM-5.3 Flash reproduced). Windowed rerun: the test video plays upright (red top, mark upper-left) and the webcam is upright. Still open: web scenes that draw by `@builtin(position)` are V-mirrored versus the web (spectrum, scan), and the control window's clip thumbnails are mirrored versus the stage |
-| sigil text look (L-text-3, merged 3ab85d6) | uppercase Grenze Gotisch, whip thorns 0.24-0.60 of a line's height with needle tips, S-curves and barbs (up to 20, none over another word or a space), a mirrored bramble mark either side, seeded by the text; GPOS kerning sums across lookups (a test fails on the old rule); the uniform reflection test pins every member offset. Sigil pass 0.96 ms vs clean 0.68 ms at 1080p (GLM-5.3). Windowed: thorns and marks draw on the stage; a single long word ("ilanaVisual") is hard-broken into two lines by the 9-advance wrap, to fix |
-| **app wiring** (#60: camera, text, HAP, Adjustment/Mask, stem taps; windowed, stage 1075x655, 163 BPM feed) | camera clip shows the live webcam; a Mask layer lights the text only where the sigil halo is bright; an Adjustment (Negative + Mirror) inverts and mirrors the whole stack below it. Steady state over 20 one-second windows (`ILANAVISUAL_BUDGET_LOG=1`): camera + mask + text + adjustment 0.32-0.66 ms render thread, 8.3-10.7 ms GPU (stack waits included) vs the stress project's 0.56-0.95 / 7.4-9.3 ms in the same window. Text draws upside down (sent to L-text-2); HAP and stem taps not yet run with a real HAP file or Tap instances in Live |
-| **stress project**, `mosh-budget`, offscreen release, **1920x1080 output, 960x540 layers**, 300 frames | **GPU median 4.82 ms, p95 6.05 ms** (steady frames: median 4.79, p95 4.99; 2-beat 4-layer crossfade frames: median 6.02, max 6.23) against a 6 ms budget; render-thread CPU (recording + overlay upload) median 0.82 ms; 132 MB of targets and textures |
-| **stress project**, same bench at **2560x1600** (the laptop panel, 1280x800 layers) | GPU median 9.15 ms, p95 11.57 ms (steady 8.84 / 9.99; crossfade 10.56); CPU median 1.30 ms; 232 MB |
+| overlay, HAP and camera upright (O-orient, merged 61fb446) | the three shaders no longer flip v; `tests/orientation.rs` composites LayerTarget -> Compositor -> OutputImage for overlay BGRA, HAP1, camera and text (red top band at output row 0, blue at the bottom, marker upper-left), and fails on the old shaders (GLM-5.3 Flash reproduced). Windowed rerun: the test video plays upright (red top, mark upper-left) and the webcam is upright |
+| scene & clip-thumbnail orientation (merged 23f03c7) | `wrap_stage_y` flips `@builtin(position).y` in place (preserving line numbers) for web, style, and custom scene shaders (skipping lookup tables), and `ReadbackSource.flip_y` flips target readback so clip thumbnails match the stage; `tests/orientation.rs` 7/7 pass (overlay, HAP, camera, text, scan, spectrum, custom scene, clip thumbnail), 0 validation messages |
+| sigil text look (L-text-3 `3ab85d6`, L-text-4 `9b822e4`) | uppercase Grenze Gotisch, whip thorns 0.24-0.60 of a line's height with needle tips, S-curves and barbs (up to 20, kept clear of other words, spaces, and flanking marks), a mirrored bramble mark either side, seeded by the text; GPOS kerning sums across lookups; path-length reach bound instead of chord length; single words up to 18 advances stay on one line ("ilanaVisual" no longer hard-breaks); uniform reflection test pins every member offset; mirrored-mark GPU draw test passes. Sigil pass 0.96 ms vs clean 0.68 ms at 1080p |
+| Vulkan enumeration retry & uniform cap (N-render-incomplete `f33d04d`) | retries `VK_INCOMPLETE` across 6 Vulkan enumeration calls (instance/device extensions, devices, queues, surface formats, present modes, swapchain images) and raises `MAX_UNIFORM_BYTES` from 1024 to 4096 |
+| **app wiring** (#60: camera, text, HAP, Adjustment/Mask, stem taps; windowed, stage 1075x655, 163 BPM feed) | camera clip shows the live webcam; a Mask layer lights the text only where the sigil halo is bright; an Adjustment (Negative + Mirror) inverts and mirrors the whole stack below it. Steady state over 20 one-second windows (`ILANAVISUAL_BUDGET_LOG=1`): camera + mask + text + adjustment 0.32-0.66 ms render thread, 8.3-10.7 ms GPU (stack waits included) vs the stress project's 0.56-0.95 / 7.4-9.3 ms in the same window. Text draws upside down (fixed in L-text-2); HAP and stem taps not yet run with a real HAP file or Tap instances in Live |
+| **stress project**, `mosh-budget`, offscreen release, **1920x1080 output, 960x540 layers**, 300 frames (`080a140`, web-faithful datamosh + ring motion + zero-copy `prev_src`) | **GPU median 4.93 ms, p95 6.40 ms** (steady frames: median 4.82, p95 5.75; 2-beat 4-layer crossfade frames: median 6.21, max 9.09) vs 7.55 / 9.16 ms before optimization (and 4.82 / 6.05 ms before web-faithful datamosh); `mosh motion` 0.41 ms (was 2.05 ms), `mosh copy` eliminated (was 0.44 ms); render-thread CPU median 1.16 ms; 148.0 MB of targets and textures |
+| **stress project**, same bench at **2560x1600** (the laptop panel, 1280x800 layers, `080a140`) | **GPU median 9.02 ms, p95 11.52 ms** (steady 8.79 / 9.75; crossfade 11.08, max 13.05) vs 11.54 / 14.11 ms before optimization (faster than pre-web-faithful 9.15 / 11.57 ms); CPU median 1.31 ms; 263.7 MB |
 | **stress project windowed on the laptop panel after V-budget** (2560x1600, 60 fps cap, release, on AC at 100%, display on) | GPU 7.2-8.5 ms per frame (one 11.8 ms sample), render thread 0.34-0.74 ms, process 8.7% of one core, 460-463 MB working set |
 | stress project on the laptop panel, windowed at 120 Hz, before the frame cap and the profile (release, 2.6 Mpx panels, FIFO) | GPU 20-24 ms per frame, render thread 1.0-1.7 ms, process 18% of one core, 593 MB — twice the pixels and twice the frame rate of the budget's case |
 | **first app run**, loopback, nothing playing (release, integrated GPU, laptop screen only) | GPU 0.70-0.75 ms, render thread 0.05-0.11 ms per frame; process about 5.5% of one core; 322 MB |
@@ -524,19 +526,21 @@ in 9 of 12 cases (was 2 of 10). "reza pedia": bars 9-23 now average level 3.0 an
 4.0 (both were ~3.9). `Analyzer::push` stays at 32-37 us per 256-sample block (release), 54-90 us
 with drum and bass stems fed through `push_stem` (budget 200 us).
 
-Known gap: the stress project's *steady* 1080p frame is inside the 6 ms GPU budget (p95 4.99 ms),
-and so is a 2-beat crossfade frame on its own (median 6.02 ms), but the 300-frame run's p95 is
-6.05 ms: 20% of those frames carry a four-layer crossfade, so the p95 frame *is* one. What is left
-to cut, in the order the profile says: the compositor samples four 960x540 layers with a bilinear
-upscale at the output size (0.69 ms), then effects (0.73), the two motion estimates (0.72), the
-two datamosh feedbacks (0.65), the overlay upload (0.40) and the fluid solver plus its present pass
-(0.47). `mosh-budget` prints that table; `mosh-stress-project out.ron <video>` writes the project.
-Memory: the renderer holds 124 MB at 1080p and 217 MB at 2560x1600 with four layers, plus the
-driver's swapchain (~25 MB at 1080p, ~49 MB at 2560x1600) and the app's own heap; the windowed
-process working set was 593 MB at 2560x1600 before this pass and 460-463 MB after (windowed,
-under the 500 MB budget, with one video).
-Candidate for the next pass: the two remaining ping-pong pairs per layer (the scene and transition
-targets already hold one image each), ~2 MB per layer per pair at 1080p.
+Known gap: after web-faithful datamosh + `080a140` (ring-outward motion search and zero-copy
+ping-pong `prev_src`), the stress project's *steady* 1080p frame is inside the 6 ms GPU budget
+(median 4.82 ms, p95 5.75 ms), while the 300-frame run's p95 is 6.40 ms (down from 9.16 ms before
+`080a140`) because 20% of those frames carry a four-layer 2-beat crossfade (median 6.21 ms). What
+is left to cut at 1080p, in the order the profile says: effects (0.76 ms), the two datamosh
+feedbacks (0.75 ms), the compositor sampling four 960x540 layers (0.71 ms), numogram (0.69 ms),
+the overlay upload (0.42 ms), the two motion estimates (0.41 ms, down from 2.05 ms), and the fluid
+solver plus its present pass (0.55 ms). `mosh-budget` prints that table;
+`mosh-stress-project out.ron <video>` writes the project.
+Memory: `mosh-budget` reports 148.0 MB of targets and textures at 1080p (110.7 MB across 4 layers
+with ping-pong `scene`, `mosh`, and `effects` targets plus single-image `transition` and saved
+transition frames, 23.7 MB overlay texture + staging, 7.9 MB output, 5.6 MB visuals) and 263.7 MB
+at 2560x1600, plus the driver's swapchain (~25 MB at 1080p, ~49 MB at 2560x1600) and the app's own
+heap; the windowed process working set was 593 MB at 2560x1600 before V-budget and 460-463 MB after
+(under the 500 MB budget, with one video).
 
 Not measured yet: anything in Ableton, a second monitor, the app on battery, latency from audio to
 picture. Those are coordinator runs on the reference machine once the app lands.
