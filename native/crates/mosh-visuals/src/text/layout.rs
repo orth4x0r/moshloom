@@ -593,7 +593,7 @@ impl Face {
                     }
                 }
                 if break_at == first {
-                    // One word wider than a while line: cut it, but in balanced chunks — a word
+                    // One word wider than a whole line: cut it, but in balanced chunks — a word
                     // that is cut must not leave a two-letter tail on a line of its own.
                     break_at = chunk_end(&chars, &widths, first, wrap);
                 }

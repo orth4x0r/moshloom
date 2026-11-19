@@ -23,7 +23,7 @@
 // and no thorn crosses a space into the next word.
 //
 // Uniform block (1008 bytes, matches `text::UNIFORM_BYTES`; mosh-render caps a per-draw block at
-// 1024, so this is sixteen bytes — half a stroke — under that cap):
+// `mosh_render::MAX_UNIFORM_BYTES` = 4096):
 //   0  dst: vec2f          8  sheet: vec2f
 //   16 inset_min: vec2f    24 inset_max: vec2f
 //   32 p0: vec4f (p0..p3)  48 p1: vec4f (p4..p7)

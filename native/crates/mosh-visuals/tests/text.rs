@@ -1384,13 +1384,15 @@ fn the_mirrored_mark_draws_on_both_sides() {
 #[test]
 fn a_text_layer_fits_the_uniform_cap() {
     let gpu = gpu();
-    // `Pipeline::fullscreen` refuses a block over `mosh_render::device::MAX_UNIFORM_BYTES` (1024
-    // bytes, private to that crate) with `UniformTooLarge`; the text block is 1008 — 112 bytes of
-    // scalars, 20 thorn strokes and 8 mark strokes of 32 bytes. This constructor succeeding is the
-    // assertion that it fits; `text::tests::the_uniform_block_fits_the_render_crate_cap` pins the
-    // numbers, and one more stroke would not fit.
+    // `Pipeline::fullscreen` refuses a block over `mosh_render::MAX_UNIFORM_BYTES` (4096 bytes)
+    // with `UniformTooLarge`; the text block is 1008 — 112 bytes of scalars, 20 thorn strokes and
+    // 8 mark strokes of 32 bytes. This constructor succeeding is the GPU-side assertion that it
+    // fits; `text::tests::the_uniform_block_fits_the_render_crate_cap` pins the numbers.
     let _layer = TextLayer::new(&gpu).expect("the text pass's uniform block fits mosh-render's cap");
-    println!("TextLayer::new: a 1008-byte uniform block against a 1024-byte cap");
+    println!(
+        "TextLayer::new: a 1008-byte uniform block against a {}-byte cap",
+        mosh_render::MAX_UNIFORM_BYTES
+    );
     assert_no_validation_messages(&gpu);
 }
 

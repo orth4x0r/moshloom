@@ -666,15 +666,12 @@ mod tests {
         }
     }
 
-    /// The uniform block's size against `mosh-render`'s cap. `MAX_UNIFORM_BYTES` (1024) lives in
-    /// that crate's private `device` module, so the number is mirrored here; the failure it guards
-    /// is `Pipeline::fullscreen` returning `UniformTooLarge`, which would make `TextLayer::new`
-    /// fail. The block is at the edge of the cap on purpose-of-construction: 28 strokes fit and 29
-    /// do not, so a lane that adds linework has to see this test (and the cap, which is being
-    /// raised to 4096 separately) before it adds the thirtieth.
+    /// The uniform block's size against `mosh-render`'s cap (`mosh_render::MAX_UNIFORM_BYTES`,
+    /// 4096 bytes). Guards against `Pipeline::fullscreen` returning `UniformTooLarge` and failing
+    /// `TextLayer::new` when new linework or fields are added.
     #[test]
     fn the_uniform_block_fits_the_render_crate_cap() {
-        const RENDER_CAP: usize = 1024;
+        let render_cap = mosh_render::MAX_UNIFORM_BYTES as usize;
         // The block's size as the shader declares it, so this is a measured number and not a
         // constant the compiler folds away (which would make the assertion a tautology to clippy).
         let module = naga::front::wgsl::parse_str(SHADER).expect("text.wgsl parses");
@@ -690,22 +687,17 @@ mod tests {
         let block = *span as usize;
         println!(
             "text uniform block {block} bytes (text.rs writes {UNIFORM_BYTES}), mosh-render's cap \
-             {RENDER_CAP}, headroom {}",
-            RENDER_CAP.saturating_sub(block)
+             {render_cap}, headroom {}",
+            render_cap.saturating_sub(block)
         );
         assert_eq!(
             block, UNIFORM_BYTES,
             "the shader's block and the bytes text.rs writes must be the same size"
         );
         assert!(
-            block <= RENDER_CAP,
-            "the text pass's {block}-byte uniform block exceeds mosh-render's cap of {RENDER_CAP}: \
+            block <= render_cap,
+            "the text pass's {block}-byte uniform block exceeds mosh-render's cap of {render_cap}: \
              TextLayer::new would fail with UniformTooLarge"
-        );
-        assert!(
-            block + THORN_BYTES > RENDER_CAP,
-            "the block is {block} bytes; this test assumes it is within one stroke of the \
-             {RENDER_CAP}-byte cap, which is its bounds check"
         );
     }
 
