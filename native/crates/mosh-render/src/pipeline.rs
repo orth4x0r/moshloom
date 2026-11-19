@@ -17,8 +17,8 @@ use mosh_core::show::BlendMode;
 use crate::RenderError;
 use crate::device::{FRAMES_IN_FLIGHT, Gpu, MAX_DRAWS_PER_FRAME, MAX_UNIFORM_BYTES};
 use crate::target::{
-    Barrier, LayerTarget, OFFSCREEN_FORMAT, cmd_barrier, from_transfer_write, to_color_attachment,
-    to_shader_read, to_transfer_dst,
+    Barrier, LayerTarget, OFFSCREEN_FORMAT, cmd_barrier, from_transfer_write,
+    to_color_attachment_discard, to_shader_read, to_transfer_dst,
 };
 use crate::timing::{FrameTicket, GpuTimings};
 use crate::upload::VideoTexture;
@@ -807,23 +807,19 @@ impl<'a> FrameRecorder<'a> {
                 &self.gpu.dev,
                 self.cmd,
                 target.back_image(),
-                to_color_attachment(),
+                to_color_attachment_discard(),
             );
 
             let query = self.draws * 2;
             self.write_timestamp(query, vk::PipelineStageFlags::TOP_OF_PIPE);
 
-            let clear = vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.0, 0.0, 0.0, 0.0],
-                },
-            };
+            // Every fullscreen pass draws one unblended triangle covering the whole target with no
+            // `discard`, so clearing before writing is a wasted full-target VRAM write.
             let attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(target.back_view())
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(clear);
+                .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .store_op(vk::AttachmentStoreOp::STORE);
             let attachments = [attachment];
             let rendering = vk::RenderingInfo::default()
                 .render_area(extent)

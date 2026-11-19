@@ -40,16 +40,19 @@ fn smoothstep01(x: f32) -> f32 { let t = clamp(x, 0., 1.); return t * t * (3. - 
 fn hh(p: vec2f) -> f32 { return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453); }
 
 @fragment fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
-  let uv = pos.xy / T.res;
+  let px = vec2i(pos.xy);
   let p = smoothstep01(T.progress);
-  let b = textureSampleLevel(srcT, smp2, uv, 0.).rgb;
-  var c = textureSampleLevel(fromT, smp, uv, 0.).rgb;
+  let b = textureLoad(srcT, px, 0).rgb;
+  var c: vec3f;
 
   if (T.mode == 2.) {
     // Melt: the old picture sags by a per-column drip while the new one fades in over it.
+    let uv = pos.xy / T.res;
     let cols = 24.;
     let drip = ((hh(vec2f(floor(uv.x * cols), 7.)) - 0.5) * 0.12 + 0.06) * p;
     c = textureSampleLevel(fromT, smp, uv + vec2f(0., -drip), 0.).rgb;
+  } else {
+    c = textureLoad(fromT, px, 0).rgb;
   }
 
   c = mix(c, b, p);

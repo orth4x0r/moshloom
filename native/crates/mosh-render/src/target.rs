@@ -77,6 +77,20 @@ pub(crate) fn to_color_attachment() -> Barrier {
     }
 }
 
+/// Same dependency as [`to_color_attachment`], but discards prior image contents (`old_layout =
+/// UNDEFINED`) for full-screen passes that overwrite every pixel with `LOAD_OP_DONT_CARE`.
+pub(crate) fn to_color_attachment_discard() -> Barrier {
+    Barrier {
+        old_layout: vk::ImageLayout::UNDEFINED,
+        new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        src_stage: vk::PipelineStageFlags::FRAGMENT_SHADER
+            | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+    }
+}
+
 pub(crate) fn to_shader_read() -> Barrier {
     Barrier {
         old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,

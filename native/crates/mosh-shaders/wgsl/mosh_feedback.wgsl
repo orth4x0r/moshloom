@@ -62,26 +62,33 @@ struct FU {
 const BLOCKS: vec2<f32> = vec2<f32>(40.0, 22.5);
 
 /// `G.nm`'s mirror-repeat wrap of one texel index (`gpu.js:639`): `0, 1, ... n-1, n-1, ... 0`.
+/// Fast-paths the common in-bounds and single-reflection ranges so the GPU avoids two 32-bit
+/// signed integer divisions per axis on 99%+ of pixels.
 fn mirror(index: i32, n: i32) -> i32 {
+    if (index >= 0 && index < n) {
+        return index;
+    }
+    if (index >= -n && index < 0) {
+        return -1 - index;
+    }
+    if (index >= n && index < 2 * n) {
+        return 2 * n - 1 - index;
+    }
     let period = 2 * n;
     let wrapped = ((index % period) + period) % period;
-    if (wrapped < n) {
-        return wrapped;
-    }
-    return period - 1 - wrapped;
+    return select(period - 1 - wrapped, wrapped, wrapped < n);
 }
 
 @fragment
 fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(i32(pos.x), i32(pos.y));
     let res = vec2<i32>(i32(f.res.x), i32(f.res.y));
-    // `s` and `prv` are read at this pixel's centre, which is the texel itself through any filter.
-    let fresh = textureLoad(srcT, pixel, 0).rgb;
+    let uv = pos.xy / f.res;
 
     // One vector per block of the analysis grid, read straight out of the 40x23 field: no
     // filtering, so the displacement steps by a whole block at a block edge (`textureLoad(mvT,
     // bc, 0)` in `WG_FB`).
-    var bc = vec2<i32>(floor((pos.xy / f.res) * BLOCKS));
+    var bc = vec2<i32>(floor(uv * BLOCKS));
     bc = clamp(bc, vec2<i32>(0, 0), vec2<i32>(39, 22));
     if (f.coarse > 0.5) {
         bc = bc & vec2<i32>(-2);
@@ -92,11 +99,11 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     // carried picture moves *against* the field. Same here: this is a sample offset, and `flow` is
     // added to it rather than subtracted. The web scales by `0.03` because its velocity is in uv
     // per second; this one is already pixels per frame, so the factor is 1.
-    let flow = textureSampleLevel(velT, velS, pos.xy / f.res, 0.0).xy;
+    let flow = textureSampleLevel(velT, velS, uv, 0.0).xy;
     // The web rounds the displacement to whole output pixels after the gain, which is what makes
     // the smear hold still for a frame instead of sliding sub-pixel. `motion` is the forward
     // displacement in grid pixels, so the sample offset it comes from is `-shift`.
-    let shift = round(motion * (f.gain * f.mv_scale) * f.res / f.grid);
+    let shift = round(motion * ((f.gain * f.mv_scale) * (f.res / f.grid)));
 
     // The web samples the buffer with `G.nm` - nearest, mirror-repeat (`gpu.js:639`), so a
     // displacement of whole pixels is exactly a texel, and a smear that leaves the frame mirrors
@@ -107,6 +114,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     var c = textureLoad(bufT, at, 0).rgb;
     if (f.skipres < 0.5) {
+        let fresh = textureLoad(srcT, pixel, 0).rgb;
         let previous = textureLoad(prvT, pixel, 0).rgb;
         c = c + fresh - previous;
         c = mix(c, fresh, clamp(f.leak, 0.0, 1.0));

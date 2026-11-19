@@ -39,23 +39,51 @@ fn tx(uv: vec2f) -> vec3f { return textureSampleLevel(inT, smp, uv, 0.).rgb; }
 fn lum(c: vec3f) -> f32 { return dot(c, vec3f(0.3, 0.59, 0.11)); }
 
 @fragment fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
-  let asp = vec2f(E.res.x / max(E.res.y, 1.), 1.);
-  let p0 = (pos.xy / E.res - 0.5) * asp;
+  let inv_res = 1. / E.res;
+  let uv0 = pos.xy * inv_res;
+  let px = vec2i(pos.xy);
+  var uv = uv0;
+  var c: vec3f;
 
   // Zoom and spin: a geometric transform about the centre, blended by its own amount (in the web
-  // app these are feedback transforms; see the header).
-  let spin = 0.45 * E.fxa.w * select(1., -1., E.fpa.w > 0.5);
-  let zoom = 1. - 0.4 * E.fxa.z * select(1., -1., E.fpa.z > 0.5);
-  var p = vec2f(p0.x * cos(spin) - p0.y * sin(spin), p0.x * sin(spin) + p0.y * cos(spin)) * zoom;
-  var uv = p / asp + 0.5;
-  var c = tx(uv);
+  // app these are feedback transforms; see the header). Skip trig and bilinear filtering when
+  // neither zoom nor spin is active.
+  let has_spin = E.fxa.w > 0.;
+  let has_zoom = E.fxa.z > 0.;
+  let need_asp = has_spin || E.fxa.x > 0.;
+  var asp = vec2f(1., 1.);
+  var p = uv0 - 0.5;
+  if (need_asp) {
+    asp = vec2f(E.res.x / max(E.res.y, 1.), 1.);
+    p = p * asp;
+  }
+  if (has_spin || has_zoom) {
+    let zoom = 1. - 0.4 * E.fxa.z * select(1., -1., E.fpa.z > 0.5);
+    if (has_spin) {
+      let spin = 0.45 * E.fxa.w * select(1., -1., E.fpa.w > 0.5);
+      let cs = cos(spin);
+      let sn = sin(spin);
+      p = vec2f(p.x * cs - p.y * sn, p.x * sn + p.y * cs) * zoom;
+      uv = p / asp + 0.5;
+    } else {
+      p = p * zoom;
+      uv = (uv0 - 0.5) * zoom + 0.5;
+    }
+    c = tx(uv);
+  } else {
+    c = textureLoad(inT, px, 0).rgb;
+  }
 
-  // Mirror: fold the picture onto its left (and top) half.
+  // Mirror: fold the picture onto its left (and top) half. Mirrored pixel centers are exact texels
+  // (no bilinear filter needed), and pixels already in the target half reuse `c` when unwarped.
   if (E.fxa.y > 0.) {
-    var pm = p0;
-    pm.x = -abs(pm.x);
-    if (E.fpa.y > 0.5) { pm.y = -abs(pm.y); }
-    c = mix(c, tx(pm / asp + 0.5), E.fxa.y);
+    let res_i = vec2i(E.res);
+    let mx = min(px.x, res_i.x - 1 - px.x);
+    let my = select(px.y, min(px.y, res_i.y - 1 - px.y), E.fpa.y > 0.5);
+    if (mx != px.x || my != px.y || has_spin || has_zoom) {
+      let mc = textureLoad(inT, vec2i(mx, my), 0).rgb;
+      c = mix(c, mc, E.fxa.y);
+    }
   }
 
   // Fold: a kaleidoscope with `round(2 + 10 * param)` wedges, as in WG_PRE.
@@ -73,7 +101,7 @@ fn lum(c: vec3f) -> f32 { return dot(c, vec3f(0.3, 0.59, 0.11)); }
   // Crush: block quantise, then posterise to fewer levels as the amount rises.
   if (E.fxb.y > 0.) {
     let bs = max(mix(4., 40., clamp(E.fpb.y, 0., 1.)) * E.res.y / 360., 1.);
-    c = mix(c, tx((floor(uv * E.res / bs) + 0.5) * bs / E.res), E.fxb.y);
+    c = mix(c, tx((floor(uv * E.res / bs) + 0.5) * bs * inv_res), E.fxb.y);
     let levels = mix(24., 2.5, clamp(E.fxb.y, 0., 1.));
     c = floor(c * levels + 0.5) / levels;
   }

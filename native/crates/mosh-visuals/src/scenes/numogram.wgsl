@@ -76,27 +76,75 @@ fn sin_b(k: i32) -> f32 {
   return v;
 }
 
-/// Squared distance from `p` to the segment `a`-`b`, in the units `p` arrives in.
-fn seg2(p: vec2f, a: vec2f, b: vec2f) -> f32 {
+/// Squared distance from `p` to the segment `a -> a + ba`, where `inv_baba = 1 / dot(ba, ba)`
+/// is a compile-time constant (zero divisions per segment).
+fn seg2_c(p: vec2f, a: vec2f, ba: vec2f, inv_baba: f32) -> f32 {
   let pa = p - a;
-  let ba = b - a;
-  let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-9), 0., 1.);
+  let h = clamp(dot(pa, ba) * inv_baba, 0., 1.);
   let d = pa - ba * h;
   return dot(d, d);
 }
 
+/// Squared distance from `p` to a horizontal segment `[-hx, +hx]` at `y = y0`.
+fn hseg2(p: vec2f, hx: f32, y0: f32) -> f32 {
+  let dx = max(abs(p.x) - hx, 0.);
+  let dy = p.y - y0;
+  return dx * dx + dy * dy;
+}
+
+// Precomputed segment vectors and inverse squared lengths for the non-horizontal segments.
+// LP angled edge (after folding into the first quadrant): (0.55, 0.0) -> (0.30, 0.35).
+const LP_A = vec2f(0.55, 0.0);
+const LP_BA = vec2f(-0.25, 0.35);
+const LP_INV = 5.40540541; // 1 / (0.25^2 + 0.35^2) = 1 / 0.185
+
+// GT non-horizontal segments:
+// 2->3: (-0.30, 0.35) -> (-0.25, -0.75)
+const GT0_BA = vec2f(0.05, -1.10);
+const GT0_INV = 0.82474227; // 1 / (0.0025 + 1.21)
+// 4->1: (-0.30, -0.35) -> (-0.55, 0.0)
+const GT1_BA = vec2f(-0.25, 0.35);
+const GT1_INV = 5.40540541; // 1 / 0.185
+// 5->6: (0.30, -0.35) -> (0.25, -0.75)
+const GT2_BA = vec2f(-0.05, -0.40);
+const GT2_INV = 6.15384615; // 1 / (0.0025 + 0.16)
+// 7->1: (0.30, 0.35) -> (-0.55, 0.0)
+const GT3_BA = vec2f(-0.85, -0.35);
+const GT3_INV = 1.18343195; // 1 / (0.7225 + 0.1225)
+// 8->9: (0.55, 0.0) -> (0.25, 0.75)
+const GT4_BA = vec2f(-0.30, 0.75);
+const GT4_INV = 1.53256705; // 1 / (0.09 + 0.5625)
+
+// `exp2(5.5 / 5.0) = exp2(1.1)`: multiplicative scale step between consecutive rings.
+const RING_SCALE_STEP = 2.143546925;
+
 // One mel disc: a hole (`ain`) and, unless the band is loud, a thin ring around it. `ql`, `z` and
-// the radii are in ring units (the ring's own rotated frame, divided by s); `th` is the stroke
-// width in the shader's units.
-fn mel_disc(c: vec3f, ql: vec2f, z: vec2f, s: f32, th: f32, b: f32, px: f32, e: f32) -> vec3f {
+// the radii are in ring units (the ring's own rotated frame, divided by s); `margin` is the exact
+// ring-unit radius beyond `rad` where both the fill and the ring stroke clamp to 0.
+fn mel_disc(
+  c: vec3f,
+  ql: vec2f,
+  z: vec2f,
+  s_inv_px: f32,
+  th_half_px: f32,
+  margin: f32,
+  b: f32,
+  e: f32,
+) -> vec3f {
   let rad = 0.05 + 0.07 * e;
-  let dd = length(ql - z);
-  let ain = clamp(s * (rad - dd) / px + 0.5, 0., 1.);
+  let dv = ql - z;
+  let dd2 = dot(dv, dv);
+  let reach = rad + margin;
+  if (dd2 >= reach * reach) {
+    return c;
+  }
+  let dd = sqrt(dd2);
+  let ain = clamp((rad - dd) * s_inv_px + 0.5, 0., 1.);
   var out = c * (1. - ain);
   if (e > 0.75) {
     out = mix(out, vec3f(b), ain);
   } else {
-    out = max(out, U.l0.rgb * b * clamp((th * 0.5 - s * abs(dd - rad)) / px + 0.5, 0., 1.));
+    out = max(out, U.l0.rgb * b * clamp(th_half_px - abs(dd - rad) * s_inv_px, 0., 1.));
   }
   return out;
 }
@@ -104,6 +152,7 @@ fn mel_disc(c: vec3f, ql: vec2f, z: vec2f, s: f32, th: f32, b: f32, px: f32, e: 
 @fragment fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let q = XY(pos);
   let r = length(q) + 1e-4;
+  let inv_px = U.res.y * 0.5;
   let px = 2. / U.res.y;
   let ss = U.res.x / 640.;
   let tw = f32(i32(U.vari) % 4);
@@ -122,8 +171,9 @@ fn mel_disc(c: vec3f, ql: vec2f, z: vec2f, s: f32, th: f32, b: f32, px: f32, e: 
   let e9 = mel(21);
   let m0 = max(max(max(e0, e1), max(e2, e3)), max(max(e4, e5), max(e6, e7)));
   let emax = max(m0, max(max(e8, e9), 0.));
-  // 0.79 (the outermost zode) + 0.05 + 0.07 e (its disc).
-  let mel_reach = 0.7906 + 0.05 + 0.07 * emax;
+  // 0.7906 (the outermost zode) + 0.05 + 0.07 e (its disc).
+  let max_disc = 0.05 + 0.07 * emax;
+  let mel_reach = 0.7906 + max_disc;
   // The two angles every ring is built from, each once per pixel instead of once per ring: the
   // ring rotation `U.T * 0.11` and the brightness phase `PI * ph / 5`.
   let ph = fract(U.T * 0.13);
@@ -131,9 +181,18 @@ fn mel_disc(c: vec3f, ql: vec2f, z: vec2f, s: f32, th: f32, b: f32, px: f32, e: 
   let st = sin(U.T * 0.11);
   let cb = cos(PI * ph / 5.);
   let sb = sin(PI * ph / 5.);
+  let ss_half_px = ss * 0.5 + 0.5;
+  var s = 0.12 * exp2(ph * 1.1) * (0.5 + U.dens);
   for (var k = 0; k < 5; k = k + 1) {
-    let p = (ph + f32(k)) / 5.;
-    let s = 0.12 * exp2(p * 5.5) * (0.5 + U.dens);
+    if (k > 0) {
+      s = s * RING_SCALE_STEP;
+    }
+    let th = select(2.2, 1.2, s < 1.2) * ss * px;
+    // Nothing of this ring is further out than mel_reach * s: skip before computing brightness
+    // or rotation for pixels outside the ring's outer envelope.
+    if (r > mel_reach * s + th + px) {
+      continue;
+    }
     // sin(PI * p) = sin(PI k / 5) cos(PI ph / 5) + cos(PI k / 5) sin(PI ph / 5).
     let bs = sin_b(k) * cb + cos_b(k) * sb;
     let b = bs * sqrt(max(bs, 0.));
@@ -144,54 +203,59 @@ fn mel_disc(c: vec3f, ql: vec2f, z: vec2f, s: f32, th: f32, b: f32, px: f32, e: 
     let sk = sin_k(k);
     let cs = ck * ct - sign * sk * st;
     let sn = sign * st * ck + ct * sk;
-    let th = select(2.2, 1.2, s < 1.2) * ss * px;
-    // Nothing of this ring is further out than mel_reach * s (or 0.79 s for a bare stroke): skip
-    // the ring for a pixel beyond that, one stroke width and one pixel of slack included.
-    if (r > mel_reach * s + th + px) {
-      continue;
-    }
     // The ring's own frame: q rotated by -ang, divided by s.
     let inv = 1. / s;
-    let ux = (q.x * cs + q.y * sn) * inv;
-    let uy = (q.y * cs - q.x * sn) * inv;
-    let ql = vec2f(ux, uy);
-    var d0 = 1e9;
-    var d1 = 1e9;
-    var d2 = 1e9;
-    // LP: the outer loop, 1-2-7-8-5-4-1.
-    d0 = min(d0, seg2(ql, ZP1, ZP2));
-    d0 = min(d0, seg2(ql, ZP2, ZP7));
-    d0 = min(d0, seg2(ql, ZP7, ZP8));
-    d0 = min(d0, seg2(ql, ZP8, ZP5));
-    d0 = min(d0, seg2(ql, ZP5, ZP4));
-    d0 = min(d0, seg2(ql, ZP4, ZP1));
-    // SZ: the five inner chords.
-    d1 = min(d1, seg2(ql, ZP0, ZP9));
-    d1 = min(d1, seg2(ql, ZP1, ZP8));
-    d1 = min(d1, seg2(ql, ZP2, ZP7));
-    d1 = min(d1, seg2(ql, ZP3, ZP6));
-    d1 = min(d1, seg2(ql, ZP4, ZP5));
-    // GT: the six great-triangle chords.
-    d2 = min(d2, seg2(ql, ZP2, ZP3));
-    d2 = min(d2, seg2(ql, ZP4, ZP1));
-    d2 = min(d2, seg2(ql, ZP5, ZP6));
-    d2 = min(d2, seg2(ql, ZP7, ZP1));
-    d2 = min(d2, seg2(ql, ZP8, ZP9));
-    d2 = min(d2, seg2(ql, ZP6, ZP3));
-    c = max(c, U.l0.rgb * b * clamp((th * 0.5 - s * sqrt(d0)) / px + 0.5, 0., 1.));
-    c = max(c, U.l2.rgb * b * 0.8 * clamp((ss * px * 0.5 - s * sqrt(d2)) / px + 0.5, 0., 1.));
-    c = max(c, U.l1.rgb * b * clamp((th * 0.5 - s * sqrt(d1)) / px + 0.5, 0., 1.));
+    let ql = vec2f(q.x * cs + q.y * sn, q.y * cs - q.x * sn) * inv;
+    let qabs = abs(ql);
+    let th_half_px = th * 0.5 * inv_px + 0.5;
+    let margin = th_half_px * px * inv;
+    // Axis-aligned bounding box in ring space is tighter than the bounding circle (0.55 vs 0.7906
+    // on X): skip the whole ring when outside its exact box.
+    if (qabs.x > 0.55 + max_disc + margin || qabs.y > 0.75 + max_disc + margin) {
+      continue;
+    }
+
+    let s_inv_px = s * inv_px;
+    let stroke_r2 = margin * margin;
+
+    // LP (outer loop 1-2-7-8-5-4-1) is symmetric in both X and Y, so folding into the first
+    // quadrant collapses all 6 segments to 1 angled edge + 1 horizontal edge.
+    let h_mid = hseg2(qabs, 0.30, 0.35);
+    let d0 = min(seg2_c(qabs, LP_A, LP_BA, LP_INV), h_mid);
+    if (d0 < stroke_r2) {
+      c = max(c, U.l0.rgb * b * clamp(th_half_px - sqrt(d0) * s_inv_px, 0., 1.));
+    }
+
+    // GT (six great-triangle chords): 5 angled edges + 1 horizontal edge at y = -0.75.
+    let gt_r = ss_half_px * px * inv;
+    var d2 = seg2_c(ql, ZP2, GT0_BA, GT0_INV);
+    d2 = min(d2, seg2_c(ql, ZP4, GT1_BA, GT1_INV));
+    d2 = min(d2, seg2_c(ql, ZP5, GT2_BA, GT2_INV));
+    d2 = min(d2, seg2_c(ql, ZP7, GT3_BA, GT3_INV));
+    d2 = min(d2, seg2_c(ql, ZP8, GT4_BA, GT4_INV));
+    d2 = min(d2, hseg2(ql, 0.25, -0.75));
+    if (d2 < gt_r * gt_r) {
+      c = max(c, U.l2.rgb * b * 0.8 * clamp(ss_half_px - sqrt(d2) * s_inv_px, 0., 1.));
+    }
+
+    // SZ (five horizontal inner chords) is also X/Y-symmetric: reuse `h_mid` (y = +-0.35) and add
+    // y = +-0.75 and y = 0.0.
+    let d1 = min(h_mid, min(hseg2(qabs, 0.25, 0.75), hseg2(qabs, 0.55, 0.0)));
+    if (d1 < stroke_r2) {
+      c = max(c, U.l1.rgb * b * clamp(th_half_px - sqrt(d1) * s_inv_px, 0., 1.));
+    }
+
     // The ten mel discs, in zode order, with the band each one reads in the web body.
-    c = mel_disc(c, ql, ZP0, s, th, b, px, e0);
-    c = mel_disc(c, ql, ZP1, s, th, b, px, e1);
-    c = mel_disc(c, ql, ZP2, s, th, b, px, e2);
-    c = mel_disc(c, ql, ZP3, s, th, b, px, e3);
-    c = mel_disc(c, ql, ZP4, s, th, b, px, e4);
-    c = mel_disc(c, ql, ZP5, s, th, b, px, e5);
-    c = mel_disc(c, ql, ZP6, s, th, b, px, e6);
-    c = mel_disc(c, ql, ZP7, s, th, b, px, e7);
-    c = mel_disc(c, ql, ZP8, s, th, b, px, e8);
-    c = mel_disc(c, ql, ZP9, s, th, b, px, e9);
+    c = mel_disc(c, ql, ZP0, s_inv_px, th_half_px, margin, b, e0);
+    c = mel_disc(c, ql, ZP1, s_inv_px, th_half_px, margin, b, e1);
+    c = mel_disc(c, ql, ZP2, s_inv_px, th_half_px, margin, b, e2);
+    c = mel_disc(c, ql, ZP3, s_inv_px, th_half_px, margin, b, e3);
+    c = mel_disc(c, ql, ZP4, s_inv_px, th_half_px, margin, b, e4);
+    c = mel_disc(c, ql, ZP5, s_inv_px, th_half_px, margin, b, e5);
+    c = mel_disc(c, ql, ZP6, s_inv_px, th_half_px, margin, b, e6);
+    c = mel_disc(c, ql, ZP7, s_inv_px, th_half_px, margin, b, e7);
+    c = mel_disc(c, ql, ZP8, s_inv_px, th_half_px, margin, b, e8);
+    c = mel_disc(c, ql, ZP9, s_inv_px, th_half_px, margin, b, e9);
   }
   return fin(c);
 }

@@ -41,7 +41,8 @@ use mosh_core::show::BlendMode;
 use crate::device::{align_up, Gpu, MappedBuffer};
 use crate::pipeline::{Blend, DescriptorLayouts, Pipeline};
 use crate::target::{
-    cmd_barrier, to_color_attachment, Barrier, LayerTarget, OutputImage, OFFSCREEN_FORMAT,
+    cmd_barrier, to_color_attachment, to_color_attachment_discard, Barrier, LayerTarget,
+    OutputImage, OFFSCREEN_FORMAT,
 };
 use crate::RenderError;
 
@@ -609,12 +610,21 @@ impl Compositor {
             self.device.begin_command_buffer(self.cmd, &begin)?;
         }
 
+        // Single-pass stack shaders write every pixel without blending or discard, so clearing the
+        // target first is a wasted full-output write. Only the >MAX_STACK per-layer fallback needs
+        // an initial clear.
+        let single_pass = masked_pipeline.is_some() || layers.len() <= MAX_STACK;
+
         // Into the attachment layout. An `OutputImage` carries its own layout; a `LayerTarget`'s
         // two images are always readable between passes; the stage's swapchain image is already
         // in the attachment layout and the caller owns the transitions.
         match &target {
             CompositeTarget::Output(out) => {
-                let old_layout = out.layout();
+                let old_layout = if single_pass {
+                    vk::ImageLayout::UNDEFINED
+                } else {
+                    out.layout()
+                };
                 if old_layout != vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
                     cmd_barrier(
                         &self.device,
@@ -624,9 +634,9 @@ impl Compositor {
                             old_layout,
                             new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                             src_stage: vk::PipelineStageFlags::FRAGMENT_SHADER
-                                | vk::PipelineStageFlags::TRANSFER,
-                            src_access: vk::AccessFlags::SHADER_READ
-                                | vk::AccessFlags::TRANSFER_READ,
+                                | vk::PipelineStageFlags::TRANSFER
+                                | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                            src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
                             dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                             dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
                         },
@@ -638,7 +648,11 @@ impl Compositor {
                     &self.device,
                     self.cmd,
                     layer.back_image(),
-                    to_color_attachment(),
+                    if single_pass {
+                        to_color_attachment_discard()
+                    } else {
+                        to_color_attachment()
+                    },
                 );
             }
             CompositeTarget::Image { .. } => {}
@@ -650,6 +664,11 @@ impl Compositor {
             .height(extent.height as f32)
             .min_depth(0.0)
             .max_depth(1.0);
+        let load_op = if single_pass {
+            vk::AttachmentLoadOp::DONT_CARE
+        } else {
+            target.load_op()
+        };
         let attachment = vk::RenderingAttachmentInfo::default()
             .image_view(match &target {
                 CompositeTarget::Output(out) => out.view(),
@@ -657,7 +676,7 @@ impl Compositor {
                 CompositeTarget::Image { view, .. } => *view,
             })
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(target.load_op())
+            .load_op(load_op)
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(target.clear_value());
         let attachments = [attachment];
