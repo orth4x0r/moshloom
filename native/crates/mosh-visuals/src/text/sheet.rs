@@ -31,9 +31,11 @@
 //! # Size
 //!
 //! [`capacity`] is the largest block the layout can produce at the em size the shader bakes
-//! (wrapped to [`super::layout::WRAP_CHARS`] characters and capped at
+//! (wrapped to [`super::layout::WRAP_CHARS`] advances and capped at
 //! [`super::layout::MAX_LINES`]), so the layer can allocate one texture per look and never grow
-//! it: growing means dropping the old image, and dropping it waits for the device.
+//! it: growing means dropping the old image, and dropping it waits for the device. The wrap budget
+//! and this capacity are both proportional to the em, which is what makes the sheet always hold a
+//! wrapped block: no text is ever shrunk (or its words broken) to fit.
 //!
 //! # Thorns
 //!
@@ -265,6 +267,14 @@ fn compose_into(
         layout.block_h.max(1) as u32,
     );
     let thorny = face.thorns();
+    // The marks are drawn before the thorns are grown: a thorn that would come within a clearance
+    // of one is dropped, so the pair of marks reads as linework beside the word instead of merging
+    // into the band of spikes on the block's edge (`thorn::grow`).
+    let symbols = if thorny {
+        thorn::symbols(text, block, layout.lines.len())
+    } else {
+        Vec::new()
+    };
     Some(Baked {
         block_w: block.0,
         block_h: block.1,
@@ -278,15 +288,12 @@ fn compose_into(
                 block,
                 layout.lines.len(),
                 &layout.words,
+                &symbols,
             )
         } else {
             Vec::new()
         },
-        symbols: if thorny {
-            thorn::symbols(text, block, layout.lines.len())
-        } else {
-            Vec::new()
-        },
+        symbols,
         lines: layout.lines.len(),
         words: layout.words.clone(),
     })

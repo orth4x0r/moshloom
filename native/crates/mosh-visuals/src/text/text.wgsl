@@ -22,7 +22,8 @@
 // draws the strokes in the same silver as the letters. Nothing is ever drawn across a glyph's face,
 // and no thorn crosses a space into the next word.
 //
-// Uniform block (416 bytes, matches `text::UNIFORM_BYTES`):
+// Uniform block (1008 bytes, matches `text::UNIFORM_BYTES`; mosh-render caps a per-draw block at
+// 1024, so this is sixteen bytes — half a stroke — under that cap):
 //   0  dst: vec2f          8  sheet: vec2f
 //   16 inset_min: vec2f    24 inset_max: vec2f
 //   32 p0: vec4f (p0..p3)  48 p1: vec4f (p4..p7)
@@ -120,10 +121,19 @@ fn stroke_sdf(p: vec2<f32>, stroke: Stroke) -> vec4<f32> {
     return select(first, second, second.x < first.x);
 }
 
-// The cheapest way to know a stroke cannot reach `p`: its own bounding circle. Most strokes are
-// rejected by this before the capsule maths runs.
+// The slack `out_of_reach` adds to a stroke's radius, in block heights: a fraction of a baked
+// pixel. `text/thorn.rs::reach_radius` mirrors this formula, and `the_thorn_geometry_constants_
+// match_the_shader` compares this literal with that module's constant.
+const REACH_SLACK: f32 = 0.01;
+
+// The cheapest way to know a stroke cannot reach `p`: one bounding circle around its whole body.
+// The radius is the stroke's **path length** — `|a-b| + |b-c|` — plus its base half-width twice,
+// never the chord `|c-a|`: a bent stroke's chord is shorter than its path, and a bound built from
+// it cuts pixels off the bend. That defect lost two or three baked pixels of a mark barb on `W`
+// and `THE LOOM IS US`, because the early-out rejected them before the capsule maths ran.
 fn out_of_reach(p: vec2<f32>, stroke: Stroke) -> bool {
-    let radius = length(stroke.c - stroke.a) + stroke.width * 2.0 + 0.01;
+    let radius = length(stroke.b - stroke.a) + length(stroke.c - stroke.b)
+        + stroke.width * 2.0 + REACH_SLACK;
     return distance(p, stroke.a) > radius;
 }
 
@@ -305,6 +315,10 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         // left: the mirror of a block-space x is the block's width in its own units minus x. Both
         // copies sit outside the block's box, so there is nothing to evaluate over the letters.
         if (local.x < 0.0 || local.x > block_aspect) {
+            // Which side of the block this pixel is on, and so which copy of an authored mark it
+            // can see. `stroke.mirror` is the CPU's bit for the second copy (`text/thorn.rs`
+            // writes 1 for every mark stroke): a stroke without it is drawn once, on the right.
+            let mirrored = local.x < 0.5 * block_aspect;
             let probe = select(
                 vec2<f32>(block_aspect - local.x, local.y),
                 local,
@@ -317,6 +331,9 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
                 }
                 let stroke = U.symbols[mark];
                 mark = mark + 1u;
+                if (mirrored && stroke.mirror < 0.5) {
+                    continue;
+                }
                 if (out_of_reach(probe, stroke)) {
                     continue;
                 }

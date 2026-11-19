@@ -80,7 +80,14 @@ pub const PARAMS: [&str; 8] = [
 /// Bytes of the pass's uniform block. Keep in sync with `text/text.wgsl` (a unit test reflects the
 /// shader and compares every member's offset): 112 bytes of scalar block, then the sigil look's
 /// linework — [`thorn::MAX_THORNS`] thorn strokes and [`thorn::MAX_SYMBOLS`] symbol strokes at 32
-/// bytes each. 1008 bytes, well inside a device's uniform budget.
+/// bytes each.
+///
+/// **This is 1008 bytes, sixteen under the limit.** `mosh-render` caps a per-draw uniform block at
+/// `MAX_UNIFORM_BYTES` = 1024 (`mosh-render/src/device.rs`, private to that crate; the constant is
+/// mirrored in the test below) and `Pipeline::fullscreen` returns `UniformTooLarge` past it, so the
+/// binding limit here is the render crate's 1024, not a device's much larger budget. One more
+/// stroke (32 bytes) would make `TextLayer::new` fail until that cap is raised;
+/// `the_uniform_block_fits_the_render_crate_cap` pins both numbers.
 const UNIFORM_BYTES: usize = THORNS_AT + (thorn::MAX_THORNS + thorn::MAX_SYMBOLS) * THORN_BYTES;
 
 /// The uniform block's scalar member offsets, in bytes. `text/text.wgsl`'s `TextUniforms` is the
@@ -554,6 +561,7 @@ mod tests {
         for (name, expected) in [
             ("BEND_WIDTH", thorn::BEND_WIDTH),
             ("TIP_WIDTH", thorn::TIP_WIDTH),
+            ("REACH_SLACK", thorn::REACH_SLACK),
         ] {
             assert_eq!(
                 wgsl_const(SHADER, name),
@@ -656,6 +664,49 @@ mod tests {
             assert_eq!(stroke_offset("width"), STROKE_WIDTH_AT);
             assert_eq!(stroke_offset("mirror"), STROKE_MIRROR_AT);
         }
+    }
+
+    /// The uniform block's size against `mosh-render`'s cap. `MAX_UNIFORM_BYTES` (1024) lives in
+    /// that crate's private `device` module, so the number is mirrored here; the failure it guards
+    /// is `Pipeline::fullscreen` returning `UniformTooLarge`, which would make `TextLayer::new`
+    /// fail. The block is at the edge of the cap on purpose-of-construction: 28 strokes fit and 29
+    /// do not, so a lane that adds linework has to see this test (and the cap, which is being
+    /// raised to 4096 separately) before it adds the thirtieth.
+    #[test]
+    fn the_uniform_block_fits_the_render_crate_cap() {
+        const RENDER_CAP: usize = 1024;
+        // The block's size as the shader declares it, so this is a measured number and not a
+        // constant the compiler folds away (which would make the assertion a tautology to clippy).
+        let module = naga::front::wgsl::parse_str(SHADER).expect("text.wgsl parses");
+        let uniform_type = module
+            .global_variables
+            .iter()
+            .find(|(_, variable)| variable.space == naga::AddressSpace::Uniform)
+            .map(|(_, variable)| variable.ty)
+            .expect("text.wgsl declares a uniform block");
+        let naga::TypeInner::Struct { span, .. } = &module.types[uniform_type].inner else {
+            panic!("the uniform block is a struct");
+        };
+        let block = *span as usize;
+        println!(
+            "text uniform block {block} bytes (text.rs writes {UNIFORM_BYTES}), mosh-render's cap \
+             {RENDER_CAP}, headroom {}",
+            RENDER_CAP.saturating_sub(block)
+        );
+        assert_eq!(
+            block, UNIFORM_BYTES,
+            "the shader's block and the bytes text.rs writes must be the same size"
+        );
+        assert!(
+            block <= RENDER_CAP,
+            "the text pass's {block}-byte uniform block exceeds mosh-render's cap of {RENDER_CAP}: \
+             TextLayer::new would fail with UniformTooLarge"
+        );
+        assert!(
+            block + THORN_BYTES > RENDER_CAP,
+            "the block is {block} bytes; this test assumes it is within one stroke of the \
+             {RENDER_CAP}-byte cap, which is its bounds check"
+        );
     }
 
     /// The counts the shader loops over are the numbers of strokes, not the number of `vec4` words

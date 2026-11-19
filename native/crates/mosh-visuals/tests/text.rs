@@ -23,8 +23,9 @@
 //! * The beat pop (`p6`) and glitch change pixels, and nothing flashes the whole frame: the four
 //!   corners stay black through a 400 ms window (`README`: no full-frame flash faster than every
 //!   400 ms).
-//! * Previews of the three looks, with a word and a two-line phrase, are written under
-//!   `native/target/style-previews/text/` for the PR; nothing is committed.
+//! * Previews of the three looks, with a word, that word as the windowed run spelled it
+//!   (`ilanaVisual`) and a two-line phrase, are written under `native/target/style-previews/text/`
+//!   for the PR; nothing is committed.
 //!
 //! # Row order
 //!
@@ -860,7 +861,14 @@ fn three_looks_write_previews() {
     let (width, height) = (960u32, 540u32);
     let frame = audio_frame();
     let looks = [("chrome", 0.05), ("sigil", 0.45), ("clean", 0.85)];
-    let shots = [("ilana", "ILANA"), ("phrase", "the loom\nis us")];
+    // `ilanaVisual` is the text the windowed run broke into `ILANAVISU` / `AL`: the Sigil look
+    // uppercases it, and it must come out as one line in every look. The two-line phrase is the
+    // other half of the wrap contract.
+    let shots = [
+        ("ilana", "ILANA"),
+        ("ilanavisual", "ilanaVisual"),
+        ("phrase", "the loom\nis us"),
+    ];
 
     for (name, font) in looks {
         for (shot_name, text) in shots {
@@ -1181,27 +1189,39 @@ fn set_text_and_draw_costs() {
          {record_median:.3})"
     );
     // Reported, not budgeted: the sigil look's bake also grows its thorns from the composed field
-    // (`text/thorn.rs`), a cost the two other looks do not pay. A text change on a sigil layer is
-    // the only place it lands, so it is measured here and printed with the rest.
-    let mut recorder = FrameRecorder::new(&gpu);
-    layer
-        .draw(
-            &mut recorder,
-            0,
-            &dst,
-            &frame,
-            &params(0.8, 0.45, 0.5, 0.0, 0.0, 0.45, 0.0, 0.0),
-            0.0,
-        )
-        .expect("draw the sigil look");
-    let sigil_timings = gpu.wait_frame(recorder.submit());
+    // (`text/thorn.rs`), a cost the two other looks do not pay. The pass is measured the way the
+    // clean one is — a warm-up frame (the first draw after a text change also uploads the sheet and
+    // binds the look), then ten frames, median — because one cold sample is not a number.
+    let sigil_params = params(0.8, 0.45, 0.5, 0.0, 0.0, 0.45, 0.0, 0.0);
+    let mut sigil_samples: Vec<f64> = Vec::new();
+    for step in 0..11 {
+        let mut recorder = FrameRecorder::new(&gpu);
+        layer
+            .draw(
+                &mut recorder,
+                0,
+                &dst,
+                &frame,
+                &sigil_params,
+                step as f32 / 60.0,
+            )
+            .expect("draw the sigil look");
+        let timings = gpu.wait_frame(recorder.submit());
+        if step == 0 {
+            continue;
+        }
+        if let Some((_, ms)) = timings
+            .per_pass_ms
+            .iter()
+            .find(|(name, _)| name == "text.glyphs")
+        {
+            sigil_samples.push(f64::from(*ms));
+        }
+    }
+    assert_eq!(sigil_samples.len(), 10, "ten measured sigil frames");
+    let (sigil_min, sigil_median) = stats(&mut sigil_samples);
     // The sigil pass costs more than the clean one: it evaluates up to twenty thorn strokes and a
-    // handful of mark strokes per pixel over a wider region. Reported, not budgeted.
-    let sigil_pass = sigil_timings
-        .per_pass_ms
-        .iter()
-        .find(|(name, _)| name == "text.glyphs")
-        .map(|(_, ms)| *ms);
+    // handful of mark strokes per pixel over a wider region.
     let sigil_text = "the loom knows what the flesh wants";
     let sigil = {
         let start = Instant::now();
@@ -1218,8 +1238,8 @@ fn set_text_and_draw_costs() {
     };
     println!(
         "a sigil-look text change ({sigil_text:?}, thorns and marks included): {sigil:.3} ms cold, \
-         {warm:.3} ms with every glyph already cached; the sigil pass {}",
-        sigil_pass.map_or("not timed".to_string(), |ms| format!("{ms:.4} ms"))
+         {warm:.3} ms with every glyph already cached; the sigil pass {sigil_min:.4} / \
+         {sigil_median:.4} ms min/median"
     );
     // A sigil text change pays for the glyphs and for the thorn and mark growth, and it must not
     // become a per-frame or per-edit stall. 25 ms is about twice the 9.5 ms measured here for
@@ -1230,6 +1250,147 @@ fn set_text_and_draw_costs() {
         sigil < sigil_bound,
         "a sigil text change must stay under {sigil_bound} ms, took {sigil:.3} ms (cold)"
     );
+    assert_no_validation_messages(&gpu);
+}
+
+/// The sigil look's marks are authored once, on the right of the block, and the shader draws the
+/// left copy mirrored about the block's centre. A build where only one half drew was caught by
+/// eye, so this measures both flanks.
+///
+/// Calibrated on `SIGIL` at size 0.15, the pair the review prototyped with. The glyph mass is the
+/// ink a 5x5 erosion keeps (the letters are filled; a mark's stroke is 2-3px wide, so an erosion
+/// deletes it), and the flanks are the columns either side of it. The assertion is that the left
+/// flank's ink **mirrors** the right flank's, pixel for pixel about the block's centre: that is
+/// what the shader is supposed to do, and thorns — which are asymmetric by design — cannot fake
+/// it. The bare "leftmost ink is a few pixels left of the mass" predicate the review prototyped
+/// does not survive here: with the left copy disabled the leftmost ink is 229 and the letters 251,
+/// so the left thorns alone sit 22px outside the mass and the predicate passes.
+///
+/// The text and size are part of the calibration on purpose: other words grow a thorn that reaches
+/// as far as a mark.
+#[test]
+fn the_mirrored_mark_draws_on_both_sides() {
+    let gpu = gpu();
+    let (width, height) = (960u32, 540u32);
+    let frame = AnalysisFrame::default();
+    let shot = draw_once(
+        &gpu,
+        "SIGIL",
+        &params(0.15, 0.45, 0.5, 0.0, 0.0, 0.3, 0.0, 0.0),
+        &frame,
+        0.0,
+        width,
+        height,
+    );
+    // The silver body, not the red glow: the glow's red never passes 90, the metal's channels sit
+    // well above 120.
+    let body = |x: u32, y: u32| {
+        shot.pixel(x, y)
+            .iter()
+            .take(3)
+            .copied()
+            .max()
+            .unwrap_or(0)
+            > 120
+    };
+    let filled = |x: u32, y: u32| {
+        (y.saturating_sub(2)..=(y + 2).min(height - 1))
+            .all(|row| (x.saturating_sub(2)..=(x + 2).min(width - 1)).all(|column| body(column, row)))
+    };
+    let mut mass_left = width;
+    let mut mass_right = 0;
+    for y in 0..height {
+        for x in 2..width - 2 {
+            if filled(x, y) {
+                mass_left = mass_left.min(x);
+                mass_right = mass_right.max(x);
+            }
+        }
+    }
+    println!(
+        "SIGIL at 0.15 on {width}x{height}: glyph mass {mass_left}..={mass_right} \
+         (centre {}), block centre {}",
+        (mass_left + mass_right) / 2,
+        width / 2
+    );
+    let leftmost = (0..width)
+        .find(|x| (0..height).any(|y| body(*x, y)))
+        .expect("ink");
+    let rightmost = (0..width)
+        .rfind(|x| (0..height).any(|y| body(*x, y)))
+        .expect("ink");
+    println!(
+        "ink {leftmost}..={rightmost}: {}px left of the mass, {}px right of it",
+        mass_left.saturating_sub(leftmost),
+        rightmost.saturating_sub(mass_right)
+    );
+    assert!(
+        mass_right > mass_left + 100,
+        "the glyph mass is {mass_left}..={mass_right}: this calibration needs the letters to fill \
+         the middle of the frame"
+    );
+
+    // Every lit column outside the mass, and how much of it the other flank mirrors.
+    let flank = 40u32;
+    let mirrored_ink = |outward: bool| -> (usize, usize) {
+        let mut ink = 0usize;
+        let mut pairs = 0usize;
+        let columns = if outward {
+            (mass_left.saturating_sub(flank)..mass_left).collect::<Vec<_>>()
+        } else {
+            (mass_right + 1..=(mass_right + flank).min(width - 1)).collect::<Vec<_>>()
+        };
+        for x in columns {
+            for y in 0..height {
+                if !body(x, y) {
+                    continue;
+                }
+                ink += 1;
+                // The block is centred at width/2, so x mirrors to width - 1 - x (a pixel centre
+                // at x + 0.5 maps to width - x - 0.5). One pixel of slack either way covers the
+                // rounding of the two sides' rasterisation.
+                let mirror = width - 1 - x;
+                let found = (y.saturating_sub(1)..=(y + 1).min(height - 1)).any(|row| {
+                    (mirror.saturating_sub(1)..=(mirror + 1).min(width - 1))
+                        .any(|column| body(column, row))
+                });
+                pairs += usize::from(found);
+            }
+        }
+        (ink, pairs)
+    };
+    let (left_ink, left_pairs) = mirrored_ink(true);
+    let (right_ink, right_pairs) = mirrored_ink(false);
+    println!(
+        "{flank} flank columns each side: left {left_ink} lit, {left_pairs} with a mirror; \
+         right {right_ink} lit, {right_pairs} with a mirror"
+    );
+    // With the mirrored copy drawn, the two marks are the same ink on both sides, so most of a
+    // flank's ink finds its reflection. With the left copy missing, only thorns are left there and
+    // almost nothing pairs.
+    assert!(
+        left_pairs * 2 > left_ink && left_ink > 100,
+        "the left flank has {left_ink} lit pixels and only {left_pairs} of them mirror the right \
+         flank: the mirrored mark is not drawing"
+    );
+    assert!(
+        right_pairs * 2 > right_ink && right_ink > 100,
+        "the right flank has {right_ink} lit pixels and only {right_pairs} of them mirror the left \
+         flank: the authored mark is not drawing"
+    );
+    assert_no_validation_messages(&gpu);
+}
+
+#[test]
+fn a_text_layer_fits_the_uniform_cap() {
+    let gpu = gpu();
+    // `Pipeline::fullscreen` refuses a block over `mosh_render::device::MAX_UNIFORM_BYTES` (1024
+    // bytes, private to that crate) with `UniformTooLarge`; the text block is 1008 — 112 bytes of
+    // scalars, 20 thorn strokes and 8 mark strokes of 32 bytes. This constructor succeeding is the
+    // assertion that it fits; `text::tests::the_uniform_block_fits_the_render_crate_cap` pins the
+    // numbers, and one more stroke would not fit.
+    let _layer = TextLayer::new(&gpu).expect("the text pass's uniform block fits mosh-render's cap");
+    println!("TextLayer::new: a 1008-byte uniform block against a 1024-byte cap");
     assert_no_validation_messages(&gpu);
 }
 

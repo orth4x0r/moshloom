@@ -30,13 +30,23 @@
 //!
 //! # Wrapping and the length cap
 //!
-//! A display line is wrapped to [`WRAP_CHARS`] em of advance width (word wrap, breaking a word that is
-//! longer than a whole line), because the shader fits the block to the frame: an unwrapped 100
-//! character line would be fitted down to a stripe a few percent of the frame tall. Explicit `\n`
-//! breaks are kept. A line is measured and centred without its trailing whitespace, so `"hello "`
-//! centres exactly like `"hello"`. At most [`MAX_LINES`] visual lines are drawn and at most
-//! [`MAX_CHARS`] characters are laid out; anything beyond is dropped and logged once, so a pasted
-//! essay cannot produce a smear or an empty frame.
+//! A line wraps between words to [`WRAP_CHARS`] advances (measured on the face's own `o`), because
+//! the shader fits the block to the frame: an unwrapped 100-character line would be fitted down to
+//! a stripe a few percent of the frame tall. Two rules keep that budget from cutting words up:
+//!
+//! * **A word is only broken when it cannot fit a line at all**, which is a word of about 16-18
+//!   capitals or 20 lowercase letters (the measured count is in the test that prints it), or one
+//!   wider than the sheet itself. A word that is cut is cut into chunks of about equal length, so
+//!   the tail is never a lone fragment.
+//! * **The last line never holds one word alone** when the line above it can hand one down: a
+//!   short phrase that would otherwise leave a widow is balanced instead.
+//!
+//! A phrase that fits one line stays on one line and the shader's fit-to-width scale shrinks the
+//! block: wrapping is for text that cannot be one line, never a way to make a short word fit.
+//! Explicit `\n` breaks are kept. A line is measured and centred without its trailing whitespace,
+//! so `"hello "` centres exactly like `"hello"`. At most [`MAX_LINES`] visual lines are drawn and
+//! at most [`MAX_CHARS`] characters are laid out; anything beyond is dropped and logged once, so a
+//! pasted essay cannot produce a smear or an empty frame.
 //!
 //! # Sub-pixel edges
 //!
@@ -71,7 +81,18 @@ pub const PAD: i32 = SDF_RANGE as i32 + 2;
 /// A visual line wraps at this many characters' worth of advance (measured on the face's `o`), so
 /// every face gets a similar number of letters per line — a fixed em count gives the wide
 /// blackletter seven characters and the narrow grotesque twenty.
-pub const WRAP_CHARS: f32 = 9.0;
+///
+/// The budget is deliberately wide enough that a word is not cut up to make a line fit: it buys
+/// 16.1 / 15.4 / 17.9 capitals and 20.0 / 20.2 / 20.1 lowercase letters per line on Unbounded /
+/// Grenze Gotisch / Space Grotesk, so a word only breaks past roughly 16-18 characters. The 9 this
+/// replaces bought about 8-9 capitals and 10 lowercase, which cut `ILANAVISUAL` into
+/// `ILANAVISU` / `AL`: the Sigil look is uppercased blackletter, and its `o` is narrow enough that
+/// the old budget clamped to the 5 em floor.
+///
+/// The budget scales with the em, and so does the sheet ([`super::sheet::capacity`] is built from
+/// it), which is what makes "a word only breaks when it cannot fit one line at any size the sheet
+/// bakes" true: a word too wide here is too wide at every smaller em too, in the same ratio.
+pub const WRAP_CHARS: f32 = 18.0;
 
 /// The most visual lines a block draws (explicit `\n` breaks included).
 pub const MAX_LINES: usize = 7;
@@ -332,6 +353,7 @@ struct Placed {
 
 /// One visual line: the character range it draws. Its advance width is measured when the glyphs
 /// are placed, because kerning depends on the glyphs and on the line's own first character.
+#[derive(Clone, Copy)]
 struct VisualLine {
     first: usize,
     end: usize,
@@ -391,10 +413,12 @@ impl Face {
     }
 
     /// The advance width a visual line wraps to, at `px`: [`WRAP_CHARS`] of this face's own
-    /// letters, clamped so no face gets a silly line.
+    /// letters, clamped so no face gets a silly line. The floor is 6 em (a blackletter `o` is
+    /// narrow, and a line under six em reads as a fragment); the ceiling is 16 em, which keeps the
+    /// widest possible sheet inside [`super::sheet::MAX_SHEET_WIDTH`].
     pub fn wrap_width(&self, px: f32) -> f32 {
         let reference = self.advance('o', px).max(px * 0.35);
-        (WRAP_CHARS * reference).clamp(px * 5.0, px * 16.0)
+        (WRAP_CHARS * reference).clamp(px * 6.0, px * 16.0)
     }
 
     /// The GPOS pair adjustment for `left` followed by `right`, in em. Zero when the face has no
@@ -569,7 +593,9 @@ impl Face {
                     }
                 }
                 if break_at == first {
-                    break_at = end;
+                    // One word wider than a while line: cut it, but in balanced chunks — a word
+                    // that is cut must not leave a two-letter tail on a line of its own.
+                    break_at = chunk_end(&chars, &widths, first, wrap);
                 }
             }
             // A line is measured and centred without its trailing whitespace: "hello " centres
@@ -598,6 +624,9 @@ impl Face {
                 end: first,
             });
         }
+        // A last line that holds one word alone is the same defect as a bare fragment of a
+        // broken word: balance it against the line above, when that pair still fits.
+        no_lone_last_word(&chars, &widths, wrap, &mut lines);
         let dropped = dropped + chars.len().saturating_sub(first.min(chars.len()));
 
         // Place every glyph, line by line, and measure each line by the pen it ends with. Kerning
@@ -719,6 +748,68 @@ impl Face {
         }
     }
 }
+
+/// The end of the first chunk of a word that cannot fit one line, in characters: the word is cut
+/// into `ceil(word width / wrap)` chunks of about equal length, so a word that has to be broken
+/// never ends in a lone fragment (the 9-advance budget turned `ILANAVISUAL` into `ILANAVISU` /
+/// `AL`). The chunk is also shrunk until it fits the line, because an even split of uneven glyphs
+/// can still be a little too wide.
+fn chunk_end(chars: &[char], widths: &[f32], first: usize, wrap: f32) -> usize {
+    let mut word_end = first;
+    while word_end < chars.len() && chars[word_end] != ' ' && chars[word_end] != '\n' {
+        word_end += 1;
+    }
+    let length = word_end - first;
+    if length <= 1 {
+        return (first + 1).min(chars.len());
+    }
+    let pieces = ((widths[word_end] - widths[first]) / wrap.max(1.0)).ceil() as usize;
+    let pieces = pieces.clamp(1, length);
+    let mut chunk = length.div_ceil(pieces).max(1);
+    while chunk > 1 && widths[first + chunk] - widths[first] > wrap {
+        chunk -= 1;
+    }
+    first + chunk
+}
+
+/// A last line that holds one word and nothing else takes the word before it down from the line
+/// above, when the pair still fits: a block must not end in a lone word under a full line, which
+/// reads as a fragment of it for the same reason `ILANAVISU` / `AL` does. A line that follows an
+/// explicit `\n` is its own paragraph and is never rebalanced across the break, and a previous
+/// line with no space in it (a cut word) has no whole word to hand down.
+fn no_lone_last_word(chars: &[char], widths: &[f32], wrap: f32, lines: &mut [VisualLine]) {
+    let Some(last) = lines.len().checked_sub(1).filter(|last| *last > 0) else {
+        return;
+    };
+    let line = lines[last];
+    if line.end <= line.first || chars[line.first..line.end].contains(&' ') {
+        return;
+    }
+    // A natural wrap leaves the space it broke at behind the line's first character; an explicit
+    // break leaves the `\n`.
+    if line.first == 0 || chars[line.first - 1] != ' ' {
+        return;
+    }
+    let previous = lines[last - 1];
+    let Some(space) = (previous.first + 1..previous.end)
+        .rev()
+        .find(|index| chars[*index] == ' ')
+    else {
+        return;
+    };
+    let moved = space + 1;
+    let mut end = space;
+    while end > previous.first && chars[end - 1].is_whitespace() {
+        end -= 1;
+    }
+    // Never empty the line above, and never make the last line too wide to draw.
+    if end <= previous.first || widths[line.end] - widths[moved] > wrap {
+        return;
+    }
+    lines[last - 1].end = end;
+    lines[last].first = moved;
+}
+
 
 /// Turns a laid-out block's antialiased coverage into field tiles in place: one distance field for
 /// the mask plus, when `normals`, the bevel's surface direction, written as BGRA (see
@@ -1406,6 +1497,295 @@ mod tests {
         for (left, right) in first.glyphs.iter().zip(second.glyphs.iter()) {
             assert_eq!((left.x, left.y), (right.x, right.y));
             assert!(Rc::ptr_eq(&left.glyph, &right.glyph), "the bake is cached");
+        }
+    }
+
+    /// The sigil face as the layer bakes it: uppercase (see `TextLayer::bake`) and thorny.
+    fn sigil() -> Face {
+        Face::new(crate::text::FACE_SIGIL, true)
+            .map(|face| face.with_thorns(true))
+            .expect("Grenze Gotisch")
+    }
+
+    /// The three looks, each with its own face.
+    fn every_look() -> [(&'static str, Face); 3] {
+        [
+            ("chrome", unbounded()),
+            ("sigil", sigil()),
+            ("clean", space_grotesk()),
+        ]
+    }
+
+    /// The defect a windowed run showed: `"ilanaVisual"` in the Sigil look, uppercased to
+    /// `ILANAVISUAL`, came out as `ILANAVISU` / `AL`, because the old 9-advance budget broke the
+    /// word instead of letting the shader's fit-to-width scale shrink the line. A word this short
+    /// is never broken, and neither is one raised or lowered: the sigil look bakes uppercase, so
+    /// both spellings are laid out here for every look.
+    #[test]
+    fn a_short_word_is_never_broken_in_any_look() {
+        for (look, face) in every_look() {
+            for text in ["ilanaVisual", "ILANAVISUAL", "cybersigilism"] {
+                for drawn in [text.to_string(), text.to_uppercase()] {
+                    let layout = face.layout(&drawn, BAKE_PX);
+                    println!(
+                        "{look}: {drawn:?} ({} chars) -> {} line(s), {}x{} block",
+                        drawn.chars().count(),
+                        layout.lines.len(),
+                        layout.block_w,
+                        layout.block_h
+                    );
+                    assert_eq!(
+                        layout.lines.len(),
+                        1,
+                        "{look}: {drawn:?} is {} characters and was broken into {} lines; a word \
+                         that short must stay on one line and let the block's fit-to-width scale \
+                         shrink it",
+                        drawn.chars().count(),
+                        layout.lines.len()
+                    );
+                    assert!(
+                        layout.block_w as f32 <= face.wrap_width(BAKE_PX),
+                        "{look}: {drawn:?} is {}px wide on a {:.0}px line",
+                        layout.block_w,
+                        face.wrap_width(BAKE_PX)
+                    );
+                }
+            }
+        }
+    }
+
+    /// A word that cannot fit one line at any size is still broken — and nothing is lost, and the
+    /// break is balanced: a 40-character word comes out as two chunks of about twenty, never as
+    /// one full line and a lone tail.
+    #[test]
+    fn a_forty_character_word_breaks_without_a_fragment() {
+        let word = "abcdefghij".repeat(4);
+        assert_eq!(word.chars().count(), 40);
+        for (look, face) in every_look() {
+            let layout = face.layout(&word, BAKE_PX);
+            let widest = layout
+                .lines
+                .iter()
+                .map(|line| line.advance)
+                .fold(0.0f32, f32::max);
+            let narrowest = layout
+                .lines
+                .iter()
+                .map(|line| line.advance)
+                .fold(f32::INFINITY, f32::min);
+            println!(
+                "{look}: 40-char word -> {} line(s), advances {narrowest:.0}..{widest:.0}px, \
+                 {} dropped, {} glyphs",
+                layout.lines.len(),
+                layout.dropped,
+                layout.glyphs.len()
+            );
+            assert!(
+                layout.lines.len() >= 2,
+                "{look}: a 40-character word fit one line of {:.0}px",
+                face.wrap_width(BAKE_PX)
+            );
+            assert_eq!(layout.dropped, 0, "{look}: the break dropped characters");
+            assert_eq!(
+                layout.glyphs.len(),
+                40,
+                "{look}: the broken word lost glyphs"
+            );
+            for line in &layout.lines {
+                assert!(
+                    line.advance <= face.wrap_width(BAKE_PX) + 1.0,
+                    "{look}: a chunk is {:.0}px wide on a {:.0}px line",
+                    line.advance,
+                    face.wrap_width(BAKE_PX)
+                );
+            }
+            // Balanced: the shortest chunk is at least half the longest, so there is no fragment.
+            assert!(
+                narrowest > widest * 0.5,
+                "{look}: the chunks are {narrowest:.0}..{widest:.0}px: one is a lone fragment"
+            );
+        }
+    }
+
+    /// The budget and the sheet grow together, so the widest block a wrap can produce still fits
+    /// the texture the layer allocated at [`BAKE_PX`]: a text never falls down the smaller-em
+    /// ladder, and a word never has to be broken to fit the sheet.
+    #[test]
+    fn a_wrapped_block_always_fits_the_sheet() {
+        let sentence: String = "the loom knows what the flesh wants and the loom is us and the \
+                                flesh is the loom"
+            .chars()
+            .take(80)
+            .collect();
+        for (look, face) in every_look() {
+            let (width, height) = super::super::sheet::capacity(&face);
+            for text in [
+                "ilanaVisual",
+                "THE LOOM IS US",
+                sentence.as_str(),
+                "antidisestablishmentarianismss",
+            ] {
+                let layout = face.layout(text, BAKE_PX);
+                println!(
+                    "{look}: {:?} -> {}x{} block, capacity {width}x{height}",
+                    text.chars().take(16).collect::<String>(),
+                    layout.block_w,
+                    layout.block_h
+                );
+                assert!(
+                    (layout.block_w.max(1) as u32) + 2 * super::super::sheet::MARGIN <= width,
+                    "{look}: a {}-character block is {}px wide, the sheet holds {width}px",
+                    text.chars().count(),
+                    layout.block_w
+                );
+                assert!(
+                    (layout.block_h.max(1) as u32) + 2 * super::super::sheet::MARGIN <= height,
+                    "{look}: a {}-line block is {}px tall, the sheet holds {height}px",
+                    layout.lines.len(),
+                    layout.block_h
+                );
+            }
+        }
+    }
+
+    /// The block's height as a fraction of a 960x540 layer, from `text.wgsl`'s own arithmetic at
+    /// `size` 0.8 and the default `spacing` 0.5: `min(0.14 + 0.44 * size, 0.86 * width /
+    /// (aspect * spacing))`. A wrapped block has a larger aspect, so the fit-to-width term binds
+    /// and the block gets *shorter* in the picture instead of the word being split.
+    fn layer_height_fraction(layout: &Layout, size: f32, spacing: f32) -> f32 {
+        let (width, height) = (960.0f32, 540.0f32);
+        let aspect = layout.block_w as f32 / layout.block_h.max(1) as f32;
+        let spacing = 0.92 + spacing * 0.55;
+        let wanted = height * (0.14 + 0.44 * size);
+        let fitted = width * 0.86 / (aspect * spacing);
+        wanted.min(fitted) / height
+    }
+
+    /// The numbers the wrap rule is justified with: lines produced and the block's height as a
+    /// fraction of the layer, for the four texts the task names. This is the calibration a
+    /// reviewer re-measures against; the assertions are the shape of the rule, the printed table
+    /// is the number.
+    #[test]
+    fn the_wrap_budget_by_the_numbers() {
+        let sentence: String = "the loom knows what the flesh wants and the loom is us and the \
+                                flesh is the loom"
+            .chars()
+            .take(80)
+            .collect();
+        assert_eq!(sentence.chars().count(), 80);
+        let word = "antidisestablishmentarianismss".to_string();
+        assert_eq!(word.chars().count(), 30);
+        for (look, face) in every_look() {
+            println!(
+                "{look}: wrap {:.0}px, o advance {:.1}px ({:.2} em)",
+                face.wrap_width(BAKE_PX),
+                face.advance('o', BAKE_PX),
+                face.advance('o', BAKE_PX) / BAKE_PX
+            );
+            for text in ["ilanaVisual", "THE LOOM IS US", sentence.as_str(), word.as_str()] {
+                let drawn = if look == "sigil" {
+                    text.to_uppercase()
+                } else {
+                    (*text).to_string()
+                };
+                let layout = face.layout(&drawn, BAKE_PX);
+                println!(
+                    "  {:<18} {:>3} chars -> {} line(s), block {}x{}, {:.1}% of a 540px layer{}",
+                    format!("{:?}", text.chars().take(16).collect::<String>()),
+                    text.chars().count(),
+                    layout.lines.len(),
+                    layout.block_w,
+                    layout.block_h,
+                    layer_height_fraction(&layout, 0.8, 0.5) * 100.0,
+                    if layout.dropped > 0 {
+                        format!(", {} dropped", layout.dropped)
+                    } else {
+                        String::new()
+                    }
+                );
+                // The two phrases fit one line in every look; the sentence and the word do not.
+                let short = text == "ilanaVisual" || text == "THE LOOM IS US";
+                assert_eq!(
+                    layout.lines.len() == 1,
+                    short,
+                    "{look}: {text:?} produced {} lines",
+                    layout.lines.len()
+                );
+                let fraction = layer_height_fraction(&layout, 0.8, 0.5);
+                assert!(
+                    (0.02..0.6).contains(&fraction),
+                    "{look}: {text:?} is {:.1}% of the layer tall",
+                    fraction * 100.0
+                );
+            }
+        }
+    }
+
+    /// A last line that would hold one word alone takes the word before it down: the same defect
+    /// as a lone fragment of a broken word, with words instead of letters.
+    #[test]
+    fn the_last_line_never_holds_one_word_alone() {
+        let chars: Vec<char> = "aaa bbb ccc ddd".chars().collect();
+        let widths: Vec<f32> = (0..=chars.len()).map(|index| index as f32 * 10.0).collect();
+        let greedy = |lines: &mut Vec<VisualLine>| {
+            *lines = vec![
+                VisualLine { first: 0, end: 11 },
+                VisualLine { first: 12, end: 15 },
+            ];
+        };
+        let mut lines = Vec::new();
+        greedy(&mut lines);
+        no_lone_last_word(&chars, &widths, 120.0, &mut lines);
+        assert_eq!(
+            lines.iter().map(|line| (line.first, line.end)).collect::<Vec<_>>(),
+            vec![(0, 7), (8, 15)],
+            "the last line should have taken `ccc` down from the line above"
+        );
+        // The pair would overflow the line: the widow stays rather than the line.
+        greedy(&mut lines);
+        no_lone_last_word(&chars, &widths, 40.0, &mut lines);
+        assert_eq!(
+            lines.iter().map(|line| (line.first, line.end)).collect::<Vec<_>>(),
+            vec![(0, 11), (12, 15)],
+            "a pair that does not fit must not be forced onto one line"
+        );
+        // A line that follows an explicit break is its own paragraph and is not rebalanced.
+        let chars: Vec<char> = "aa\nbb".chars().collect();
+        let widths: Vec<f32> = (0..=chars.len()).map(|index| index as f32 * 10.0).collect();
+        let mut lines = vec![
+            VisualLine { first: 0, end: 2 },
+            VisualLine { first: 3, end: 5 },
+        ];
+        no_lone_last_word(&chars, &widths, 120.0, &mut lines);
+        assert_eq!(
+            lines.iter().map(|line| (line.first, line.end)).collect::<Vec<_>>(),
+            vec![(0, 2), (3, 5)],
+            "a line after an explicit break was pulled across it"
+        );
+        // And a real phrase: a wrapped block's last line reads as a line, not as one leftover
+        // word under a full one.
+        for text in [
+            "the loom knows what the flesh wants and the loom is us",
+            "one two three four five six seven eight nine ten eleven",
+        ] {
+            for (look, face) in every_look() {
+                let drawn = if look == "sigil" {
+                    text.to_uppercase()
+                } else {
+                    text.to_string()
+                };
+                let layout = face.layout(&drawn, BAKE_PX);
+                let last = layout.lines.len().saturating_sub(1);
+                let on_last = layout.words.iter().filter(|word| word.2 == last).count();
+                println!(
+                    "{look}: {text:?} -> {} lines, {on_last} word(s) on the last",
+                    layout.lines.len()
+                );
+                assert!(
+                    layout.lines.len() < 2 || on_last >= 2,
+                    "{look}: the block ends on one lone word"
+                );
+            }
         }
     }
 }
