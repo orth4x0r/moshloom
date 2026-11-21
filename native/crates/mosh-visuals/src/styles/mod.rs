@@ -5,14 +5,18 @@
 //! | --- | --- | --- |
 //! | Sigil + Smear | `cyber` | S-cyber |
 //! | Chrome + Glass + Aura + Fold | `aero` | S-aero |
+//! | Hyper + Wave | `novel` | S-novel |
 //!
-//! Sixteen abstract scenes in six packs. The palette is contemporary abstract digital art — chrome
-//! sigil linework, liquid metal, iridescent foil, gradient meshes, glass dispersion, silk, topographic
-//! contours, sorted streaks — and there is deliberately nothing retro-literal in here: no synthwave
+//! Twenty-two abstract and mathematical scenes in eight packs. The palette is contemporary abstract
+//! digital art — chrome sigil linework, liquid metal, iridescent foil, gradient meshes, glass
+//! dispersion, silk, topographic contours, sorted streaks, plus non-Euclidean Poincaré / Kleinian
+//! geometry, 4D Hopf fibrations, spectral Chladni cymatics, aperiodic quasicrystals, and analytical
+//! curl tensor streamlines — and there is deliberately nothing retro-literal in here: no synthwave
 //! grid or sun, no CRT, no scanlines, no VHS, no glyph rain, no pixel font, no hills, globes or skies.
 //! The look is carried by `paint.wgsl` (shared chrome, iridescence, grain and the highlight shoulder)
-//! and by the per-scene bodies; `tests/styles_cyber.rs` and `tests/styles_aero.rs` hold both packs to
-//! lit, beat-reactive, unclipped pixels and to the 0.5 ms budget.
+//! and by the per-scene bodies; `tests/styles_cyber.rs`, `tests/styles_aero.rs`, and
+//! `tests/styles_novel.rs` hold all packs to lit, beat-reactive, unclipped pixels and to the 0.5 ms
+//! budget.
 //!
 //! A style scene's `body` is WGSL written on top of [`prelude`]: the native scene prelude
 //! (`scenes/prelude.wgsl`: `U`, `lut`, `mel`, `melh`, `XY`, `h1`, `h2`, the five inputs palT,
@@ -24,6 +28,7 @@
 
 pub mod aero;
 pub mod cyber;
+pub mod novel;
 
 /// One native scene.
 #[derive(Clone, Copy, Debug)]
@@ -32,7 +37,7 @@ pub struct StyleScene {
     pub id: &'static str,
     /// Display name.
     pub name: &'static str,
-    /// Pack name shown in the browser ("Cybersigil", "Glitch", "Y2K", "Frutiger Aero").
+    /// Pack name shown in the browser ("Sigil", "Smear", "Chrome", "Glass", "Aura", "Fold", "Hyper", "Wave").
     pub pack: &'static str,
     /// What `p0..p7` mean for this scene (shown in the clip editor).
     pub params: [&'static str; 8],
@@ -42,7 +47,10 @@ pub struct StyleScene {
 
 /// Every style scene, pack by pack.
 pub fn all() -> impl Iterator<Item = &'static StyleScene> {
-    cyber::SCENES.iter().chain(aero::SCENES.iter())
+    cyber::SCENES
+        .iter()
+        .chain(aero::SCENES.iter())
+        .chain(novel::SCENES.iter())
 }
 
 /// The prelude a style body is compiled on: the scene prelude with `p0..p7` readable.

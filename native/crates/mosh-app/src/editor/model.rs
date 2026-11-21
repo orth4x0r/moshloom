@@ -820,7 +820,7 @@ impl EditorModel {
                 clip.effects.push(EffectSlot {
                     kind,
                     amount: 0.5,
-                    param: 0.5,
+                    param: if kind == EffectKind::Mosh { 0.0 } else { 0.5 },
                 });
                 Ok(EditorOutcome::changed())
             }
@@ -1668,7 +1668,7 @@ pub fn new_clip(id: ClipId, visualizer: &str) -> Clip {
             vec![EffectSlot {
                 kind: EffectKind::Mosh,
                 amount,
-                param: 0.5,
+                param: 0.0,
             }],
             Transition {
                 kind: TransitionKind::Datamosh,

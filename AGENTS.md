@@ -1,10 +1,12 @@
 # AGENTS.md — working contract
 
-Moshloom is a single-page app with two test harnesses. Several agents work in this repo at
-the same time, so this file is the contract. If a task prompt conflicts with it, this file
-wins and the conflict gets reported, never silently resolved.
+**Active codebase:** `native/` (**ilanaVisual**, Rust + Vulkan). The browser web app at the repo
+root (`engine.c`, `gpu.js`, `index.src.html`, `index.html`) is **deprecated** and kept frozen as a
+legacy reference implementation. Several agents may work in this repo at the same time, so this
+file is the contract. If a task prompt conflicts with it, this file wins and the conflict gets
+reported, never silently resolved.
 
-## The shape of the code
+## The shape of the legacy web app (deprecated — read-only reference)
 
     engine.c   --build-->  engine.wasm     freestanding C: analysis, tempo, timeline, per-frame plan
     gpu.js                                 WGSL shaders + WebGPU frame loop; no document/window,
@@ -14,7 +16,7 @@ wins and the conflict gets reported, never silently resolved.
     test.mjs                               CPU harness (node only)
     gpu_test.mjs                           headless Chromium + WebGPU harness
 
-## Hard rules
+## Hard rules (legacy web reference — frozen)
 
 1. **Never edit `index.html` by hand.** It is generated: edit `index.src.html` / `gpu.js`, then
    `python pack.py`. `npm test` re-packs in `pretest`, so a hand edit is silently lost.
@@ -22,7 +24,7 @@ wins and the conflict gets reported, never silently resolved.
    with the committed binary, and `fixtures/golden/meta.json` records which. Differing pixels
    are a finding, not something to accept. Re-record only with `npm run golden:record`, only
    when the pixel change is the point of the task, and say why in the commit body.
-3. **`npm test` is the gate, and green is numbers, not a sentence:** goldens *N/13, 0 differing
+3. **`npm test` is the legacy web gate, and green is numbers, not a sentence:** goldens *N/13, 0 differing
    pixels*, CPU ms/frame, plus every step that skipped and the reason it skipped.
 4. **Do not rebuild `engine.wasm`** unless the task is about the engine. A different clang moves
    mosh frames by up to 19% of pixels and invalidates every golden.
@@ -30,16 +32,16 @@ wins and the conflict gets reported, never silently resolved.
 6. **One headed-Chrome run at a time.** `npm run test:gpu:hw` takes the real GPU. Only the
    coordinator runs it, only on the primary checkout, never alongside another run.
 
-## Fan-out lanes
+## Legacy web fan-out lanes (deprecated / archived)
 
 Up to **four** workers at once, one lane each, never two workers in the same lane.
 
-| lane | owns | queue, in order |
+| lane | owns | status |
 | --- | --- | --- |
-| **A · UI / worker** | `index.src.html`, `gpu.js`, `pack.py` | T1d (parked, see State) |
-| **B · harness** | `gpu_test.mjs`, `test.mjs` | (empty) |
-| **C · gates** | `scripts/gate*`, `scripts/testdata/**` | (empty) |
-| **D · tooling** | `package.json`, `package-lock.json` | (empty) |
+| **A · UI / worker** | `index.src.html`, `gpu.js`, `pack.py` | deprecated (frozen reference) |
+| **B · harness** | `gpu_test.mjs`, `test.mjs` | deprecated (frozen reference) |
+| **C · gates** | `scripts/gate*`, `scripts/testdata/**` | deprecated (frozen reference) |
+| **D · tooling** | `package.json`, `package-lock.json` | deprecated (frozen reference) |
 | **E · docs** | `README.md`, `lab/*/README.md`, `.github/workflows/ci.yml` | coordinator |
 | **frozen** | `AGENTS.md`, `fixtures/**`, `engine.c`, `engine.wasm`, `build.*`, `lab/`, `index.html` | coordinator only |
 

@@ -1088,7 +1088,7 @@ pub fn default_project() -> Project {
                 effects: vec![EffectSlot {
                     kind: EffectKind::Mosh,
                     amount: default_mosh(visualizer).0,
-                    param: 0.5,
+                    param: 0.0,
                 }],
                 transition_in: default_transition(row, visualizer),
                 follow: FollowAction::None,

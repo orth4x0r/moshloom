@@ -827,7 +827,7 @@ fn a_new_clip_starts_with_the_web_mosh_default() {
                     vec![EffectSlot {
                         kind: EffectKind::Mosh,
                         amount,
-                        param: 0.5,
+                        param: 0.0,
                     }],
                     "{}",
                     entry.id

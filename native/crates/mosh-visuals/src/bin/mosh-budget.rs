@@ -310,7 +310,7 @@ impl LayerSpec {
         let slot = |kind, amount| EffectSlot {
             kind,
             amount,
-            param: 0.5,
+            param: if kind == EffectKind::Mosh { 0.0 } else { 0.5 },
         };
         let spec = |visualizer, effects, (blend, opacity, scale)| LayerSpec {
             visualizer,

@@ -72,9 +72,20 @@
 //! forgotten, so the next non-zero amount starts on an I-frame. `leak` is floored at 0.004, so
 //! `amount = 1` cannot freeze a layer forever.
 //!
-//! Freeze/bloom (`mvScale *= 1.02` per frame before a Melt) is *not* ported: nothing in the native
-//! render plan asks for it yet (`LayerState.transition` is the *entering* transition, not the
-//! upcoming one). `mv_scale` is a uniform field and is always 1.0 until then.
+//! # Freeze / Bloom (`mv_scale`)
+//!
+//! Ported from `engine.c:342,349,370,372,391` and `gpu.js:893,902-903,912`: when a layer is frozen
+//! (via [`MoshPass::set_freeze`], driven by an active `TransitionKind::Melt` or by `EffectKind::Mosh`'s
+//! `param` as `bloom` in the last `bloom * 0.5` of each 4-beat bar via [`MoshPass::bloom_freeze`]):
+//!
+//! * the motion estimation pass is **skipped** (once at least one P-frame has populated `motion`),
+//!   reusing the frozen motion vectors from the frame before the freeze;
+//! * `mv_scale` grows multiplicatively every frozen frame (`mv_scale *= 1.02`, capped at `64.0` to
+//!   prevent `f32` overflow on a paused transport), stretching the carried smear exponentially;
+//! * `skipres` is forced on (`PL[2] = P.skipres || P.freeze`), so the residual and leak are
+//!   suppressed for the duration of the freeze.
+//!
+//! On the first non-frozen P-frame (or on an I-frame / `invalidate`), `mv_scale` resets to `1.0`.
 //!
 //! # I-frames
 //!
@@ -151,6 +162,14 @@ const COARSE_ABOVE: f32 = 0.85;
 /// entry frame only (`entered` is true on exactly one frame), so this is one.
 const SKIPRES_FRAMES: u32 = 1;
 
+/// Per-frame multiplier on the frozen motion vector scale (`gpu.js:902`: `G.mvScale *= 1.02`,
+/// `engine.c:370`: `mvx[i] *= 1.02f; mvy[i] *= 1.02f`).
+const FREEZE_MV_GROWTH: f32 = 1.02;
+
+/// Safety cap on `mv_scale` (~210 consecutive frozen frames = 3.5 s at 60 fps) so an indefinitely
+/// held freeze (e.g. a paused transport inside a bloom window) never overflows `f32`.
+const MAX_MV_SCALE: f32 = 64.0;
+
 const MOTION_UNIFORM_BYTES: usize = 16;
 const FEEDBACK_UNIFORM_BYTES: usize = 40;
 const COPY_UNIFORM_BYTES: usize = 16;
@@ -176,6 +195,9 @@ struct LayerState {
     grid_front: usize,
     /// 40x23 displacement field, RG = grid pixels per frame, forward.
     motion: LayerTarget,
+    /// True once `motion` has been written at least once since creation / `invalidate`, so a
+    /// freeze pass never reads an uninitialized motion texture.
+    has_motion: bool,
     /// Fallback copy of last frame's source picture, allocated lazily only when `src` is a
     /// single-image target (`LayerTarget::new_single`). A ping-pong `src` (such as
     /// `LayerSlot::scene`) already keeps last frame's image in its back half, so no copy pass
@@ -190,6 +212,10 @@ struct LayerState {
     valid: bool,
     /// Frames that must still run without the residual (`skipres`), set by `carry_over`.
     skipres_frames: u32,
+    /// Multiplicative scale on the frozen motion field (`G.mvScale` in `gpu.js`).
+    mv_scale: f32,
+    /// One-shot freeze request for the next `apply`, set by `set_freeze`.
+    freeze_next: bool,
 }
 
 impl LayerState {
@@ -201,12 +227,15 @@ impl LayerState {
             ],
             grid_front: 0,
             motion: LayerTarget::new(gpu, MOTION_WIDTH, MOTION_HEIGHT),
+            has_motion: false,
             prev_src: None,
             last_src_id: 0,
             last_src_writes: 0,
             last_time_s: f64::NAN,
             valid: false,
             skipres_frames: 0,
+            mv_scale: 1.0,
+            freeze_next: false,
         }
     }
 }
@@ -299,23 +328,43 @@ impl MoshPass {
 
         let src_id = src.id();
         let src_writes = src.writes();
+        let freeze = std::mem::take(&mut state.freeze_next);
         if iframe {
             rec.draw(copy, dst, &copy_uniform, &[src])?;
+            state.mv_scale = 1.0;
         } else {
-            let motion_uniform = motion_uniform(GRID);
-            rec.draw(
-                motion,
-                &state.motion,
-                &motion_uniform,
-                &[&state.grids[next_grid], &state.grids[state.grid_front]],
-            )?;
+            // `gpu.js:902,912`: while frozen, skip motion re-estimation (reusing the previous
+            // frame's vectors) and stretch `mv_scale *= 1.02` each frame; otherwise re-estimate
+            // motion and reset `mv_scale = 1.0`. If `motion` has never been written yet (the first
+            // P-frame after an I-frame), run it once so the texture is initialized before freezing.
+            if freeze && state.has_motion {
+                state.mv_scale = (state.mv_scale * FREEZE_MV_GROWTH).min(MAX_MV_SCALE);
+            } else {
+                let motion_uniform = motion_uniform(GRID);
+                rec.draw(
+                    motion,
+                    &state.motion,
+                    &motion_uniform,
+                    &[&state.grids[next_grid], &state.grids[state.grid_front]],
+                )?;
+                state.has_motion = true;
+                if freeze {
+                    state.mv_scale = (state.mv_scale * FREEZE_MV_GROWTH).min(MAX_MV_SCALE);
+                } else {
+                    state.mv_scale = 1.0;
+                }
+            }
             // `skipres` is consumed by a P-frame, not by an I-frame: an I-frame has already
             // replaced the picture, so it must not eat the carry-over it interrupts.
-            let skipres = state.skipres_frames > 0;
-            if skipres {
+            // `engine.c:391`: `PL[2] = P.skipres || P.freeze` — a frozen frame also suppresses the
+            // residual and leak so the carried picture blooms cleanly along the frozen vectors.
+            let carry_skip = state.skipres_frames > 0;
+            if carry_skip {
                 state.skipres_frames -= 1;
             }
-            let feedback_uniform = feedback_uniform(res, amount, GRID, skipres);
+            let skipres = carry_skip || freeze;
+            let feedback_uniform =
+                feedback_uniform(res, amount, state.mv_scale, GRID, skipres);
             let flow = extra_flow.unwrap_or(no_flow);
             // When `src` is a ping-pong target written once since our last call, its back image
             // *is* last frame's source (zero copy). When `src` was not redrawn since last call,
@@ -368,6 +417,9 @@ impl MoshPass {
     pub fn invalidate(&mut self, layer: usize) {
         if let Some(Some(state)) = self.layers.get_mut(layer) {
             state.valid = false;
+            state.has_motion = false;
+            state.mv_scale = 1.0;
+            state.freeze_next = false;
         }
     }
 
@@ -387,6 +439,38 @@ impl MoshPass {
         if let Some(Some(state)) = self.layers.get_mut(layer) {
             state.skipres_frames = SKIPRES_FRAMES;
         }
+    }
+
+    /// Requests freeze/bloom on the next [`MoshPass::apply`] for `layer` (one-shot per frame).
+    ///
+    /// When `freeze` is `true` on a P-frame, motion estimation is skipped (reusing the previous
+    /// frame's motion vectors), `mv_scale` is multiplied by `1.02`, and `skipres` is forced on.
+    /// Calling `set_freeze(layer, false)` (or not calling it before the next P-frame) resumes
+    /// normal motion estimation and resets `mv_scale` to `1.0`.
+    pub fn set_freeze(&mut self, layer: usize, freeze: bool) {
+        if let Some(Some(state)) = self.layers.get_mut(layer) {
+            state.freeze_next = freeze;
+        }
+    }
+
+    /// Current multiplicative scale applied to `layer`'s motion field (`1.0` when not frozen,
+    /// growing by `1.02` per frozen frame up to `64.0`).
+    pub fn mv_scale(&self, layer: usize) -> f32 {
+        self.layers
+            .get(layer)
+            .and_then(|slot| slot.as_ref())
+            .map_or(1.0, |state| state.mv_scale)
+    }
+
+    /// The web app's periodic bar-end bloom rule (`engine.c:349`):
+    /// `if (bloom > 0 && fract(bar_phase) > 1.0 - bloom * 0.5) freeze = true`.
+    pub fn bloom_freeze(bloom: f32, bar_phase: f32) -> bool {
+        let bloom = bloom.clamp(0.0, 1.0);
+        if bloom <= 0.0 || !bar_phase.is_finite() {
+            return false;
+        }
+        let phase = bar_phase.rem_euclid(1.0);
+        phase > 1.0 - bloom * 0.5
     }
 }
 
@@ -408,15 +492,20 @@ fn motion_uniform(grid: [f32; 2]) -> [u8; MOTION_UNIFORM_BYTES] {
     bytes
 }
 
-fn feedback_uniform(res: [f32; 2], amount: f32, grid: [f32; 2], skipres: bool) -> [u8; FEEDBACK_UNIFORM_BYTES] {
+fn feedback_uniform(
+    res: [f32; 2],
+    amount: f32,
+    mv_scale: f32,
+    grid: [f32; 2],
+    skipres: bool,
+) -> [u8; FEEDBACK_UNIFORM_BYTES] {
     let mut bytes = [0u8; FEEDBACK_UNIFORM_BYTES];
     let amount = amount.clamp(0.0, 1.0);
     write_f32(&mut bytes, 0, res[0]);
     write_f32(&mut bytes, 4, res[1]);
     // `decide()`: leak = (1 - m)^5, floored; gain = 1 + 2.2 * m; coarse = m > 0.85.
     write_f32(&mut bytes, 8, leak_for(amount));
-    // No freeze/bloom yet: the web multiplies this by 1.02 per frozen frame (see the module).
-    write_f32(&mut bytes, 12, 1.0);
+    write_f32(&mut bytes, 12, mv_scale.clamp(1.0, MAX_MV_SCALE));
     write_f32(&mut bytes, 16, 1.0 + GAIN_PER_AMOUNT * amount);
     write_f32(&mut bytes, 20, if skipres { 1.0 } else { 0.0 });
     write_f32(&mut bytes, 24, if amount > COARSE_ABOVE { 1.0 } else { 0.0 });
@@ -463,13 +552,13 @@ mod tests {
         assert_eq!(at(&motion, 4), 180.0);
 
         // `struct FU` in mosh_feedback.wgsl: res, leak, mv_scale, gain, skipres, coarse, pad, grid.
-        let feedback = feedback_uniform([960.0, 540.0], 0.8, GRID, false);
+        let feedback = feedback_uniform([960.0, 540.0], 0.8, 1.0, GRID, false);
         assert_eq!(FEEDBACK_UNIFORM_BYTES, 40);
         assert_eq!(at(&feedback, 0), 960.0);
         assert_eq!(at(&feedback, 4), 540.0);
         // amount 0.8: (1 - 0.8)^5 = 0.00032, so the floor takes over.
         assert_eq!(at(&feedback, 8), MIN_LEAK);
-        assert_eq!(at(&feedback, 12), 1.0, "mvScale: no freeze/bloom yet");
+        assert_eq!(at(&feedback, 12), 1.0, "mvScale when not frozen");
         assert_eq!(at(&feedback, 16), 1.0 + 2.2 * 0.8);
         assert_eq!(at(&feedback, 20), 0.0, "skipres off");
         assert_eq!(at(&feedback, 24), 0.0, "0.8 is not coarse");
@@ -477,22 +566,42 @@ mod tests {
         assert_eq!(at(&feedback, 32), 320.0);
         assert_eq!(at(&feedback, 36), 180.0);
 
+        // Frozen mv_scale flows through to offset 12 and is clamped to [1.0, MAX_MV_SCALE].
+        let frozen = feedback_uniform([960.0, 540.0], 0.8, 1.02f32.powi(10), GRID, true);
+        assert!((at(&frozen, 12) - 1.02f32.powi(10)).abs() < 1e-6);
+        assert_eq!(at(&frozen, 20), 1.0, "skipres on while frozen");
+        let capped = feedback_uniform([960.0, 540.0], 0.8, 999.0, GRID, true);
+        assert_eq!(at(&capped, 12), MAX_MV_SCALE);
+
         // The fifth power and its floor, and the two thresholds that come with it.
-        let low = feedback_uniform([1.0, 1.0], 0.6, GRID, false);
+        let low = feedback_uniform([1.0, 1.0], 0.6, 1.0, GRID, false);
         assert!((at(&low, 8) - 0.4f32.powi(5)).abs() < 1e-7);
         assert_eq!(at(&low, 24), 0.0);
-        let high = feedback_uniform([1.0, 1.0], 0.9, GRID, true);
+        let high = feedback_uniform([1.0, 1.0], 0.9, 1.0, GRID, true);
         assert_eq!(at(&high, 8), MIN_LEAK);
         assert_eq!(at(&high, 20), 1.0, "skipres on");
         assert_eq!(at(&high, 24), 1.0, "0.9 is coarse");
 
         // Out-of-range amounts are clamped rather than fed to the shader.
-        let over = feedback_uniform([1.0, 1.0], 4.0, GRID, false);
+        let over = feedback_uniform([1.0, 1.0], 4.0, 1.0, GRID, false);
         assert_eq!(at(&over, 8), MIN_LEAK);
         assert_eq!(at(&over, 16), 3.2);
-        let under = feedback_uniform([1.0, 1.0], -2.0, GRID, false);
+        let under = feedback_uniform([1.0, 1.0], -2.0, 0.25, GRID, false);
         assert_eq!(at(&under, 8), 1.0, "amount 0 leaks everything");
+        assert_eq!(at(&under, 12), 1.0, "mv_scale never drops below 1.0");
         assert_eq!(at(&under, 16), 1.0, "and gains nothing");
+    }
+
+    #[test]
+    fn bloom_freeze_matches_engine_c_bar_window() {
+        // engine.c:349: if (bloom > 0) { if (fr > 1 - bloom * 0.5) freeze = 1; }
+        assert!(!MoshPass::bloom_freeze(0.0, 0.99), "bloom 0 never freezes");
+        assert!(!MoshPass::bloom_freeze(0.5, 0.74), "before last quarter of bar");
+        assert!(!MoshPass::bloom_freeze(0.5, 0.75), "strict > matches engine.c");
+        assert!(MoshPass::bloom_freeze(0.5, 0.76), "inside last quarter of bar");
+        assert!(MoshPass::bloom_freeze(1.0, 0.51), "bloom 1.0 covers second half of bar");
+        assert!(!MoshPass::bloom_freeze(1.0, 0.49), "first half of bar stays unfrozen");
+        assert!(!MoshPass::bloom_freeze(0.5, f32::NAN), "non-finite phase never freezes");
     }
 
     #[test]

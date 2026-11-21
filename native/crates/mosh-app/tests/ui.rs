@@ -877,7 +877,9 @@ fn browser_groups_fold_away() {
             })
             .sum()
     };
-    let mut harness = Harness::new((1280.0, 1400.0));
+    // Tall enough to fit every open browser group without scroll-clipping the bottom packs
+    // (otherwise folding a top group pulls clipped rows into view).
+    let mut harness = Harness::new((1280.0, 2200.0));
     // The retro looks start folded away; everything else starts open.
     assert_eq!(
         harness.state.folded,

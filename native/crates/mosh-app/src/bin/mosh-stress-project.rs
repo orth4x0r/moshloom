@@ -27,7 +27,11 @@ fn clip(id: u32, visualizer: &str, effects: Vec<EffectSlot>, video: Option<Strin
 }
 
 fn slot(kind: EffectKind, amount: f32) -> EffectSlot {
-    EffectSlot { kind, amount, param: 0.5 }
+    EffectSlot {
+        kind,
+        amount,
+        param: if kind == EffectKind::Mosh { 0.0 } else { 0.5 },
+    }
 }
 
 fn main() {

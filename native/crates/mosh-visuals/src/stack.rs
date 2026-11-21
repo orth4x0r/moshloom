@@ -1,4 +1,4 @@
-﻿//! The whole layer stack: consecutive picture layers in one composite pass, with `Adjustment`
+//! The whole layer stack: consecutive picture layers in one composite pass, with `Adjustment`
 //! and `Mask` layers as the seams between segments. Owner: L-stack (wave 3).
 //!
 //! A frame is composed by [`Stack::compose`], which is what the app calls instead of
@@ -273,12 +273,18 @@ impl Stack {
         }
         self.last_clip[index] = state.clip;
 
-        let amount = state
+        let (amount, bloom) = state
             .effects
             .iter()
             .filter(|slot| slot.kind == EffectKind::Mosh)
-            .map(|slot| slot.amount)
-            .fold(0.0f32, f32::max);
+            .fold((0.0f32, 0.0f32), |(max_amt, max_bloom), slot| {
+                let next_bloom = if slot.amount > 0.0 {
+                    max_bloom.max(slot.param)
+                } else {
+                    max_bloom
+                };
+                (max_amt.max(slot.amount), next_bloom)
+            });
         // No mosh slot this frame is an I-frame, exactly as in `Visuals::draw_layer`: the web app
         // does `if (m <= 0.001) iframe = 1`, so the buffer is forgotten and the next mosh frame
         // starts from a fresh picture instead of carrying a stale one.
@@ -316,6 +322,7 @@ impl Stack {
             let source = resolve(&self.below, &self.mosh_out, &self.effected, acc)
                 .expect("an applied adjustment has a composite below it");
             let destination = self.mosh_out.as_ref().expect("mosh output");
+            mosh.set_freeze(index, MoshPass::bloom_freeze(bloom, frame.bar_phase));
             if mosh.apply(&mut recorder, index, source, destination, amount, frame, flow)? {
                 current = Base::Mosh;
             }

@@ -1,6 +1,12 @@
-# Moshloom
+# Moshloom / ilanaVisual
 
-Audio-reactive datamosh visualizer with a block timeline.
+> **Deprecation notice (web app):** The browser WebGPU/wasm web app (`index.html`, `index.src.html`, `gpu.js`, `engine.c`) is **deprecated** and kept frozen as a read-only legacy reference implementation and test baseline.
+>
+> **Active application: [ilanaVisual](#ilanavisual-rust-vulkan)** (`native/`, by Ilana Audio) — a native Rust + Vulkan live visual instrument for playing next to Ableton Live, with VST3 Tap + Control plugins, real-time audio analysis, web-faithful P-frame datamosh (including freeze/bloom), 38 visualizers (16 Classic, 22 native Style scenes across 8 packs, plus Fluid, Particles, Camera, Text, and HAP/Video overlay layers), and sub-6 ms 1080p GPU frames on integrated graphics.
+
+## Legacy Web App (Deprecated Reference)
+
+Audio-reactive datamosh visualizer with a block timeline (legacy browser build — no new features are added here).
 
 - **wasm (C)** is the brain: audio analysis, tempo, the timeline, and every per-frame decision
   (which block, I-frame or not, freeze, strobe, glitch ops). `plan(f)` returns that as floats.
@@ -8,11 +14,6 @@ Audio-reactive datamosh visualizer with a block timeline.
   a stable-fluids solver that can stir the mosh, the mosh feedback pass, and the output pass.
 - If WebGPU is missing or the device is lost, the app falls back to the CPU renderer in the
   same wasm (`render(f)`), which has the first 8 visuals only.
-
-**In progress: ilanaVisual** (`native/`, by Ilana Audio), a Rust + Vulkan port for playing live
-next to Ableton Live: two VST3 plugins feed it the master audio and Live's transport, and it runs
-hands-free on the integrated GPU. See [ilanaVisual](#ilanavisual-rust-in-progress) below.
-The web app stays as the reference implementation.
 
 Files
 - `engine.c`        engine (freestanding C, no libc); `build.sh` / `build.bat` build `engine.wasm`
@@ -382,7 +383,7 @@ mid, high, pulse, vari, dens, beat, mel[24], line colours l0..l2; helpers `lut()
 `mel()`, `melh()`, `ca()`), add its name/colour to `SCENES` in index.src.html, and a
 default palette to `DEFPAL` in engine.c (raise the scene limit there and in `pack_scene`).
 
-## ilanaVisual (Rust, in progress)
+## ilanaVisual (Rust + Vulkan)
 
 A native Windows rebuild for live shows: the performer presses play on backing tracks in Ableton
 Live and sings; nothing is touched during the set, so the visuals follow Live by themselves.
@@ -507,7 +508,9 @@ number — it is the same work minus presentation.
 | camera layer (L-camera, the laptop's "USB2.0 HD UVC WebCam", 1280x720) | 30.3 frames/s captured on its own thread, newest frame wins; render-thread recording 0.08-0.35 ms median; draw pass 0.16 ms at 1080p (same as the video overlay); first picture 4.8-6.4 s after the camera is chosen (Windows format negotiation; the layer stays black meanwhile, never blocks) |
 | **HAP overlay video** (O-hap: HAP, HAP Alpha, HAP Q, HAP Q Alpha in .mov; BC1/BC3/BC4 uploaded compressed, no CPU decode) | 1080p frame read + Snappy 0.54 ms (release); 0.99 MB uploaded per frame instead of 8.3 MB; GPU memory per layer 2.97 MB instead of 23.7 MB; straight alpha in, premultiplied out (50% red over blue reads back [128,0,127]). Tested with generated files only, not yet a file from a real HAP encoder |
 | particle layer (L-particles, 960x540) | 0.83 ms release at the default count (~270 particles; 1.2-2.0 ms at the maximum count); a kick lifts the light +262%; 5 000 noisy frames stay finite; particles are texels drawn by gathering (the renderer has no compute or instancing) |
+| datamosh freeze/bloom (`MoshPass::set_freeze`, `bloom_freeze`) | matches web `gpu.js` / `engine.c:349`: while frozen (`TransitionKind::Melt` or `EffectKind::Mosh` `param` bloom with `bar_phase > 1.0 - bloom * 0.5`), skips `mosh motion`, multiplies `mvScale *= 1.02` per frame (capped at `64.0`), and forces `skipres`, resetting `mvScale = 1.0` on unfreeze/I-frame. GPU integration tests (`tests/mosh.rs`): 10 frozen frames reach `mvScale 1.2190`, `51.2/255` drift, motion pass skipped during freeze and resumed on unfreeze, 0 validation messages |
 | style packs (S-abstract #58: 16 abstract scenes in 6 packs) | worst median 0.25-0.26 ms at 960x540 (release); no scene clips more than 2% of its pixels to white; every control of the Sigil and Smear scenes moves its picture (tested). The synthwave horizon, holo globe, aqua hills, broken CRT and ASCII raster are gone; sigils are thick chrome rods, the glitch scenes are luminous smears, and Aura Mesh, Contour Field, Glass Refract, Foil Fold and Silk Ribbon are new |
+| novel style packs (Hyper + Wave: 6 scenes in 2 packs, `styles/novel/`) | `Poincare Tessellation` (0.114 ms), `Hopf Fibration` (0.218 ms), `Kleinian Apollyon` (0.232 ms), `Chladni Cymatics` (0.220 ms), `Quasicrystal Lattice` (0.222 ms), `Tensor Streamlines` (0.221 ms) at 960x540 release (empty pass 0.046 ms; worst 0.232 ms < 0.500 ms budget); 0.00% clipped white across all 6 previews; all `p0..p7` controls active and beat-reactive without strobing (`tests/styles_novel.rs`, 5/5 pass, 0 validation messages). Stress `mosh-budget --warmup 120` at 1080p: median 3.001 ms, p95 3.881 ms, max 4.732 ms, CPU record 0.729 ms, 148.01 MB |
 | retro web scenes (Grid, Glyph rain, Scan, Punch cards) | moved to a Legacy browser group, last and folded; still load in old projects; the default project's Autopilot grid uses Aura Mesh, Contour Field, Glass Refract and Silk Ribbon in their place |
 | stage frame rate cap | `--fps` (default 60): at most 60 frames a second on a 120 Hz panel, one high-resolution wait per frame, no spin; a stale deadline resyncs instead of bursting |
 

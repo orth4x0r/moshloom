@@ -1325,3 +1325,220 @@ fn ping_pong_and_single_image_sources_produce_identical_mosh() {
     assert_no_validation_messages(&gpu);
 }
 
+#[test]
+fn freeze_bloom_grows_mv_scale_skips_motion_and_resets_on_unfreeze() {
+    const TEXTURE_WGSL: &str = r#"
+struct S {
+    shift: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> s: S;
+@fragment
+fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    if (s.shift.z > 0.5) {
+        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    }
+    let x = pos.x + s.shift.x;
+    let y = pos.y + s.shift.y;
+    let r = 0.5 + 0.45 * sin(x * 0.37) * cos(y * 0.23);
+    let g = 0.5 + 0.45 * sin((x + y) * 0.29 + 1.1);
+    let b = 0.5 + 0.45 * cos((x - y * 0.7) * 0.41 + 2.3);
+    return vec4<f32>(r, g, b, 1.0);
+}
+"#;
+    let gpu = gpu();
+    let (width, height) = (320u32, 180u32);
+    let texture = pipeline(&gpu, TEXTURE_WGSL, 16, 0);
+    let src = LayerTarget::new(&gpu, width, height);
+    let dst = LayerTarget::new(&gpu, width, height);
+    let mut mosh = MoshPass::new(&gpu, width, height).expect("mosh pass");
+
+    // 3 warm frames: I-frame + 2 P-frames of the 2D texture sliding right 4 px/frame so every 8x8
+    // analysis block holds a real non-zero motion vector before the freeze.
+    for step in 0..3u32 {
+        let shift = -4.0 * step as f32;
+        let frame = AnalysisFrame {
+            time_s: step as f64 / 60.0,
+            ..Default::default()
+        };
+        let mut rec = FrameRecorder::new(&gpu);
+        rec.draw(&texture, &src, &vec4_uniform([shift, 0.0, 0.0, 0.0]), &[])
+            .expect("texture");
+        mosh.apply(&mut rec, 0, &src, &dst, 0.85, &frame, None)
+            .expect("mosh");
+        gpu.wait_frame(rec.submit());
+        assert_eq!(mosh.mv_scale(0), 1.0, "unfrozen frame {step} keeps mv_scale 1.0");
+    }
+    let before_freeze = gpu.read_back(&dst);
+
+    // Freeze for 10 frames while the source is completely STILL (and on frame 10 turns solid white
+    // to prove `skipres` suppresses residual & leak during freeze):
+    // * motion estimation must be skipped (`mosh motion` absent from passes);
+    // * mv_scale must multiply by 1.02 each frame;
+    // * the carried picture must keep advecting every frame along the frozen vectors.
+    let mut prev_out = before_freeze.clone();
+    let mut frozen_step_deltas = Vec::new();
+    for k in 1..=10u32 {
+        let frame = AnalysisFrame {
+            time_s: (2 + k) as f64 / 60.0,
+            ..Default::default()
+        };
+        let solid_white = if k == 10 { 1.0 } else { 0.0 };
+        let mut rec = FrameRecorder::new(&gpu);
+        rec.draw(
+            &texture,
+            &src,
+            &vec4_uniform([-8.0, 0.0, solid_white, 0.0]),
+            &[],
+        )
+        .expect("static texture");
+        mosh.set_freeze(0, true);
+        mosh.apply(&mut rec, 0, &src, &dst, 0.85, &frame, None)
+            .expect("frozen mosh");
+        let timings = gpu.wait_frame(rec.submit());
+        let expected = 1.02f32.powi(k as i32);
+        assert!(
+            (mosh.mv_scale(0) - expected).abs() < 1e-5,
+            "frozen frame {k}: mv_scale {} != expected {expected}",
+            mosh.mv_scale(0)
+        );
+        assert!(
+            !timings.per_pass_ms.iter().any(|(name, _)| *name == "mosh motion"),
+            "frozen frame {k}: motion pass must be skipped: {:?}",
+            timings.per_pass_ms
+        );
+        let curr_out = gpu.read_back(&dst);
+        frozen_step_deltas.push(mean_abs_difference(&prev_out, &curr_out));
+        prev_out = curr_out;
+    }
+    let total_drift = mean_abs_difference(&before_freeze, &prev_out);
+    let mean_luma_after_white = mean(&red_row(&prev_out, width, height / 2), 0, width.into());
+    println!(
+        "freeze bloom (10 frames, static source): mv_scale {:.4}, total drift {:.1}/255, mean red after white src {:.1}/255, per-frame deltas {:?}",
+        mosh.mv_scale(0),
+        total_drift,
+        mean_luma_after_white,
+        frozen_step_deltas
+    );
+    assert!(
+        total_drift > 25.0 && frozen_step_deltas.iter().all(|&d| d > 15.0),
+        "frozen motion vectors did not keep carrying/blooming the picture (total {total_drift:.1}, steps {frozen_step_deltas:?})"
+    );
+    assert!(
+        mean_luma_after_white < 180.0,
+        "frozen frame leaked solid-white source despite skipres (mean red {mean_luma_after_white:.1}/255)"
+    );
+
+    // Unfreeze on the next frame: motion estimation resumes and mv_scale resets to 1.0.
+    let frame = AnalysisFrame {
+        time_s: 13.0 / 60.0,
+        ..Default::default()
+    };
+    let mut rec = FrameRecorder::new(&gpu);
+    rec.draw(&texture, &src, &vec4_uniform([-8.0, 0.0, 0.0, 0.0]), &[])
+        .expect("static texture");
+    mosh.set_freeze(0, false);
+    mosh.apply(&mut rec, 0, &src, &dst, 0.85, &frame, None)
+        .expect("unfrozen mosh");
+    let timings = gpu.wait_frame(rec.submit());
+    assert_eq!(mosh.mv_scale(0), 1.0, "unfreeze must reset mv_scale to 1.0");
+    assert!(
+        timings.per_pass_ms.iter().any(|(name, _)| *name == "mosh motion"),
+        "unfreeze must resume motion estimation: {:?}",
+        timings.per_pass_ms
+    );
+    assert_no_validation_messages(&gpu);
+}
+
+#[test]
+fn visuals_triggers_freeze_bloom_on_melt_and_bar_end_bloom() {
+    let gpu = gpu();
+    let (width, height) = (160u32, 90u32);
+    let mut visuals = Visuals::new(&gpu, width, height).expect("visuals");
+    let mut slot = LayerSlot::new(&gpu, 0, width, height);
+
+    let make_state = |clip: u32, bloom: f32, transition: Option<ActiveTransition>| LayerState {
+        layer: 0,
+        clip: Some(clip),
+        visualizer: Some("tunnel".to_string()),
+        params: ClipParams {
+            p: [1.0, 0.5, 0.2, 0.5, 0.0, 0.0, 0.0, 0.0],
+            palette: 1,
+            seed: 1,
+        },
+        effects: vec![EffectSlot {
+            kind: EffectKind::Mosh,
+            amount: 0.85,
+            param: bloom,
+        }],
+        transition,
+        blend: BlendMode::Normal,
+        opacity: 1.0,
+        seed: 1,
+    };
+
+    let mut step = 0u32;
+    let mut draw_step = |visuals: &mut Visuals,
+                         slot: &mut LayerSlot,
+                         state: &LayerState,
+                         bar_phase: f32| {
+        let frame = AnalysisFrame {
+            time_s: step as f64 / 60.0,
+            bar_phase,
+            playing: true,
+            ..Default::default()
+        };
+        let mut rec = FrameRecorder::new(&gpu);
+        visuals
+            .draw_layer(&mut rec, slot, state, &frame, step as f32 / 60.0)
+            .expect("draw layer");
+        gpu.wait_frame(rec.submit());
+        step += 1;
+    };
+
+    // Bloom 0.5 -> freeze when bar_phase > 0.75.
+    let bloom_state = make_state(1, 0.5, None);
+    draw_step(&mut visuals, &mut slot, &bloom_state, 0.20); // I-frame
+    draw_step(&mut visuals, &mut slot, &bloom_state, 0.50); // P-frame, unfrozen
+    assert_eq!(visuals.mosh.mv_scale(0), 1.0);
+
+    for (k, phase) in [0.78f32, 0.84, 0.91].into_iter().enumerate() {
+        draw_step(&mut visuals, &mut slot, &bloom_state, phase);
+        let expected = 1.02f32.powi((k + 1) as i32);
+        assert!(
+            (visuals.mosh.mv_scale(0) - expected).abs() < 1e-5,
+            "bloom phase {phase}: mv_scale {} != {expected}",
+            visuals.mosh.mv_scale(0)
+        );
+    }
+
+    // Next bar downbeat: unfreezes back to 1.0.
+    draw_step(&mut visuals, &mut slot, &bloom_state, 0.05);
+    assert_eq!(visuals.mosh.mv_scale(0), 1.0);
+
+    // Melt transition (even with bloom = 0.0) freezes and grows mv_scale while progress < 1.0.
+    for (k, progress) in [0.15f32, 0.45, 0.75].into_iter().enumerate() {
+        let melt_state = make_state(
+            2,
+            0.0,
+            Some(ActiveTransition {
+                kind: TransitionKind::Melt,
+                progress,
+                from: Some(1),
+            }),
+        );
+        draw_step(&mut visuals, &mut slot, &melt_state, 0.25);
+        let expected = 1.02f32.powi((k + 1) as i32);
+        assert!(
+            (visuals.mosh.mv_scale(0) - expected).abs() < 1e-5,
+            "melt progress {progress}: mv_scale {} != {expected}",
+            visuals.mosh.mv_scale(0)
+        );
+    }
+
+    // Once Melt finishes, mv_scale resets to 1.0.
+    draw_step(&mut visuals, &mut slot, &make_state(2, 0.0, None), 0.35);
+    assert_eq!(visuals.mosh.mv_scale(0), 1.0);
+    assert_no_validation_messages(&gpu);
+}
+
+

@@ -3,7 +3,7 @@
   "version": "2.5.0",
   "private": true,
   "type": "module",
-  "description": "Audio-reactive datamosh visualizer. wasm decides, WebGPU draws.",
+  "description": "[DEPRECATED] Legacy WebGPU/wasm visualizer (reference only). Active development is the native Rust + Vulkan app ilanaVisual in native/.",
   "scripts": {
     "build": "node scripts/build.mjs",
     "pack": "python pack.py",

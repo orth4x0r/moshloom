@@ -184,12 +184,18 @@ impl Visuals {
                 .draw(rec, &slot.scene, visualizer, frame, &state.params, t)?;
         }
 
-        let mut mosh = state
+        let (mut mosh, bloom) = state
             .effects
             .iter()
             .filter(|e| e.kind == EffectKind::Mosh)
-            .map(|e| e.amount)
-            .fold(0.0f32, f32::max);
+            .fold((0.0f32, 0.0f32), |(max_amt, max_bloom), e| {
+                let next_bloom = if e.amount > 0.0 {
+                    max_bloom.max(e.param)
+                } else {
+                    max_bloom
+                };
+                (max_amt.max(e.amount), next_bloom)
+            });
         if carry_entry {
             // The clip change *is* a mosh: keep the buffer running at mosh strength for the whole
             // transition, even when the new clip asks for no mosh of its own. The web app derives
@@ -198,7 +204,12 @@ impl Visuals {
             // Melt) transition on a clip with no mosh slot would otherwise be an I-frame.
             mosh = mosh.max(CARRY_AMOUNT);
         }
+        let melt_freeze = state
+            .transition
+            .is_some_and(|tr| tr.kind == TransitionKind::Melt && tr.progress < 1.0);
+        let freeze = melt_freeze || MoshPass::bloom_freeze(bloom, frame.bar_phase);
         if mosh > 0.0 {
+            self.mosh.set_freeze(slot.layer, freeze);
             if self.mosh.apply(
                 rec,
                 slot.layer,

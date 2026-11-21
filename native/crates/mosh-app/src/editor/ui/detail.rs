@@ -627,9 +627,14 @@ fn effects_column(ui: &mut egui::Ui, clip: &Clip, width: f32, out: &mut Vec<Comm
                     let a = ui
                         .add(egui::Slider::new(&mut amount, 0.0..=1.0).show_value(false))
                         .on_hover_text("amount");
+                    let param_tip = if slot.kind == EffectKind::Mosh {
+                        "bloom: freeze and stretch motion vectors at the end of each bar (0 = off)"
+                    } else {
+                        "the effect's own parameter"
+                    };
                     let b = ui
                         .add(egui::Slider::new(&mut param, 0.0..=1.0).show_value(false))
-                        .on_hover_text("the effect's own parameter");
+                        .on_hover_text(param_tip);
                     if a.changed() || b.changed() {
                         out.push(Command::SetEffect {
                             clip: id,
